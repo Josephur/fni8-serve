@@ -1,25 +1,26 @@
-# forge batch list — "repo[, kind[, bits]]"  (kind: llm|dit, default llm; bits default 8)
-# Ordered small -> large; the disk guard halts before the archive floor.
+# forge batch — "repo[, kind[, bits]]" (kind: llm|dit; bits default 8). Disk-guarded.
+# COMFY/DiT PRIORITIZED (user directive): quant the diffusion transformers first.
 
-# --- validators (small) ---
+# --- pipeline validator (fast) ---
 Qwen/Qwen3.5-0.8B
+
+# --- DiTs (Comfy priority) — quantizes the transformer/ subfolder only ---
+Tongyi-MAI/Z-Image-Turbo, dit                 # 6B, first target (smallest)
+Qwen/Qwen-Image, dit
+Qwen/Qwen-Image-Edit-2511, dit                # latest image-edit (Nov 2025)
+Qwen/Qwen-Image-Edit-2509, dit                # image-edit (Sep 2025)
+black-forest-labs/FLUX.1-dev, dit
+stabilityai/stable-diffusion-3.5-large, dit
+Wan-AI/Wan2.2-TI2V-5B-Diffusers, dit          # 5B dense
+Lightricks/LTX-Video, dit
+Wan-AI/Wan2.2-T2V-A14B-Diffusers, dit         # 14B (big) — later in the run
+
+# --- LLMs ---
 Qwen/Qwen3-0.6B
 LiquidAI/LFM2-1.2B
-
-# --- mid LLMs ---
-Qwen/Qwen3-8B
 google/gemma-3-4b-it
+Qwen/Qwen3-8B
 Qwen/Qwen3-30B-A3B
-
-# --- Qwen3.5 / 3.6 targets (qwen3_next hybrid backbone) ---
-Qwen/Qwen3.5-0.8B-Base
-# Qwen/Qwen3-Next-80B-A3B-Instruct        # large MoE — enable when disk allows
-
-# --- other families ---
 zai-org/GLM-4.5-Air
 tencent/Hunyuan-A13B-Instruct
-
-# --- diffusion DiTs (quantizes the transformer only) ---
-black-forest-labs/FLUX.1-dev, dit
-Qwen/Qwen-Image, dit
-# Tongyi-MAI/Z-Image-Turbo, dit           # first DiT target; enable once repo confirmed
+# Qwen/Qwen3-Next-80B-A3B-Instruct            # large MoE — enable when disk allows
