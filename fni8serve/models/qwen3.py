@@ -107,8 +107,10 @@ class Qwen3ForCausalLM(nn.Module):
         self.config = cfg
         self.model = Qwen3Model(cfg, sd)
         lm_w = sd["model.embed_tokens.weight"] if cfg.tie_word_embeddings else sd["lm_head.weight"]
-        # tied head stays fp16 (shared table); untied head can be int8-quantized.
-        head_w = lm_w if cfg.tie_word_embeddings else to_qtensor(lm_w)
+        # Quantize the head to int8 dp4a even when tied: the fp16 logits GEMM runs
+        # on the fleet's crippled tensor cores (~6.9 TFLOP/s) and was the single
+        # biggest decode kernel. The embedding lookup keeps its own fp16 table.
+        head_w = to_qtensor(lm_w)
         self.lm_head = LMHead(head_w, logit_softcap=cfg.final_logit_softcap)
 
     def forward(self, input_ids, positions, ctx: ForwardContext):

@@ -98,7 +98,7 @@ class Qwen3NextForCausalLM(nn.Module):
             [Qwen3NextDecoderLayer(cfg, i, sd, rope) for i in range(cfg.num_hidden_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, sd["model.norm.weight"])
         lm_w = sd["model.embed_tokens.weight"] if cfg.tie_word_embeddings else sd["lm_head.weight"]
-        self.lm_head = LMHead(lm_w if cfg.tie_word_embeddings else to_qtensor(lm_w))
+        self.lm_head = LMHead(to_qtensor(lm_w))
 
     def forward(self, input_ids, positions, ctx: ForwardContext):
         h = self.embed_tokens(input_ids)

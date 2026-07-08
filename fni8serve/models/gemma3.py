@@ -98,8 +98,10 @@ class Gemma3ForCausalLM(nn.Module):
         super().__init__()
         self.config = cfg
         self.model = Gemma3Model(cfg, sd)
-        # Gemma ties the head to the (unscaled) embedding table.
-        self.lm_head = LMHead(sd["model.embed_tokens.weight"],
+        # Gemma ties the head to the (unscaled) embedding table; quantize it to
+        # int8 dp4a (the fp16 logits GEMM runs on the fleet's crippled tensor
+        # cores). The embedding lookup keeps its own fp16 table.
+        self.lm_head = LMHead(to_qtensor(sd["model.embed_tokens.weight"]),
                               logit_softcap=cfg.final_logit_softcap)
 
     def forward(self, input_ids, positions, ctx: ForwardContext):
