@@ -23,7 +23,7 @@ name="${repo//\//__}"
 kindarg=""; [ "$kind" = "dit" ] && kindarg="--kind dit"
 
 hf jobs run --flavor "$flavor" --secrets HF_TOKEN="${HF_TOKEN:?set HF_TOKEN}" \
-  --timeout "${TIMEOUT:-6h}" --label "fni8-quant=$repo" -d "$image" \
+  --timeout "${TIMEOUT:-6h}" --label "fni8-quant=${repo//\//_}" -d "$image" \
   bash -c "set -euo pipefail
     pip install -q torch --index-url https://download.pytorch.org/whl/cpu
     pip install -q safetensors huggingface_hub hf_transfer numpy
