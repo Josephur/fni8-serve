@@ -140,10 +140,16 @@ def quant_dit(repo: str, subfolder: str, bits: int) -> Path:
     return out
 
 
+def _expected_out(repo: str, kind: str, bits: int) -> Path:
+    """The .fni8 path forge writes for (repo, kind, bits) — used for per-bits
+    idempotency so an int4 run doesn't skip an already-int8-done model."""
+    name = _name(repo)
+    return WEIGHTS / (f"{name}.dit.b{bits}.fni8" if kind == "dit" else f"{name}.b{bits}.fni8")
+
+
 def forge_one(repo: str, *, kind: str, bits: int, group: int, subfolder: str) -> bool:
-    m = _manifest()
-    if m["models"].get(repo, {}).get("status") == "done":
-        print(f"[skip] {repo} already done"); return True
+    if _expected_out(repo, kind, bits).exists():
+        print(f"[skip] {repo} b{bits} already done"); return True
     stage = STAGING / _name(repo)
     log = (LOGS / f"{_name(repo)}.log").open("a")
 
@@ -167,8 +173,12 @@ def forge_one(repo: str, *, kind: str, bits: int, group: int, subfolder: str) ->
         say(f"quant {kind} bits={bits} ...")
         out = quant_dit(repo, subfolder, bits) if kind == "dit" else quant_llm(repo, bits, group)
         size = out.stat().st_size / 1e9
+        # Record per-bits under `outputs` so an int4 run doesn't clobber the int8 record.
+        m = _manifest()
+        outputs = m["models"].get(repo, {}).get("outputs", {})
+        outputs[f"b{bits}"] = {"out": str(out), "out_gb": round(size, 3), "finished": time.time()}
         _set(repo, status="done", kind=kind, bits=bits, out=str(out),
-             out_gb=round(size, 3), finished=time.time())
+             out_gb=round(size, 3), finished=time.time(), outputs=outputs)
         say(f"DONE -> {out.name} ({size:.2f}GB)")
         return True
     except Exception as e:
@@ -180,14 +190,62 @@ def forge_one(repo: str, *, kind: str, bits: int, group: int, subfolder: str) ->
         log.close()
 
 
+def _native_dtype_of(out_path: str) -> str | None:
+    """Read the `native_dtype` recorded in a `.fni8` file's meta (DiTs), if present."""
+    try:
+        from fni8.format import FQReader
+        r = FQReader(out_path)
+        try:
+            return (r.header.get("__meta__") or {}).get("native_dtype")
+        finally:
+            r.close()
+    except Exception:
+        return None
+
+
+def publish_all(hf_user: str, *, only: str | None = None, private: bool = False):
+    """Upload every `.fni8` on disk to the Hub as a linked quantization
+    (base_model_relation=quantized), inheriting the parent's license. Scans the
+    weights dir (not the single-status manifest) so BOTH int8 and int4 of a model
+    land in its one `<name>-fni8` repo. Publishes ALL models — the parent's real
+    license tag is carried onto our card either way."""
+    from fni8serve.publish import parse_fni8_name, publish_one
+
+    # Group every weight file by parent repo -> [(bits, kind, path), ...]
+    groups: dict[str, list] = {}
+    for f in sorted(WEIGHTS.glob("*.fni8")):
+        info = parse_fni8_name(f.name)
+        if not info:
+            print(f"  [skip] unparseable {f.name}"); continue
+        if only and only not in info["parent_repo"]:
+            continue
+        groups.setdefault(info["parent_repo"], []).append((info["bits"], info["kind"], f))
+
+    print(f"publishing {sum(len(v) for v in groups.values())} file(s) across "
+          f"{len(groups)} model(s) as {hf_user}/*-fni8 ...")
+    for parent in sorted(groups):
+        for bits, kind, f in sorted(groups[parent]):        # int4 before int8
+            try:
+                res = publish_one(str(f), parent, kind, bits, hf_user=hf_user,
+                                  token=HF_TOKEN, native_dtype=_native_dtype_of(str(f)),
+                                  out_gb=f.stat().st_size / 1e9, private=private)
+                print(f"  {res['status']:16} {parent} b{bits} -> "
+                      f"{res.get('url', res.get('license', ''))}")
+            except Exception as e:
+                print(f"  ERROR            {parent} b{bits}: {e}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="forge: HF -> .fni8 with disk cleanup")
-    ap.add_argument("action", choices=["one", "batch", "status"])
-    ap.add_argument("target", nargs="?", help="repo id (one) or models.txt path (batch)")
+    ap.add_argument("action", choices=["one", "batch", "status", "publish"])
+    ap.add_argument("target", nargs="?", help="repo id (one) / models.txt (batch) / "
+                    "substring filter (publish)")
     ap.add_argument("--kind", choices=["llm", "dit"], default="llm")
     ap.add_argument("--bits", type=int, default=8, choices=(4, 8))
     ap.add_argument("--group", type=int, default=128)
     ap.add_argument("--subfolder", default="transformer")
+    ap.add_argument("--hf-user", default="jajmangold", help="HF account for *-fni8 repos")
+    ap.add_argument("--private", action="store_true", help="create private repos")
     a = ap.parse_args()
     BASE.mkdir(parents=True, exist_ok=True)
     for d in (STAGING, WEIGHTS, LOGS):
@@ -198,6 +256,10 @@ def main():
         for repo, v in sorted(m["models"].items()):
             print(f"  {v.get('status','?'):14} {repo}  {v.get('out_gb','')}")
         print(f"archive free: {free_gb(BASE):.0f} GB")
+        return
+
+    if a.action == "publish":
+        publish_all(a.hf_user, only=a.target, private=a.private)
         return
 
     if a.action == "one":
