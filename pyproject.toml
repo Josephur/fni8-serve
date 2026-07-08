@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fni8-serve"
+version = "0.0.1"
+description = "W8A8 (INT8 dp4a) inference server for Volta / CMP 100-210, over the fni8 kernels"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "fni8-serve authors" }]
+
+# Pinned to the last Volta-capable stack (matches fni8). NO flash-attn (fp16 path is
+# the gimped-tensor-core baseline we deliberately avoid on this fleet).
+dependencies = [
+  "torch==2.10.0",
+  "numpy",
+  # fni8 is installed from the sibling repo:  pip install -e ../fused_ni8
+  # (declared here for documentation; not on PyPI)
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+include = ["fni8serve*"]
+
+[tool.ruff]
+line-length = 100

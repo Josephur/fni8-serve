@@ -1,0 +1,21 @@
+fni8-serve
+==========
+
+This project is a serving layer over the `fni8` W8A8 dp4a FlashAttention-2 kernels
+for NVIDIA Volta (sm_70) / CMP 100-210.
+
+Attributions
+------------
+
+* Serving-loop design (scheduler, paged KV cache, continuous batching) follows
+  nano-vllm (https://github.com/GeeeekExplorer/nano-vllm), MIT License,
+  Copyright (c) GeeeekExplorer. This project re-implements the design; it does not
+  vendor nano-vllm source verbatim. Where engine modules are ported, the MIT notice
+  is retained in-file.
+
+* Depends on `fni8` (the CUDA/dp4a attention kernels + `.fni8` weight format +
+  transport codec), BSD-3-Clause, Copyright (c) 2026 fni8 authors.
+
+Quantization approaches informed by SDNQ (GPL-3.0, referenced for approach only, no
+code), QuaRot / SageAttention / QLoRA-NF4 (studied for approach). No GPL code is
+included in this project.
