@@ -32,4 +32,4 @@ hf jobs run --flavor "$flavor" --secrets HF_TOKEN="${HF_TOKEN:?set HF_TOKEN}" \
     export PYTHONPATH=/fni8:/serve FORGE_BASE=/data HF_HOME=/data/hf \
            HF_HUB_ENABLE_HF_TRANSFER=1 HF_XET_HIGH_PERFORMANCE=1 FORGE_MIN_FREE_GB=10
     python /serve/tools/forge.py one '$repo' --bits $bits $kindarg
-    python /serve/tools/forge.py publish '$name'"
+    python /serve/tools/forge.py publish '$repo'"    # repo id is a substring of the parsed parent

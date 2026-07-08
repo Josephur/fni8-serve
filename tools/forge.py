@@ -232,6 +232,13 @@ def publish_all(hf_user: str, *, only: str | None = None, private: bool = False)
 
     print(f"publishing {sum(len(g['files']) for g in groups.values())} file(s) across "
           f"{len(groups)} model(s) as {hf_user}/*-fni8 ...")
+    if not groups:
+        # Fail loudly: a quant ran but nothing matched the filter (or no .fni8 on disk).
+        # Silent 0-published was how HF Jobs "completed" without publishing anything.
+        print(f"[error] publish matched 0 files in {WEIGHTS}"
+              f"{f' for filter {only!r}' if only else ''}")
+        sys.exit(2)
+    published = 0
     for parent in sorted(groups):
         g = groups[parent]
         native = _native_dtype_of(str(g["files"][0][1]))
@@ -241,8 +248,12 @@ def publish_all(hf_user: str, *, only: str | None = None, private: bool = False)
             bits = ",".join(f"int{b}" for b in res.get("bits", []))
             print(f"  {res['status']:16} {parent} [{bits}] -> "
                   f"{res.get('url', res.get('license', ''))}")
+            if res.get("status") == "published":
+                published += 1
         except Exception as e:
             print(f"  ERROR            {parent}: {e}")
+    if published == 0:
+        print("[error] published 0 repos"); sys.exit(2)
 
 
 def main():
