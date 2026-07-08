@@ -180,3 +180,46 @@ class ModelCard(BaseModel):
 class ModelList(BaseModel):
     object: Literal["list"] = "list"
     data: list[ModelCard]
+
+
+class FileObject(BaseModel):
+    """OpenAI `/v1/files` shape (issue #41): the input/output JSONL of a batch job."""
+    id: str = Field(default_factory=lambda: _id("file"))
+    object: Literal["file"] = "file"
+    bytes: int
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    filename: str
+    purpose: str
+
+
+class BatchRequestCounts(BaseModel):
+    total: int = 0
+    completed: int = 0
+    failed: int = 0
+
+
+class CreateBatchRequest(BaseModel):
+    input_file_id: str
+    endpoint: Literal["/v1/chat/completions", "/v1/completions"]
+    completion_window: str = "24h"
+    metadata: dict | None = None
+
+
+class Batch(BaseModel):
+    """OpenAI `/v1/batches` shape (issue #41). This server has no background job
+    queue, so `POST /v1/batches` runs the file to completion before returning --
+    `status` is always `"completed"` by the time a `Batch` is handed back."""
+    id: str = Field(default_factory=lambda: _id("batch"))
+    object: Literal["batch"] = "batch"
+    endpoint: str
+    input_file_id: str
+    completion_window: str
+    status: Literal["completed", "failed"] = "completed"
+    output_file_id: str | None = None
+    error_file_id: str | None = None
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    in_progress_at: int | None = None
+    completed_at: int | None = None
+    failed_at: int | None = None
+    request_counts: BatchRequestCounts = Field(default_factory=BatchRequestCounts)
+    metadata: dict | None = None

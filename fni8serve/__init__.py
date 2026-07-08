@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 """fni8-serve — W8A8 dp4a inference server for Volta / CMP 100-210, over `fni8`."""
+from .batch import BatchRequest, BatchResult, generate_batch
 from .config import ServeConfig
 from .convert import convert_hf_to_fni8, quantize_state_dict
 from .engine import LLMEngine, SamplingParams
@@ -26,5 +27,8 @@ __all__ = [
     "build_model",
     "is_supported",
     "list_models",
+    "BatchRequest",
+    "BatchResult",
+    "generate_batch",
 ]
 __version__ = "0.0.1"

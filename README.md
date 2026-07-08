@@ -200,6 +200,46 @@ entirely: it builds a JSON schema from the tool's `parameters` and constrains
 generation through the same XGrammar structured-output backend `response_format`
 uses, so the result is guaranteed schema-valid.
 
+## Offline batch inference
+
+`fni8serve.batch.generate_batch(engine, requests)` runs a list of `BatchRequest`
+(prompt ids, optionally its own `SamplingParams`, an optional `custom_id`) to
+completion over `LLMEngine`'s continuous-batching scheduler, one call -- unlike
+`LLMEngine.generate()`, each request may carry its own `SamplingParams`. Results
+come back as a list of `BatchResult`, always in request order. Good for eval or
+dataset runs without holding a connection open per request:
+
+```python
+from fni8serve import BatchRequest, generate_batch, SamplingParams
+
+requests = [
+    BatchRequest(tokenizer.encode(p), SamplingParams(max_tokens=64), custom_id=str(i))
+    for i, p in enumerate(prompts)
+]
+for result in generate_batch(engine, requests):
+    print(result.custom_id, tokenizer.decode(result.output_ids))
+```
+
+The API server exposes the same offline-batch idea over OpenAI's `/v1/batches`
+JSONL-in/JSONL-out shape: upload a JSONL file of `/v1/chat/completions` or
+`/v1/completions` request bodies via `/v1/files`, `POST /v1/batches` to run it,
+then read the output file back. Every line -- including one carrying `tools` /
+`tool_choice` -- is driven through the SAME `EngineWorker` continuous-batching
+loop and the same request-building/tool-call helpers the streaming endpoints use
+(`fni8serve.api.request_helpers`), so batch and live traffic share the engine
+instead of contending for it, and get identical tool-calling behavior. Unlike
+OpenAI's real (up-to-24h) batch window, this server has no background job queue --
+`POST /v1/batches` runs the file to completion before returning, which is the
+point for a short eval/dataset job, not a million-line one. Needs the `serve`
+extra's `python-multipart` (for `/v1/files`' multipart upload).
+
+```python
+batch_input = client.files.create(file=open("prompts.jsonl", "rb"), purpose="batch")
+batch = client.batches.create(input_file_id=batch_input.id, endpoint="/v1/completions",
+                              completion_window="24h")
+output = client.files.content(batch.output_file_id).text   # JSONL, one line per request
+```
+
 ## Model support
 
 Model support is a registry: a family is a `ModelConfig` plus a thin `models/<family>.py`
@@ -230,6 +270,9 @@ over shared layers, registered with `@register_model`. The engine never changes.
 - [x] `tools`/`tool_choice` (`fni8serve.tool_calls`): tools formatted into the
       prompt via the chat template; `auto` parsed with a per-model text parser
       (`hermes`), `required`/named forced through the structured-output backend
+- [x] Offline batch inference (`fni8serve.batch.generate_batch`) plus OpenAI
+      `/v1/batches` + `/v1/files` (JSONL in/out), sharing the API server's
+      continuous-batching `EngineWorker` and tool-calling request path
 - [ ] int8 dp4a DeltaNet and MLA kernels in `fni8` (the divergent-attention acceleration)
 - [ ] multi-GPU PP + MoE-EP with `fni8.transport`
 
