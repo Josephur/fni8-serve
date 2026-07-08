@@ -8,6 +8,7 @@ gather then applied in the tensor's dtype.
 """
 from __future__ import annotations
 
+import fni8
 import torch
 import torch.nn as nn
 
@@ -45,6 +46,10 @@ class RotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """positions: [...] int; q, k: [..., n_heads, head_dim]. Broadcasts cos/sin
         over the head axis."""
+        # Fused single-launch-per-tensor path (fni8.rope rotates in place using the
+        # fp32 cos/sin tables); eager fallback on CPU / non-fp16.
+        if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
+            return fni8.rope(positions, q, k, self.cos, self.sin, self.rotary_dim)
         cos = self.cos[positions].unsqueeze(-2).to(q.dtype)   # [..., 1, rotary_dim]
         sin = self.sin[positions].unsqueeze(-2).to(q.dtype)
         return self._rotate(q, cos, sin), self._rotate(k, cos, sin)
