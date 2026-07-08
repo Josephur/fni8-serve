@@ -57,6 +57,7 @@ def _linear_attn(cfg, sd, p):
 class Qwen3NextDecoderLayer(nn.Module):
     def __init__(self, cfg: ModelConfig, i: int, sd: dict, rope: RotaryEmbedding):
         super().__init__()
+        self.layer_idx = i
         p = f"model.layers.{i}"
         self.kind = cfg.attention_kind(i)
         self.attn = _full_attn(cfg, sd, p, rope) if self.kind == "full" else _linear_attn(cfg, sd, p)
@@ -81,7 +82,7 @@ class Qwen3NextDecoderLayer(nn.Module):
             residual, h = x, self.input_layernorm(x)
         else:
             h, residual = self.input_layernorm(x, residual)
-        h = self.attn(h, positions, ctx, 0)
+        h = self.attn(h, positions, ctx, self.layer_idx)
         h, residual = self.post_attention_layernorm(h, residual)
         return self.mlp(h), residual
 

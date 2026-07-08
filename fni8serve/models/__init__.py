@@ -5,7 +5,7 @@ Adding a family = drop a `models/<family>.py` with an `@register_model(...)` bui
 and import it here. The engine/runner never change.
 """
 from .base import CausalLM, ForwardContext
-from .cache import KVCache
+from .cache import KVCache, RecurrentStateCache
 from .config import ModelConfig
 from .registry import build_model, is_supported, list_models, register_model
 from .runner import ModelRunner
@@ -24,6 +24,7 @@ __all__ = [
     "CausalLM",
     "ForwardContext",
     "KVCache",
+    "RecurrentStateCache",
     "ModelConfig",
     "ModelRunner",
     "build_model",

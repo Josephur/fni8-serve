@@ -47,6 +47,7 @@ class ForwardContext:
         *,
         is_prefill: bool,
         kv_cache=None,
+        lin_cache=None,
         cu_seqlens: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
         slot_mapping: torch.Tensor | None = None,
@@ -57,6 +58,7 @@ class ForwardContext:
     ):
         self.is_prefill = is_prefill
         self.kv_cache = kv_cache
+        self.lin_cache = lin_cache     # RecurrentStateCache for linear-attn layers
         self.cu_seqlens = cu_seqlens
         self.seq_lens = seq_lens
         self.slot_mapping = slot_mapping

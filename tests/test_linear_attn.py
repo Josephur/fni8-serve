@@ -7,8 +7,15 @@ the full GatedDeltaNetAttention block runs end-to-end. The chunked/int8 form is
 Track 2 (fni8 csrc/), validated there against this recurrence."""
 import pytest
 import torch
+import torch.nn.functional as F
 
-from fni8serve.layers.linear_attn import _l2norm, recurrent_gated_delta_rule
+from fni8serve.layers.linear_attn import (
+    GatedDeltaNetAttention,
+    _l2norm,
+    lightning_attention,
+    lightning_slopes,
+    recurrent_gated_delta_rule,
+)
 
 CUDA = torch.cuda.is_available()
 
@@ -24,7 +31,7 @@ def test_delta_rule_writes_and_reads():
     B, H, Dk, Dv = 1, 1, 4, 4
     k = _l2norm(torch.randn(B, H, 1, Dk))
     v = torch.randn(B, H, 1, Dv)
-    out = recurrent_gated_delta_rule(k.clone(), k, v, torch.ones(B, H, 1), torch.zeros(B, H, 1))
+    out, _ = recurrent_gated_delta_rule(k.clone(), k, v, torch.ones(B, H, 1), torch.zeros(B, H, 1))
     torch.testing.assert_close(out, v, rtol=1e-3, atol=1e-3)   # o_1 = (v k^T) k = v (k unit)
 
 
@@ -36,9 +43,84 @@ def test_decay_shrinks_state():
     v = torch.randn(B, H, 2, Dv)
     beta = torch.ones(B, H, 2)
     g_strong = torch.tensor([[[0.0, -20.0]]])                  # step 2 decays state ~0
-    out = recurrent_gated_delta_rule(q, k, v, beta, g_strong)
+    out, _ = recurrent_gated_delta_rule(q, k, v, beta, g_strong)
     # at t=2 the state is dominated by the fresh write (old contribution ~ alpha~0)
     assert torch.isfinite(out).all()
+
+
+def test_delta_rule_decode_state_matches_prefill():
+    """The actual decode-caching bug: feeding the sequence one token at a time with
+    `S` carried across calls (as the decode path now does) must reproduce the same
+    output as a single whole-sequence ("prefill") call. Before the fix, each call
+    zero-initialized `S`, so this would only hold for the first token."""
+    torch.manual_seed(0)
+    B, H, L, Dk, Dv = 2, 3, 6, 4, 5
+    q = _l2norm(torch.randn(B, H, L, Dk))
+    k = _l2norm(torch.randn(B, H, L, Dk))
+    v = torch.randn(B, H, L, Dv)
+    beta = torch.sigmoid(torch.randn(B, H, L))
+    g = -F.softplus(torch.randn(B, H, L))
+
+    full_out, full_state = recurrent_gated_delta_rule(q, k, v, beta, g)
+
+    state, outs = None, []
+    for t in range(L):
+        o, state = recurrent_gated_delta_rule(q[:, :, t:t + 1], k[:, :, t:t + 1], v[:, :, t:t + 1],
+                                              beta[:, :, t:t + 1], g[:, :, t:t + 1], state=state)
+        outs.append(o)
+
+    torch.testing.assert_close(torch.cat(outs, dim=2), full_out, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(state, full_state, rtol=1e-4, atol=1e-4)
+
+
+def test_lightning_attention_decode_state_matches_prefill():
+    """Same decode-caching property for MiniMax lightning attention: stepping token
+    by token with `S` carried across calls must match one whole-sequence call."""
+    torch.manual_seed(1)
+    B, H, L, Dk, Dv = 2, 4, 5, 4, 4
+    q, k = torch.randn(B, H, L, Dk), torch.randn(B, H, L, Dk)
+    v = torch.randn(B, H, L, Dv)
+    slopes = lightning_slopes(H)
+
+    full_out, full_state = lightning_attention(q, k, v, slopes)
+
+    state, outs = None, []
+    for t in range(L):
+        o, state = lightning_attention(q[:, :, t:t + 1], k[:, :, t:t + 1], v[:, :, t:t + 1],
+                                       slopes, state=state)
+        outs.append(o)
+
+    torch.testing.assert_close(torch.cat(outs, dim=2), full_out, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(state, full_state, rtol=1e-4, atol=1e-4)
+
+
+class _ConvHarness:
+    """Bare object exposing only what `GatedDeltaNetAttention._conv` touches, so the
+    causal-conv decode-tail logic can be unit tested without building the full
+    nn.Module (whose projections need the CUDA dp4a kernels)."""
+
+    def __init__(self, conv_kernel, conv_weight):
+        self.conv_kernel = conv_kernel
+        self.conv_weight = conv_weight
+
+
+def test_deltanet_conv_tail_matches_full_sequence():
+    """The causal depthwise conv must carry its trailing `kernel-1` raw window
+    across decode calls instead of zero-padding it away: one token at a time with
+    the tail threaded through must match a single whole-sequence call."""
+    torch.manual_seed(2)
+    B, L, W, K = 2, 7, 5, 4
+    harness = _ConvHarness(K, torch.randn(W, K))
+    x = torch.randn(B, L, W)
+
+    full, _ = GatedDeltaNetAttention._conv(harness, x)
+
+    tail, outs = None, []
+    for t in range(L):
+        y, tail = GatedDeltaNetAttention._conv(harness, x[:, t:t + 1], tail)
+        outs.append(y)
+
+    torch.testing.assert_close(torch.cat(outs, dim=1), full, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.skipif(not CUDA, reason="the projections use the dp4a GEMM")

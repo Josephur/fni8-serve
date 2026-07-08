@@ -12,7 +12,7 @@ from __future__ import annotations
 import torch
 
 from .base import ForwardContext
-from .cache import KVCache
+from .cache import KVCache, RecurrentStateCache
 from .config import ModelConfig
 
 
@@ -23,6 +23,7 @@ class ModelRunner:
         self.device = device
         self.cache = KVCache(cfg.num_hidden_layers, max_batch, cfg.num_key_value_heads,
                              max_len, cfg.resolved_head_dim(), device=device)
+        self.lin_cache = RecurrentStateCache()
 
     @torch.inference_mode()
     def prefill(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -30,7 +31,8 @@ class ModelRunner:
         B, S = input_ids.shape
         pos = torch.arange(S, device=self.device).unsqueeze(0).expand(B, S)
         self.cache.reset()
-        ctx = ForwardContext(is_prefill=True, kv_cache=self.cache)
+        self.lin_cache.reset()
+        ctx = ForwardContext(is_prefill=True, kv_cache=self.cache, lin_cache=self.lin_cache)
         hidden = self.model(input_ids, pos, ctx)
         self.cache.advance(S)
         return self.model.compute_logits(hidden[:, -1])
@@ -40,7 +42,7 @@ class ModelRunner:
         """token_ids: [B, 1] -> next-token logits [B, vocab]."""
         B = token_ids.shape[0]
         pos = torch.full((B, 1), self.cache.length, device=self.device, dtype=torch.long)
-        ctx = ForwardContext(is_prefill=False, kv_cache=self.cache)
+        ctx = ForwardContext(is_prefill=False, kv_cache=self.cache, lin_cache=self.lin_cache)
         hidden = self.model(token_ids, pos, ctx)
         self.cache.advance(1)
         return self.model.compute_logits(hidden[:, -1])

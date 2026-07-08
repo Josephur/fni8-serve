@@ -36,8 +36,13 @@ class LightningAttention(nn.Module):
 
     def forward(self, x, positions, ctx, layer_idx):
         B, L, _ = x.shape
+        cache = ctx.lin_cache if ctx is not None else None
+        state = cache.get_state(layer_idx) if cache is not None else None
         q, k, v = self.qkv_proj(x).view(B, L, 3, self.nh, self.hd).unbind(2)
-        o = lightning_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), self.slopes)
+        o, state = lightning_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                       self.slopes, state=state)
+        if cache is not None:
+            cache.set_state(layer_idx, state)
         o = o.transpose(1, 2).reshape(B, L, self.nh * self.hd)
         o = self.norm(o * torch.sigmoid(self.output_gate(x)))
         return self.out_proj(o)
@@ -55,6 +60,7 @@ def _softmax_attn(cfg, sd, p, rope):
 class MiniMaxDecoderLayer(nn.Module):
     def __init__(self, cfg, i, sd, rope):
         super().__init__()
+        self.layer_idx = i
         p = f"model.layers.{i}"
         self.is_lightning = cfg.extra.get("attn_type_list", [])[i] == 0 if cfg.extra.get("attn_type_list") \
             else (i + 1) % cfg.extra.get("softmax_every", 8) != 0
@@ -82,7 +88,8 @@ class MiniMaxDecoderLayer(nn.Module):
         self.beta = cfg.extra.get("layernorm_mlp_beta", 1.0)
 
     def forward(self, x, positions, ctx, residual):
-        h = self.beta * x + self.alpha * self.attn(self.input_layernorm(x), positions, ctx, 0)
+        attn_out = self.attn(self.input_layernorm(x), positions, ctx, self.layer_idx)
+        h = self.beta * x + self.alpha * attn_out
         h = self.beta * h + self.alpha * self.mlp(self.post_attention_layernorm(h))
         return h, None
 

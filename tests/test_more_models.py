@@ -8,7 +8,7 @@ import torch
 
 pytest.importorskip("fni8")
 
-from fni8serve.models import ModelConfig, build_model, is_supported
+from fni8serve.models import ModelConfig, ModelRunner, build_model, is_supported
 from fni8serve.models.base import ForwardContext
 from fni8serve.models.cache import KVCache
 
@@ -43,7 +43,7 @@ def _moe_sd(sd, p, H, E, mi, shared_name=None):
         sd[f"{p}.mlp.{shared_name}.down_proj.weight"] = _r(H, mi)
 
 
-def test_qwen3_next_hybrid_prefill():
+def _qwen3_next_hybrid_cfg_sd():
     x = dict(linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=16,
              linear_value_head_dim=16, linear_conv_kernel_dim=4)
     cfg = ModelConfig(arch="qwen3_next", vocab_size=64, hidden_size=128, num_hidden_layers=2,
@@ -52,7 +52,6 @@ def test_qwen3_next_hybrid_prefill():
                       tie_word_embeddings=True, num_experts=2, num_experts_per_tok=2,
                       moe_intermediate_size=64, linear_attention=True, full_attention_interval=2,
                       shared_expert_intermediate_size=64, extra=x)
-    assert is_supported("qwen3_next")
     H, nh, nkv, hd = 128, 4, 2, 32
     nk, nv, kd, vd = 2, 4, 16, 16
     qkv_lin = 2 * nk * kd + nv * vd
@@ -79,7 +78,37 @@ def test_qwen3_next_hybrid_prefill():
             sd[f"{la}.dt_proj.weight"] = _r(nv, H)
             sd[f"{la}.norm.weight"] = _r(nv * vd)
         _moe_sd(sd, p, H, cfg.num_experts, cfg.moe_intermediate_size, shared_name="shared_expert")
+    return cfg, sd
+
+
+def test_qwen3_next_hybrid_prefill():
+    assert is_supported("qwen3_next")
+    cfg, sd = _qwen3_next_hybrid_cfg_sd()
     _prefill(cfg, sd)
+
+
+def test_qwen3_next_hybrid_decode_matches_teacher_forced():
+    """Full generate (prefill + N decode steps) must match a single teacher-forced
+    forward over the whole (prompt + generated) sequence. This is the property the
+    recurrent-state cache (`S`) and causal-conv tail now preserve for the linear
+    (DeltaNet) layers, and the per-layer `layer_idx` fix preserves for the KV cache
+    on the interleaved full-attention layers — before both fixes, decode either
+    recomputed each linear layer's state from zero every step (forgetting the
+    causal-conv history too) or clobbered a shared KV-cache slot across layers."""
+    cfg, sd = _qwen3_next_hybrid_cfg_sd()
+    model = build_model(cfg, sd).cuda().eval()
+    runner = ModelRunner(model, cfg, max_batch=1, max_len=32, device="cuda")
+    prompt = torch.randint(0, cfg.vocab_size, (1, 5), device="cuda")
+    gen = runner.generate_greedy(prompt, max_new_tokens=4)
+
+    full_ids = torch.cat([prompt, gen], dim=1)
+    pos = torch.arange(full_ids.shape[1], device="cuda").unsqueeze(0)
+    ref_cache = KVCache(cfg.num_hidden_layers, 1, cfg.num_key_value_heads, 32,
+                        cfg.resolved_head_dim(), device="cuda")
+    hidden = model(full_ids, pos, ForwardContext(is_prefill=True, kv_cache=ref_cache))
+    logits = model.compute_logits(hidden)
+    ref_tokens = logits[:, prompt.shape[1] - 1:-1].argmax(-1)
+    assert torch.equal(ref_tokens, gen)
 
 
 def _attn_sd(sd, a, cfg, qk=None, bias=False):
@@ -159,7 +188,7 @@ def test_hunyuan_prefill():
     _prefill(cfg, sd)
 
 
-def test_minimax_prefill():
+def _minimax_cfg_sd():
     cfg = ModelConfig(arch="minimax", vocab_size=64, hidden_size=128, num_hidden_layers=2,
                       num_attention_heads=4, num_key_value_heads=4, intermediate_size=256,
                       max_position_embeddings=64, head_dim=32, tie_word_embeddings=False,
@@ -187,4 +216,29 @@ def test_minimax_prefill():
             sd[f"{m}.experts.{e}.w1.weight"] = _r(cfg.moe_intermediate_size, H)
             sd[f"{m}.experts.{e}.w3.weight"] = _r(cfg.moe_intermediate_size, H)
             sd[f"{m}.experts.{e}.w2.weight"] = _r(H, cfg.moe_intermediate_size)
+    return cfg, sd
+
+
+def test_minimax_prefill():
+    cfg, sd = _minimax_cfg_sd()
     _prefill(cfg, sd)
+
+
+def test_minimax_lightning_decode_matches_teacher_forced():
+    """Same decode-caching property as the qwen3_next hybrid test, for MiniMax's
+    lightning-attention layer 0: full generate must match a single teacher-forced
+    forward over the whole (prompt + generated) sequence."""
+    cfg, sd = _minimax_cfg_sd()
+    model = build_model(cfg, sd).cuda().eval()
+    runner = ModelRunner(model, cfg, max_batch=1, max_len=32, device="cuda")
+    prompt = torch.randint(0, cfg.vocab_size, (1, 5), device="cuda")
+    gen = runner.generate_greedy(prompt, max_new_tokens=4)
+
+    full_ids = torch.cat([prompt, gen], dim=1)
+    pos = torch.arange(full_ids.shape[1], device="cuda").unsqueeze(0)
+    ref_cache = KVCache(cfg.num_hidden_layers, 1, cfg.num_key_value_heads, 32,
+                        cfg.resolved_head_dim(), device="cuda")
+    hidden = model(full_ids, pos, ForwardContext(is_prefill=True, kv_cache=ref_cache))
+    logits = model.compute_logits(hidden)
+    ref_tokens = logits[:, prompt.shape[1] - 1:-1].argmax(-1)
+    assert torch.equal(ref_tokens, gen)

@@ -33,12 +33,16 @@ def _l2norm(x: torch.Tensor) -> torch.Tensor:
     return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
-def recurrent_gated_delta_rule(q, k, v, beta, g) -> torch.Tensor:
+def recurrent_gated_delta_rule(q, k, v, beta, g, state=None):
     """Gated delta rule, scalar form. q,k: [B,H,L,Dk] (pre-L2-normed), v: [B,H,L,Dv],
-    beta: [B,H,L] in (0,1], g: [B,H,L] = log(alpha) (<=0). Returns o [B,H,L,Dv]."""
+    beta: [B,H,L] in (0,1], g: [B,H,L] = log(alpha) (<=0). `state`: optional
+    [B,H,Dv,Dk] fp32 initial S (carried in from a prior call for decode); defaults
+    to zero (prefill / stateless). Returns (o [B,H,L,Dv], state_final [B,H,Dv,Dk])
+    so a caller can carry `S` across chunked/decode calls instead of losing it."""
     B, H, L, Dk = q.shape
     Dv = v.shape[-1]
-    S = torch.zeros(B, H, Dv, Dk, dtype=torch.float32, device=q.device)
+    S = state if state is not None else torch.zeros(B, H, Dv, Dk, dtype=torch.float32,
+                                                     device=q.device)
     alpha = g.exp().float()
     qf, kf, vf, bf = q.float(), k.float(), v.float(), beta.float()
     out = torch.empty(B, H, L, Dv, dtype=torch.float32, device=q.device)
@@ -51,7 +55,7 @@ def recurrent_gated_delta_rule(q, k, v, beta, g) -> torch.Tensor:
         write = (bt * vt)[..., None] * kt[..., None, :]
         S = at * S - erase + write
         out[:, :, t] = torch.einsum("bhvk,bhk->bhv", S, qt)      # o_t = S_t q_t
-    return out.to(v.dtype)
+    return out.to(v.dtype), S
 
 
 class GatedDeltaNetAttention(nn.Module):
@@ -79,17 +83,27 @@ class GatedDeltaNetAttention(nn.Module):
         self.dt_bias = nn.Parameter(dt_bias)
         self.norm = RMSNorm(value_dim, cfg.rms_norm_eps, norm_gain)
 
-    def _conv(self, x):
-        """Causal depthwise conv1d(k) + SiLU. x: [B, L, Wc]."""
+    def _conv(self, x, tail=None):
+        """Causal depthwise conv1d(k) + SiLU. x: [B, L, Wc]. `tail`: optional
+        [B, K-1, Wc] trailing raw (pre-conv) window from the previous call — carries
+        decode history in instead of zero-padding, which would forget it every step.
+        Returns (activated [B, L, Wc], new_tail [B, K-1, Wc])."""
         B, L, W = x.shape
-        xt = x.transpose(1, 2)                                    # [B,Wc,L]
-        xt = F.pad(xt, (self.conv_kernel - 1, 0))
-        xt = F.conv1d(xt, self.conv_weight.unsqueeze(1), groups=W)
-        return F.silu(xt.transpose(1, 2))
+        K = self.conv_kernel
+        if tail is None:
+            tail = x.new_zeros(B, K - 1, W)
+        xt = torch.cat([tail, x], dim=1)                          # [B,K-1+L,Wc]
+        new_tail = xt[:, -(K - 1):] if K > 1 else x.new_zeros(B, 0, W)
+        xt = F.conv1d(xt.transpose(1, 2), self.conv_weight.unsqueeze(1), groups=W)
+        return F.silu(xt.transpose(1, 2)), new_tail
 
     def forward(self, hidden, positions, ctx, layer_idx):
         B, L, _ = hidden.shape
-        qkv = self._conv(self.qkv_proj(hidden))
+        cache = ctx.lin_cache if ctx is not None else None
+        conv_tail = cache.get_conv_tail(layer_idx) if cache is not None else None
+        qkv, conv_tail = self._conv(self.qkv_proj(hidden), conv_tail)
+        if cache is not None:
+            cache.set_conv_tail(layer_idx, conv_tail)
         qk = self.nk * self.kd
         q, k, v = qkv.split([qk, qk, self.nv * self.vd], dim=-1)
         q = _l2norm(q.view(B, L, self.nk, self.kd)).transpose(1, 2)
@@ -103,25 +117,32 @@ class GatedDeltaNetAttention(nn.Module):
         beta = beta.reshape(B, self.nv, L) if beta.dim() == 3 else beta
         dt = self.gate_proj(hidden).transpose(1, 2)
         g = -F.softplus(dt.float() + self.dt_bias.view(1, -1, 1)) * self.A_log.exp().view(1, -1, 1)
-        o = recurrent_gated_delta_rule(q, k, v, beta.reshape(B, self.nv, L), g.reshape(B, self.nv, L))
+        state = cache.get_state(layer_idx) if cache is not None else None
+        o, state = recurrent_gated_delta_rule(q, k, v, beta.reshape(B, self.nv, L),
+                                              g.reshape(B, self.nv, L), state=state)
+        if cache is not None:
+            cache.set_state(layer_idx, state)
         o = self.norm(o.transpose(1, 2).reshape(B, L, self.nv * self.vd))
         return self.out_proj(o)
 
 
-def lightning_attention(q, k, v, slopes) -> torch.Tensor:
+def lightning_attention(q, k, v, slopes, state=None):
     """MiniMax lightning attention (TransNormer): data-INDEPENDENT fixed decay, no
     delta correction. S_t = ratio_h S_{t-1} + k_t^T v_t ; o_t = q_t S_t, with per-head
-    ratio = exp(-slope). q,k: [B,H,L,Dk], v: [B,H,L,Dv], slopes: [H]. Scalar oracle."""
+    ratio = exp(-slope). q,k: [B,H,L,Dk], v: [B,H,L,Dv], slopes: [H]. Scalar oracle.
+    `state`: optional [B,H,Dv,Dk] fp32 initial S (carried in from a prior call for
+    decode); defaults to zero. Returns (o [B,H,L,Dv], state_final [B,H,Dv,Dk])."""
     B, H, L, Dk = q.shape
     Dv = v.shape[-1]
-    S = torch.zeros(B, H, Dv, Dk, dtype=torch.float32, device=q.device)
+    S = state if state is not None else torch.zeros(B, H, Dv, Dk, dtype=torch.float32,
+                                                     device=q.device)
     ratio = torch.exp(-slopes.float()).view(1, H, 1, 1)
     qf, kf, vf = q.float(), k.float(), v.float()
     out = torch.empty(B, H, L, Dv, dtype=torch.float32, device=q.device)
     for t in range(L):
         S = ratio * S + vf[:, :, t][..., :, None] * kf[:, :, t][..., None, :]   # k^T v outer
         out[:, :, t] = torch.einsum("bhvk,bhk->bhv", S, qf[:, :, t])
-    return out.to(v.dtype)
+    return out.to(v.dtype), S
 
 
 def lightning_slopes(num_heads: int, device="cpu") -> torch.Tensor:
