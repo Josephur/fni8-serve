@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT
+"""Model registry + concrete architectures. Importing a model module registers it.
+
+Adding a family = drop a `models/<family>.py` with an `@register_model(...)` builder
+and import it here. The engine/runner never change.
+"""
+from .base import CausalLM, ForwardContext
+from .cache import KVCache
+from .config import ModelConfig
+from .registry import build_model, is_supported, list_models, register_model
+from .runner import ModelRunner
+
+# Concrete architectures (import = self-register).
+from . import qwen3 as _qwen3       # noqa: E402,F401
+from . import gemma3 as _gemma3     # noqa: E402,F401
+
+__all__ = [
+    "CausalLM",
+    "ForwardContext",
+    "KVCache",
+    "ModelConfig",
+    "ModelRunner",
+    "build_model",
+    "register_model",
+    "is_supported",
+    "list_models",
+]

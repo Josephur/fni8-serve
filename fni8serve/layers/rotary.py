@@ -18,23 +18,33 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim: int, max_position: int, base: float = 1e6):
+    def __init__(
+        self, head_dim: int, max_position: int, base: float = 1e6, rotary_dim: int | None = None
+    ):
         super().__init__()
-        assert head_dim % 2 == 0, "RoPE needs an even head_dim"
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        # Partial rotary (GLM, Qwen3-Next gated attn): rotate only the first
+        # `rotary_dim` dims of each head, pass the rest through unchanged.
+        rd = rotary_dim if rotary_dim is not None else head_dim
+        assert rd % 2 == 0 and rd <= head_dim, "rotary_dim must be even and <= head_dim"
+        self.rotary_dim = rd
+        inv_freq = 1.0 / (base ** (torch.arange(0, rd, 2, dtype=torch.float32) / rd))
         t = torch.arange(max_position, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)                      # [max_pos, head_dim/2]
-        emb = torch.cat((freqs, freqs), dim=-1)               # [max_pos, head_dim]
+        freqs = torch.outer(t, inv_freq)                      # [max_pos, rotary_dim/2]
+        emb = torch.cat((freqs, freqs), dim=-1)               # [max_pos, rotary_dim]
         self.register_buffer("cos", emb.cos(), persistent=False)
         self.register_buffer("sin", emb.sin(), persistent=False)
+
+    def _rotate(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        if self.rotary_dim == x.shape[-1]:
+            return x * cos + _rotate_half(x) * sin
+        x_rot, x_pass = x[..., : self.rotary_dim], x[..., self.rotary_dim :]
+        return torch.cat((x_rot * cos + _rotate_half(x_rot) * sin, x_pass), dim=-1)
 
     def forward(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """positions: [...] int; q, k: [..., n_heads, head_dim]. Broadcasts cos/sin
         over the head axis."""
-        cos = self.cos[positions].unsqueeze(-2).to(q.dtype)   # [..., 1, head_dim]
+        cos = self.cos[positions].unsqueeze(-2).to(q.dtype)   # [..., 1, rotary_dim]
         sin = self.sin[positions].unsqueeze(-2).to(q.dtype)
-        q_r = q * cos + _rotate_half(q) * sin
-        k_r = k * cos + _rotate_half(k) * sin
-        return q_r, k_r
+        return self._rotate(q, cos, sin), self._rotate(k, cos, sin)
