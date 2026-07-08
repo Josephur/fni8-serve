@@ -52,6 +52,8 @@ class ForwardContext:
         slot_mapping: torch.Tensor | None = None,
         block_tables: torch.Tensor | None = None,
         attn_mask=None,
+        slots: list[int] | None = None,        # engine: which cache slot each batch row uses
+        slot_lengths: list[int] | None = None,  # engine: per-row KV length (ragged decode)
     ):
         self.is_prefill = is_prefill
         self.kv_cache = kv_cache
@@ -60,6 +62,8 @@ class ForwardContext:
         self.slot_mapping = slot_mapping
         self.block_tables = block_tables
         self.attn_mask = attn_mask     # e.g. bidirectional mask for diffusion
+        self.slots = slots
+        self.slot_lengths = slot_lengths
 
 
 class DecodeStrategy(Protocol):
