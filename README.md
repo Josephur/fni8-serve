@@ -8,6 +8,14 @@ The scheduler / paged‑KV / continuous‑batching design follows
 swapped from fp16 flash‑attention to `fni8`'s int8 dp4a kernels, because on this
 hardware the fp16 tensor cores are firmware‑gimped and **dp4a is the fast path**.
 
+## Pre-quantized models on Hugging Face
+
+Ready-to-serve `.fni8` weights (int8 **and** int4 in each repo) live under
+**[huggingface.co/jajmangold](https://huggingface.co/jajmangold?search=fni8)** — each
+is published as a *linked quantization*, so it also appears under its source model's
+**Quantizations** tab. Produce more with `tools/forge.sh` (download → quantize →
+`forge publish`).
+
 ## Why this exists (the hardware, honestly)
 
 The deployment fleet is **CMP 100‑210** (GV100 silicon, 16 GB HBM2 @ 829 GB/s,

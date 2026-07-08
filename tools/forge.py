@@ -209,30 +209,32 @@ def publish_all(hf_user: str, *, only: str | None = None, private: bool = False)
     weights dir (not the single-status manifest) so BOTH int8 and int4 of a model
     land in its one `<name>-fni8` repo. Publishes ALL models — the parent's real
     license tag is carried onto our card either way."""
-    from fni8serve.publish import parse_fni8_name, publish_one
+    from fni8serve.publish import parse_fni8_name, publish_repo
 
-    # Group every weight file by parent repo -> [(bits, kind, path), ...]
-    groups: dict[str, list] = {}
+    # Group every weight file by parent repo so BOTH int8 and int4 land in one repo.
+    groups: dict[str, dict] = {}
     for f in sorted(WEIGHTS.glob("*.fni8")):
         info = parse_fni8_name(f.name)
         if not info:
             print(f"  [skip] unparseable {f.name}"); continue
         if only and only not in info["parent_repo"]:
             continue
-        groups.setdefault(info["parent_repo"], []).append((info["bits"], info["kind"], f))
+        g = groups.setdefault(info["parent_repo"], {"kind": info["kind"], "files": []})
+        g["files"].append((info["bits"], f))
 
-    print(f"publishing {sum(len(v) for v in groups.values())} file(s) across "
+    print(f"publishing {sum(len(g['files']) for g in groups.values())} file(s) across "
           f"{len(groups)} model(s) as {hf_user}/*-fni8 ...")
     for parent in sorted(groups):
-        for bits, kind, f in sorted(groups[parent]):        # int4 before int8
-            try:
-                res = publish_one(str(f), parent, kind, bits, hf_user=hf_user,
-                                  token=HF_TOKEN, native_dtype=_native_dtype_of(str(f)),
-                                  out_gb=f.stat().st_size / 1e9, private=private)
-                print(f"  {res['status']:16} {parent} b{bits} -> "
-                      f"{res.get('url', res.get('license', ''))}")
-            except Exception as e:
-                print(f"  ERROR            {parent} b{bits}: {e}")
+        g = groups[parent]
+        native = _native_dtype_of(str(g["files"][0][1]))
+        try:
+            res = publish_repo(parent, g["files"], hf_user=hf_user, token=HF_TOKEN,
+                               kind=g["kind"], native_dtype=native, private=private)
+            bits = ",".join(f"int{b}" for b in res.get("bits", []))
+            print(f"  {res['status']:16} {parent} [{bits}] -> "
+                  f"{res.get('url', res.get('license', ''))}")
+        except Exception as e:
+            print(f"  ERROR            {parent}: {e}")
 
 
 def main():

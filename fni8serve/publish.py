@@ -87,20 +87,27 @@ def _fni8_tags(kind: str) -> list[str]:
     return tags
 
 
+def _scheme(bits: int) -> str:
+    return "int4 per-group W4A8 (int8 activations)" if bits == 4 else "int8 per-row W8A8"
+
+
 def model_card(
     parent_repo: str,
     kind: str,
-    bits: int,
+    quants: list[dict],
     *,
     license_tag: str | None,
     pipeline_tag: str | None = None,
     native_dtype: str | None = None,
-    out_gb: float | None = None,
 ) -> str:
-    """Render README.md (YAML frontmatter + body) for a published `.fni8` quant.
+    """Render README.md for a repo that may hold SEVERAL quant files (e.g. int8 +
+    int4). `quants` is ``[{"bits": int, "filename": str, "gb": float}, ...]``.
 
-    The frontmatter's ``base_model`` + ``base_model_relation: quantized`` are what
-    file this repo under the parent's Quantizations on the Hub."""
+    The frontmatter's ``base_model`` + ``base_model_relation: quantized`` file the
+    repo under the parent's Quantizations on the Hub. A **Files** table + per-bits
+    tags make the precision of each file unmistakable (you can tell 4- vs 8-bit at a
+    glance)."""
+    bits_present = sorted({q["bits"] for q in quants})
     fm: list[str] = ["---"]
     fm.append(f"base_model: {parent_repo}")
     fm.append("base_model_relation: quantized")
@@ -109,27 +116,45 @@ def model_card(
     if pipeline_tag:
         fm.append(f"pipeline_tag: {pipeline_tag}")
     fm.append("tags:")
-    for t in _fni8_tags(kind):
+    tags = list(_fni8_tags(kind)) + [f"{b}-bit" for b in bits_present]
+    for t in tags:
         fm.append(f"  - {t}")
     fm.append("---")
 
-    scheme = "int4 per-group (int8 activations)" if bits == 4 else "int8 per-row (W8A8)"
-    size = f" (~{out_gb:.1f} GB)" if out_gb else ""
-    dt = f"\n- **Source dtype:** `{native_dtype}` (raw tensors kept fp16, upcast to fp32 only on overflow)" if native_dtype else ""
+    dt = (f"\n- **Source dtype:** `{native_dtype}` (raw tensors kept fp16, upcast to "
+          f"fp32 only on overflow).") if native_dtype else ""
+    label = " + ".join(f"int{b}" for b in bits_present)
+    rows = "\n".join(
+        f"| `{q['filename']}` | **int{q['bits']}** | {_scheme(q['bits'])} | "
+        f"{q['gb']:.2f} GB |"
+        for q in sorted(quants, key=lambda q: q["bits"])
+    )
     body = f"""
-# {parent_repo.split('/')[-1]} — fni8 (int{bits} dp4a)
+# {parent_repo.split('/')[-1]} — fni8 ({label} dp4a)
 
 Quantization of [`{parent_repo}`](https://huggingface.co/{parent_repo}) to the
-**`.fni8`** resident format{size} for the [fni8](https://github.com/jajmangold/fni8)
+**`.fni8`** resident format for the [**fni8**](https://github.com/jajmangold/fni8)
 W8A8 DP4A kernels on **NVIDIA Volta (sm_70)** — Tesla V100 / CMP 100-210.
 
-- **Weights:** {scheme}, fp32 scales, stored in the resident dp4a VRAM layout
-  (loads with no dequant/repack).{dt}
+## Files (precision per file)
+
+| file | precision | scheme | size |
+|------|-----------|--------|------|
+{rows}
+
+Pick the file for the precision you want — **`.b8.` = int8 (W8A8)**, **`.b4.` = int4
+(W4A8)**. Weights are fp32-scaled and stored in the resident dp4a VRAM layout (loads
+with no dequant/repack).{dt}
+
 - **Why dp4a:** sm_70 has no int8 tensor cores; the contraction runs on the
   `__dp4a` CUDA-core intrinsic. On the CMP-100-210 fleet (firmware-gimped fp16
   tensor cores) dp4a is the fast path, not a compromise.
-- **Runtimes:** [fni8-serve](https://github.com/jajmangold/fni8-serve) (LLMs) /
-  [ComfyUI-fni8](https://github.com/jajmangold/ComfyUI-fni8) (diffusion DiTs).
+
+## Use it
+
+- **Kernels:** <https://github.com/jajmangold/fni8>
+- **LLM serving:** <https://github.com/jajmangold/fni8-serve>
+- **ComfyUI (diffusion DiTs):** <https://github.com/jajmangold/ComfyUI-fni8>
 
 This is a derivative quantization; its license follows the parent model above.
 """
@@ -150,26 +175,23 @@ def parent_meta(parent_repo: str, token: str | None) -> dict:
     }
 
 
-def publish_one(
-    fni8_path: str,
+def publish_repo(
     parent_repo: str,
-    kind: str,
-    bits: int,
+    quant_files: list,
     *,
     hf_user: str,
     token: str | None,
+    kind: str = "llm",
     native_dtype: str | None = None,
-    out_gb: float | None = None,
     private: bool = False,
     skip_restricted: bool = False,
 ) -> dict:
-    """Create (if needed) our public quant repo for `parent_repo`, write the linked
-    model card, and upload the `.fni8`. Returns a status dict.
+    """Publish ALL quant files of one parent into its single `<name>-fni8` repo, then
+    write ONE model card that enumerates them (so 4- vs 8-bit is unmistakable).
 
-    By default we publish **every** model (linked quantizations of the big DiTs/LLMs
-    are standard practice on the Hub); the parent's real license tag is inherited onto
-    our card either way. Pass ``skip_restricted=True`` to instead hold non-commercial/
-    gated parents (returns ``{"status": "held_restricted", ...}``)."""
+    `quant_files` is ``[(bits, path), ...]``. Creates the repo, uploads every file,
+    and writes the card last. Publishes every model by default; the parent's license
+    is inherited. `skip_restricted=True` holds non-commercial/gated parents."""
     from huggingface_hub import HfApi
 
     meta = parent_meta(parent_repo, token)
@@ -181,13 +203,16 @@ def publish_one(
     api = HfApi()
     api.create_repo(rid, token=token, private=private, exist_ok=True, repo_type="model")
 
-    card = model_card(parent_repo, kind, bits, license_tag=meta["license"],
-                      pipeline_tag=meta["pipeline_tag"], native_dtype=native_dtype,
-                      out_gb=out_gb)
+    quants = []
+    for bits, path in sorted(quant_files):
+        fname = Path(path).name
+        api.upload_file(path_or_fileobj=str(path), path_in_repo=fname, repo_id=rid,
+                        token=token, commit_message=f"upload {fname}")
+        quants.append({"bits": bits, "filename": fname, "gb": Path(path).stat().st_size / 1e9})
+
+    card = model_card(parent_repo, kind, quants, license_tag=meta["license"],
+                      pipeline_tag=meta["pipeline_tag"], native_dtype=native_dtype)
     api.upload_file(path_or_fileobj=card.encode(), path_in_repo="README.md",
                     repo_id=rid, token=token, commit_message="model card (linked quant)")
-    fname = Path(fni8_path).name
-    api.upload_file(path_or_fileobj=fni8_path, path_in_repo=fname, repo_id=rid,
-                    token=token, commit_message=f"upload {fname}")
     return {"status": "published", "repo": rid, "license": meta["license"],
-            "url": f"https://huggingface.co/{rid}"}
+            "bits": [q["bits"] for q in quants], "url": f"https://huggingface.co/{rid}"}

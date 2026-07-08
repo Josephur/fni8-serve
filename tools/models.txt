@@ -24,3 +24,11 @@ Qwen/Qwen3-30B-A3B
 zai-org/GLM-4.5-Air
 tencent/Hunyuan-A13B-Instruct
 # Qwen/Qwen3-Next-80B-A3B-Instruct            # large MoE — enable when disk allows
+
+# --- Gemma 4 family (LLM) ---
+google/gemma-4-E2B-it                          # small (effective ~2B)
+google/gemma-4-E4B-it                          # effective ~4B
+google/gemma-4-12B-it
+google/gemma-4-31B-it                          # dense flagship
+google/gemma-4-26B-A4B-it                      # MoE (26B total / A4B active)
+google/diffusiongemma-26B-A4B-it               # text-diffusion Gemma MoE (26B-A4B)
