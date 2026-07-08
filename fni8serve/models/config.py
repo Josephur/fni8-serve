@@ -119,12 +119,16 @@ class ModelConfig:
     @classmethod
     def from_hf(cls, hf: dict, *, arch: str | None = None) -> "ModelConfig":
         """Map a HuggingFace text config dict onto ModelConfig. Accepts either a
-        top-level text config or one nested under `text_config`."""
+        top-level text config or one nested under `text_config` (multimodal wrappers
+        like Gemma3-it). Some wrappers duplicate a handful of fields at the top level
+        (e.g. `hidden_size`) without duplicating the rest (e.g. `num_attention_heads`),
+        so we can't gate the dive on a single key's absence — merge `text_config` over
+        the top level instead, so its (authoritative) text-model axes always win."""
         c = dict(hf)
-        if "text_config" in c and "hidden_size" not in c:
-            c = dict(c["text_config"])
         archs = c.get("architectures") or []
         model_type = c.get("model_type", "")
+        if c.get("text_config"):
+            c = {**c, **dict(c["text_config"])}
         resolved_arch = arch or model_type or (archs[0] if archs else "unknown")
         n_heads = c["num_attention_heads"]
         return cls(

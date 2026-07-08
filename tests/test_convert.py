@@ -3,13 +3,15 @@
 the offline path is numerically identical to runtime quantization (per-row/per-group
 int8 scale depends only on its own row, so merge-then-quant == quant-then-merge).
 Needs CUDA for the forward."""
+import json
+
 import pytest
 import torch
 
 pytest.importorskip("fni8")
 
-from fni8serve.convert import is_quantizable_linear, quantize_state_dict
-from fni8serve.loader import load_fni8_state_dict
+from fni8serve.convert import convert_hf_to_fni8, is_quantizable_linear, quantize_state_dict
+from fni8serve.loader import checkpoint_info, load_fni8_state_dict
 from fni8serve.models import ModelConfig, ModelRunner, build_model
 
 CUDA = torch.cuda.is_available()
@@ -113,3 +115,80 @@ def test_fni8_model_close_to_runtime_quant(tmp_path):
     b = ModelRunner(model_rt, cfg, max_batch=1, max_len=32, device="cuda").prefill(prompt)
     cos = torch.nn.functional.cosine_similarity(a.flatten().float(), b.flatten().float(), dim=0)
     assert cos.item() >= 0.9999
+
+
+def _hf_config_dict(cfg):
+    return {
+        "model_type": cfg.arch, "vocab_size": cfg.vocab_size, "hidden_size": cfg.hidden_size,
+        "num_hidden_layers": cfg.num_hidden_layers, "num_attention_heads": cfg.num_attention_heads,
+        "num_key_value_heads": cfg.num_key_value_heads, "intermediate_size": cfg.intermediate_size,
+        "max_position_embeddings": cfg.max_position_embeddings, "head_dim": cfg.head_dim,
+    }
+
+
+def test_convert_hf_to_fni8_streams_shards_one_at_a_time(tmp_path, monkeypatch):
+    """Regression for the 220GB-in-RAM OOM (GLM-4.5-Air): convert_hf_to_fni8 must
+    quantize each safetensors shard as it's loaded rather than merging the whole
+    checkpoint into one dict first. A synthetic 2-shard checkpoint stands in for the
+    real multi-hundred-shard ones — the behavior under test (one quantize call per
+    shard, never the full state dict at once) is shard-count-independent."""
+    pytest.importorskip("safetensors")
+    from safetensors.torch import save_file
+
+    import fni8serve.convert as convert_mod
+
+    cfg = _cfg()
+    sd = _sd(cfg)
+    keys = list(sd)
+    mid = len(keys) // 2
+    save_file({k: sd[k] for k in keys[:mid]},
+              str(tmp_path / "model-00001-of-00002.safetensors"))
+    save_file({k: sd[k] for k in keys[mid:]},
+              str(tmp_path / "model-00002-of-00002.safetensors"))
+    (tmp_path / "config.json").write_text(json.dumps(_hf_config_dict(cfg)))
+
+    seen_shard_sizes = []
+    orig_quantize = convert_mod.quantize_state_dict
+
+    def spy(sd_arg, **kw):
+        seen_shard_sizes.append(len(sd_arg))
+        return orig_quantize(sd_arg, **kw)
+
+    monkeypatch.setattr(convert_mod, "quantize_state_dict", spy)
+
+    out = tmp_path / "m.fni8"
+    convert_mod.convert_hf_to_fni8(str(tmp_path), str(out), weight_bits=8)
+
+    assert seen_shard_sizes == [mid, len(keys) - mid]   # one call per shard...
+    assert all(n < len(keys) for n in seen_shard_sizes)  # ...never the full state dict
+    assert checkpoint_info(str(out))["num_tensors"] == len(keys)
+
+
+def test_convert_hf_to_fni8_multi_shard_output_matches_single_shard(tmp_path):
+    """However the checkpoint is split into shards, the quantized output must be
+    identical (per-row/per-group scales depend only on a tensor's own values)."""
+    pytest.importorskip("safetensors")
+    from safetensors.torch import save_file
+
+    cfg = _cfg()
+    sd = _sd(cfg)
+    cfg_json = json.dumps(_hf_config_dict(cfg))
+
+    one_shard_dir = tmp_path / "one"
+    one_shard_dir.mkdir()
+    save_file(sd, str(one_shard_dir / "model.safetensors"))
+    (one_shard_dir / "config.json").write_text(cfg_json)
+    out_one = one_shard_dir / "m.fni8"
+    convert_hf_to_fni8(str(one_shard_dir), str(out_one), weight_bits=8)
+
+    many_shard_dir = tmp_path / "many"
+    many_shard_dir.mkdir()
+    for i, k in enumerate(sd):
+        save_file({k: sd[k]}, str(many_shard_dir / f"model-{i:05d}.safetensors"))
+    (many_shard_dir / "config.json").write_text(cfg_json)
+    out_many = many_shard_dir / "m.fni8"
+    convert_hf_to_fni8(str(many_shard_dir), str(out_many), weight_bits=8)
+
+    info_one, info_many = checkpoint_info(str(out_one)), checkpoint_info(str(out_many))
+    assert info_one["num_tensors"] == info_many["num_tensors"] == len(sd)
+    assert info_one["arch"] == info_many["arch"] == cfg.arch

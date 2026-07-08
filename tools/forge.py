@@ -40,6 +40,19 @@ def _name(repo: str) -> str:
     return repo.replace("/", "__")
 
 
+def _purge_stale_staging():
+    """Remove any leftover staging/<name> dirs from a prior crash. An OOM SIGKILL
+    (e.g. GLM-4.5-Air) kills the process outright, skipping forge_one's per-model
+    `finally` cleanup, so a stale staging dir can otherwise sit on the archive disk
+    (up to a full model's worth of shards) until someone notices."""
+    if not STAGING.exists():
+        return
+    for d in STAGING.iterdir():
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
+            print(f"[purge] removed stale staging dir {d.name}")
+
+
 def _manifest() -> dict:
     return json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {"models": {}}
 
@@ -192,6 +205,7 @@ def main():
         sys.exit(0 if ok else 1)
 
     # batch: lines "repo[,kind[,bits]]", '#' comments
+    _purge_stale_staging()
     for raw in Path(a.target).read_text().splitlines():
         line = raw.split("#")[0].strip()
         if not line:

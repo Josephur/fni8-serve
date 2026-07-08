@@ -82,7 +82,14 @@ def _raw_dtype(w: torch.Tensor) -> torch.Tensor:
 def convert_hf_to_fni8(hf_dir: str, out_path: str, *, weight_bits: int = 8,
                        group_size: int = 128, arch: str | None = None) -> ModelConfig:
     """Read an HF model dir (config.json + *.safetensors) and write a `.fni8`.
-    Returns the ModelConfig (also embedded in the file meta)."""
+    Returns the ModelConfig (also embedded in the file meta).
+
+    Shards are streamed one at a time — load, quantize, drop the raw shard, next —
+    so peak RAM is the quantized-so-far dict plus a single raw shard, never the full
+    fp16/bf16 model (the 220GB-model-in-RAM OOM that killed GLM-4.5-Air mid-batch).
+    Each HF tensor lives wholly in one shard, and q/k/v & gate/up stay unmerged on
+    disk (the model builders merge them at load time, see fni8serve/models/weights.py),
+    so per-shard quantization needs no cross-shard state."""
     from safetensors.torch import load_file
 
     with open(os.path.join(hf_dir, "config.json")) as f:
@@ -90,14 +97,16 @@ def convert_hf_to_fni8(hf_dir: str, out_path: str, *, weight_bits: int = 8,
     cfg = ModelConfig.from_hf(hf_cfg, arch=arch)
     cfg.weight_bits = weight_bits
 
-    sd: dict[str, torch.Tensor] = {}
-    shards = [f for f in os.listdir(hf_dir) if f.endswith(".safetensors")]
+    shards = sorted(f for f in os.listdir(hf_dir) if f.endswith(".safetensors"))
     if not shards:
         raise FileNotFoundError(f"no .safetensors in {hf_dir}")
-    for shard in sorted(shards):
-        sd.update(load_file(os.path.join(hf_dir, shard)))
 
-    qsd = quantize_state_dict(sd, weight_bits=weight_bits, group_size=group_size)
+    qsd: dict[str, QTensor] = {}
+    for shard in shards:
+        sd = load_file(os.path.join(hf_dir, shard))
+        qsd.update(quantize_state_dict(sd, weight_bits=weight_bits, group_size=group_size))
+        del sd
+
     meta = {"arch": cfg.arch, "weight_bits": weight_bits,
             "config": {k: v for k, v in vars(cfg).items() if not isinstance(v, dict)}}
     save_fni8(out_path, qsd, meta=meta)
