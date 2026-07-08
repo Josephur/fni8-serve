@@ -34,3 +34,9 @@ google/gemma-4-12B-it
 google/gemma-4-31B-it                          # dense flagship
 google/gemma-4-26B-A4B-it                      # MoE (26B total / A4B active)
 google/diffusiongemma-26B-A4B-it               # text-diffusion Gemma MoE (26B-A4B)
+
+# --- Huge FP8 MoE (convert from FP8 → int8; FP8 is ~half the download) ---
+tencent/Hy3-FP8                                # hy_v3 192-expert MoE, static-fp8, ~300GB (vs 598 bf16)
+deepseek-ai/DeepSeek-V3.1                      # MLA, block-fp8 [128,128], ~689GB
+# deepseek-ai/DeepSeek-V4-Flash                # V4 uses a NON-standard hc_*_scale fp8 — needs decode first
+# deepseek-ai/DeepSeek-V4-Pro                  # (same; TODO once V4 fp8 layout is handled)

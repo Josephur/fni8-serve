@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: MIT
+"""FP8 dequant tests — round-trip fp32 -> fp8 -> dequant recovers values within
+fp8's own precision, for static, per-channel, and block scale layouts."""
+import pytest
+import torch
+
+from fni8serve.fp8 import dequantize_fp8, fp8_scale_name, is_fp8
+
+fp8 = pytest.importorskip("torch").float8_e4m3fn
+
+
+def _quant_static(w, scale):
+    """Quantize fp32 w to fp8 with a single scalar scale (real = fp8 * scale)."""
+    return (w / scale).to(fp8)
+
+
+def test_static_scalar_roundtrip():
+    torch.manual_seed(0)
+    w = torch.randn(64, 128) * 0.1
+    scale = w.abs().max() / 448.0                       # e4m3 max ~448
+    q = _quant_static(w, scale)
+    out = dequantize_fp8(q, scale.reshape(1))
+    assert is_fp8(q)
+    assert torch.cosine_similarity(out.flatten(), w.flatten(), dim=0) > 0.99
+
+
+def test_per_channel_roundtrip():
+    torch.manual_seed(1)
+    w = torch.randn(32, 96)
+    scale = w.abs().amax(dim=1, keepdim=True) / 448.0   # [O,1]
+    q = (w / scale).to(fp8)
+    out = dequantize_fp8(q, scale)                       # per-channel
+    assert out.shape == w.shape
+    assert torch.cosine_similarity(out.flatten(), w.flatten(), dim=0) > 0.99
+
+
+def test_block_roundtrip():
+    torch.manual_seed(2)
+    O, I, b = 256, 256, 128
+    w = torch.randn(O, I)
+    # per-128x128-block scale
+    grid = torch.zeros(O // b, I // b)
+    for bi in range(O // b):
+        for bj in range(I // b):
+            grid[bi, bj] = w[bi*b:(bi+1)*b, bj*b:(bj+1)*b].abs().max() / 448.0
+    full = grid.repeat_interleave(b, 0).repeat_interleave(b, 1)
+    q = (w / full).to(fp8)
+    out = dequantize_fp8(q, grid, block_size=[b, b])
+    assert out.shape == w.shape
+    assert torch.cosine_similarity(out.flatten(), w.flatten(), dim=0) > 0.99
+
+
+def test_block_ragged_tail_clips():
+    O, I, b = 130, 130, 128                              # not a multiple of 128
+    w = torch.randn(O, I)
+    grid = torch.ones(2, 2)                              # ceil(130/128)=2
+    out = dequantize_fp8(w.to(fp8), grid, block_size=[b, b])
+    assert out.shape == (O, I)                           # clipped, no shape blow-up
+
+
+def test_scale_name_pairing():
+    names = {"m.q_proj.weight", "m.q_proj.weight_scale", "m.o_proj.weight",
+             "m.o_proj.weight_scale_inv"}
+    assert fp8_scale_name("m.q_proj.weight", names) == "m.q_proj.weight_scale"
+    assert fp8_scale_name("m.o_proj.weight", names) == "m.o_proj.weight_scale_inv"
+    assert fp8_scale_name("m.absent.weight", names) is None
+
+
+def test_convert_quantizes_fp8_weight_and_drops_scale():
+    """quantize_state_dict: an fp8 linear + its scale -> one int8 QTensor; the scale
+    tensor is consumed (not emitted), and the int8 result tracks the real values."""
+    from fni8serve.convert import quantize_state_dict
+
+    torch.manual_seed(3)
+    w = torch.randn(64, 128)
+    scale = w.abs().amax(dim=1, keepdim=True) / 448.0
+    q = (w / scale).to(fp8)
+    sd = {"model.layers.0.self_attn.q_proj.weight": q,
+          "model.layers.0.self_attn.q_proj.weight_scale": scale}
+    out = quantize_state_dict(sd, weight_bits=8)
+    assert "model.layers.0.self_attn.q_proj.weight" in out
+    assert "model.layers.0.self_attn.q_proj.weight_scale" not in out   # consumed
+    qt = out["model.layers.0.self_attn.q_proj.weight"]
+    assert qt.scheme == "per_row_i8"
+    # int8 dequant ≈ real weights
+    deq = qt.data.float() * qt.scale.reshape(-1, 1)
+    assert torch.cosine_similarity(deq.flatten(), w.flatten(), dim=0) > 0.98
