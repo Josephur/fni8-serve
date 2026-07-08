@@ -17,26 +17,39 @@ Wan-AI/Wan2.2-T2V-A14B-Diffusers, dit         # 14B (big) — later in the run
 # LTX-2.3 22B distilled v1.1 — flat repo, quant ONE file (batch can't pass it; use:
 #   forge.sh one Lightricks/LTX-2.3 --kind dit --weight-file ltx-2.3-22b-distilled-1.1.safetensors --bits 8|4)
 
-# --- LLMs ---
-Qwen/Qwen3-0.6B
-LiquidAI/LFM2-1.2B
-google/gemma-3-4b-it
-Qwen/Qwen3-8B
-Qwen/Qwen3-30B-A3B
-zai-org/GLM-4.5-Air
-tencent/Hunyuan-A13B-Instruct
-# Qwen/Qwen3-Next-80B-A3B-Instruct            # large MoE — enable when disk allows
+# --- LLMs: LATEST per family (July 2026). FP8 sources where available — they are
+#     block-fp8 [128,128], which convert.py handles, and roughly half the bf16 download.
+#     Older versions (Qwen3.x, GLM-4.5, LFM2, gemma-3, Hunyuan-A13B) intentionally dropped. ---
 
-# --- Gemma 4 family (LLM) ---
-google/gemma-4-E2B-it                          # small (effective ~2B)
-google/gemma-4-E4B-it                          # effective ~4B
+# Small / quick (validate + genuinely current)
+LiquidAI/LFM2.5-350M                            # latest Liquid; tiny (0.7GB)
+LiquidAI/LFM2.5-230M
+deepreinforce-ai/Ornith-1.0-35B                # trending; qwen3_5_moe, ~70GB bf16
+
+# Qwen 3.6 (latest Qwen)
+Qwen/Qwen3.6-27B-FP8                            # dense flagship, block-fp8
+Qwen/Qwen3.6-35B-A3B-FP8                        # MoE, trending, block-fp8
+
+# GLM 5.2 (latest GLM; drops the 2-versions-old GLM-4.5-Air)
+zai-org/GLM-5.2-FP8                             # glm_moe_dsa, block-fp8, ~756GB (vs 1507 bf16)
+
+# Kimi (latest Moonshot)
+moonshotai/Kimi-K2.6                            # kimi_k25, ~595GB bf16
+
+# Gemma 4 (latest Gemma)
+google/gemma-4-E2B-it
+google/gemma-4-E4B-it
 google/gemma-4-12B-it
-google/gemma-4-31B-it                          # dense flagship
-google/gemma-4-26B-A4B-it                      # MoE (26B total / A4B active)
-google/diffusiongemma-26B-A4B-it               # text-diffusion Gemma MoE (26B-A4B)
+google/gemma-4-31B-it
+google/gemma-4-26B-A4B-it                       # MoE
+google/diffusiongemma-26B-A4B-it                # text-diffusion Gemma MoE
 
-# --- Huge FP8 MoE (convert from FP8 → int8; FP8 is ~half the download) ---
-tencent/Hy3-FP8                                # hy_v3 192-expert MoE, static-fp8, ~300GB (vs 598 bf16)
-deepseek-ai/DeepSeek-V3.1                      # MLA, block-fp8 [128,128], ~689GB
-# deepseek-ai/DeepSeek-V4-Flash                # V4 uses a NON-standard hc_*_scale fp8 — needs decode first
-# deepseek-ai/DeepSeek-V4-Pro                  # (same; TODO once V4 fp8 layout is handled)
+# Tencent / DeepSeek huge FP8 MoE
+tencent/Hy3-FP8                                 # hy_v3 192-expert MoE, ~300GB
+deepseek-ai/DeepSeek-V3.1                       # MLA, block-fp8, ~689GB
+
+# Pending format support (do NOT enable until handled):
+# deepseek-ai/DeepSeek-V4-Flash / -Pro          # non-standard hc_*_scale fp8 (task: decode it)
+# openai/gpt-oss-20b / -120b                    # mxfp4 microscaling — needs MX dequant
+# MiniMaxAI/MiniMax-M3-MXFP8                     # mxfp8 microscaling — needs MX dequant
+# meituan-longcat/LongCat-2.0                   # ~3.5TB — too large for the fleet
