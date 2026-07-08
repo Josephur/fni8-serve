@@ -34,6 +34,19 @@ def load_fni8_checkpoint(
         return r.load_many(names, device)
 
 
+def load_fni8_state_dict(path: str, *, device: str = "cuda",
+                         names: list[str] | None = None, shard: str | None = None) -> dict:
+    """Build-ready state dict: quantized tensors stay QTensor, `raw` tensors (norms,
+    embeddings, router gate) are unwrapped to plain fp16 Tensors — exactly what the
+    model builders expect (LinearW8A8 takes a QTensor; RMSNorm/Embedding take a
+    Tensor). Feed straight into `build_model(cfg, state_dict)`."""
+    loaded = load_fni8_checkpoint(path, device=device, names=names, shard=shard)
+    out: dict = {}
+    for name, qt in loaded.items():
+        out[name] = qt.data if getattr(qt, "scheme", None) == "raw" else qt
+    return out
+
+
 def checkpoint_info(path: str) -> dict:
     """Header summary (arch, quant, tensor count, shard index) without loading data."""
     with FQReader(path) as r:

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 """fni8-serve — W8A8 dp4a inference server for Volta / CMP 100-210, over `fni8`."""
 from .config import ServeConfig
-from .loader import load_fni8_checkpoint
+from .convert import convert_hf_to_fni8, quantize_state_dict
+from .engine import LLMEngine, SamplingParams
+from .loader import checkpoint_info, load_fni8_checkpoint, load_fni8_state_dict
 from .models import (
     ModelConfig,
     ModelRunner,
@@ -13,6 +15,12 @@ from .models import (
 __all__ = [
     "ServeConfig",
     "load_fni8_checkpoint",
+    "load_fni8_state_dict",
+    "checkpoint_info",
+    "convert_hf_to_fni8",
+    "quantize_state_dict",
+    "LLMEngine",
+    "SamplingParams",
     "ModelConfig",
     "ModelRunner",
     "build_model",
