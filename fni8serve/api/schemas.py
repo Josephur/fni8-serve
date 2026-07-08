@@ -20,6 +20,23 @@ class ChatMessage(BaseModel):
     name: str | None = None
 
 
+class JSONSchemaSpec(BaseModel):
+    name: str | None = None
+    schema_: dict | None = Field(default=None, alias="schema")
+    strict: bool | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class ResponseFormat(BaseModel):
+    """OpenAI `response_format` (issue #39): `json_schema` is compiled by XGrammar
+    into a token-mask matcher and applied via the sampler's logit-processor hook
+    (`fni8serve.structured`). `json_object` uses XGrammar's builtin JSON grammar
+    (any valid JSON, unconstrained by a schema)."""
+    type: Literal["text", "json_object", "json_schema"] = "text"
+    json_schema: JSONSchemaSpec | None = None
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
@@ -28,6 +45,10 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = None
     stream: bool = False
     stop: str | list[str] | None = None
+    response_format: ResponseFormat | None = None
+    # fni8-serve extension: a raw grammar (GBNF/EBNF), compiled by XGrammar the same
+    # way as `response_format={"type": "json_schema"}`. Takes precedence if both are set.
+    grammar: str | None = None
 
 
 class CompletionRequest(BaseModel):
@@ -38,6 +59,8 @@ class CompletionRequest(BaseModel):
     max_tokens: int = 16
     stream: bool = False
     stop: str | list[str] | None = None
+    response_format: ResponseFormat | None = None
+    grammar: str | None = None
 
 
 class UsageInfo(BaseModel):

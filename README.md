@@ -115,6 +115,47 @@ wired through `SamplingParams.logit_processors`): a list of
 `(input_ids, logits) -> logits` callables applied before sampling, per sequence.
 This is the seam structured outputs / grammars plug into.
 
+### Structured outputs / grammars
+
+`fni8serve.structured` plugs [XGrammar](https://github.com/mlc-ai/xgrammar) into that
+logit-processor hook: it compiles a JSON schema or a grammar into a token-mask
+matcher, masks disallowed tokens each step, and advances the matcher on the token
+actually sampled. Pure Python/CPU -- no CUDA needed for the mask itself. Needs the
+`structured` extra: `pip install -e ".[structured]"`.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+resp = client.chat.completions.create(
+    model="qwen3-8b.fni8",
+    messages=[{"role": "user", "content": "Extract the name and age as JSON."}],
+    response_format={
+        "type": "json_schema",
+        "json_schema": {"name": "person", "schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+            "required": ["name", "age"],
+        }},
+    },
+)
+```
+
+A `grammar` request field is the same mechanism for a raw grammar (GBNF/EBNF)
+instead of a JSON schema -- and wins if both are set:
+
+```python
+resp = client.chat.completions.create(
+    model="qwen3-8b.fni8",
+    messages=[{"role": "user", "content": "Yes or no: is the sky blue?"}],
+    extra_body={"grammar": 'root ::= "yes" | "no"'},
+)
+```
+
+`fni8serve.structured.GrammarCompilerCache` caches the (vocab-walk-expensive)
+`xgrammar.GrammarCompiler` per tokenizer; XGrammar itself caches compiled
+grammars/schemas, so repeat schemas across requests compile once.
+
 `--chat-template <file>` overrides the tokenizer's own embedded template with a
 Jinja source file (matches vLLM's `--chat-template` flag). The override still
 renders through `apply_chat_template`, so it gets the same sandboxed Jinja
@@ -145,6 +186,9 @@ over shared layers, registered with `@register_model`. The engine never changes.
 - [x] Paged-KV block-table with int8 quantize-on-write, wired into the engine
 - [x] OpenAI-compatible API server (`fni8serve.api`) with SSE streaming, plus a
       per-step logit-processor hook in the sampler for structured outputs / grammars
+- [x] Structured outputs / grammars (`fni8serve.structured`): XGrammar behind the
+      logit-processor hook, `response_format={type: json_schema}` + a `grammar`
+      (GBNF/EBNF) extension
 - [ ] int8 dp4a DeltaNet and MLA kernels in `fni8` (the divergent-attention acceleration)
 - [ ] multi-GPU PP + MoE-EP with `fni8.transport`
 

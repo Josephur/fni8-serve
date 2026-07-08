@@ -13,6 +13,7 @@ openai = pytest.importorskip("openai")
 httpx = pytest.importorskip("httpx")
 
 from fni8serve.api.app import create_app  # noqa: E402
+from fni8serve.api.schemas import ChatCompletionRequest  # noqa: E402
 from fni8serve.engine.sequence import SamplingParams, Sequence, Status  # noqa: E402
 
 _VOCAB = {0: "Hello", 1: ",", 2: " world", 3: "!"}
@@ -164,6 +165,32 @@ def test_chat_uses_the_tokenizers_own_template_by_default(http_client, tokenizer
         "model": "fake-qwen3", "messages": [{"role": "user", "content": "hi"}],
     })
     assert tokenizer.chat_template_calls == [None]
+
+
+def test_response_format_json_schema_parses_openais_shape():
+    """The `response_format` field (issue #39) must accept OpenAI's own
+    `{"type": "json_schema", "json_schema": {"name": ..., "schema": {...}}}` shape --
+    `schema` is a reserved BaseModel attribute name, so it's aliased to `schema_`."""
+    req = ChatCompletionRequest.model_validate({
+        "model": "fake-qwen3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "answer", "schema": {"type": "object"}},
+        },
+    })
+    assert req.response_format.type == "json_schema"
+    assert req.response_format.json_schema.name == "answer"
+    assert req.response_format.json_schema.schema_ == {"type": "object"}
+
+
+def test_grammar_extension_field_parses():
+    req = ChatCompletionRequest.model_validate({
+        "model": "fake-qwen3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "grammar": 'root ::= "yes" | "no"',
+    })
+    assert req.grammar == 'root ::= "yes" | "no"'
 
 
 def test_chat_template_override_is_threaded_through(tokenizer):
