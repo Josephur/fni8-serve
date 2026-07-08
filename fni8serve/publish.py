@@ -121,42 +121,77 @@ def model_card(
         fm.append(f"  - {t}")
     fm.append("---")
 
-    dt = (f"\n- **Source dtype:** `{native_dtype}` (raw tensors kept fp16, upcast to "
-          f"fp32 only on overflow).") if native_dtype else ""
+    parent_name = parent_repo.split("/")[-1]
     label = " + ".join(f"int{b}" for b in bits_present)
+    dt = (f"\n- Source dtype: `{native_dtype}`. Non-quantized tensors are stored fp16, "
+          f"upcast to fp32 only where fp16 would overflow.") if native_dtype else ""
     rows = "\n".join(
-        f"| `{q['filename']}` | **int{q['bits']}** | {_scheme(q['bits'])} | "
-        f"{q['gb']:.2f} GB |"
+        f"| `{q['filename']}` | int{q['bits']} | {_scheme(q['bits'])} | {q['gb']:.2f} GB |"
         for q in sorted(quants, key=lambda q: q["bits"])
     )
+    if kind == "dit":
+        use = ("Load with [ComfyUI-fni8](https://github.com/jajmangold/ComfyUI-fni8), "
+               "which runs the diffusion transformer through the dp4a kernels inside "
+               "ComfyUI (`UnetLoaderFNI8`). The text encoder and VAE are unchanged.")
+    else:
+        use = ("Serve with [fni8-serve](https://github.com/jajmangold/fni8-serve): "
+               "`load_fni8_state_dict(<file>)` into an `LLMEngine`. The architecture is "
+               "read from the file; no separate config is needed.")
+
     body = f"""
-# {parent_repo.split('/')[-1]} — fni8 ({label} dp4a)
+# {parent_name} — fni8 ({label})
 
-Quantization of [`{parent_repo}`](https://huggingface.co/{parent_repo}) to the
-**`.fni8`** resident format for the [**fni8**](https://github.com/jajmangold/fni8)
-W8A8 DP4A kernels on **NVIDIA Volta (sm_70)** — Tesla V100 / CMP 100-210.
+An int8/int4 quantization of [`{parent_repo}`](https://huggingface.co/{parent_repo})
+to the `.fni8` format, for the [fni8](https://github.com/jajmangold/fni8) DP4A kernels
+on NVIDIA Volta (sm_70) GPUs (Tesla V100 and CMP 100-210). It is a derivative of the
+parent model; its license and acceptable uses follow the parent, linked above.
 
-## Files (precision per file)
+## Files
 
 | file | precision | scheme | size |
 |------|-----------|--------|------|
 {rows}
 
-Pick the file for the precision you want — **`.b8.` = int8 (W8A8)**, **`.b4.` = int4
-(W4A8)**. Weights are fp32-scaled and stored in the resident dp4a VRAM layout (loads
-with no dequant/repack).{dt}
+`.b8.` files are int8, `.b4.` files are int4. Download the one you want. The bytes are
+the resident dp4a VRAM layout, so loading is a memory-map and copy with no dequantize
+or repack step.
 
-- **Why dp4a:** sm_70 has no int8 tensor cores; the contraction runs on the
-  `__dp4a` CUDA-core intrinsic. On the CMP-100-210 fleet (firmware-gimped fp16
-  tensor cores) dp4a is the fast path, not a compromise.
+## How to use
 
-## Use it
+{use}
 
-- **Kernels:** <https://github.com/jajmangold/fni8>
-- **LLM serving:** <https://github.com/jajmangold/fni8-serve>
-- **ComfyUI (diffusion DiTs):** <https://github.com/jajmangold/ComfyUI-fni8>
+## What was quantized
 
-This is a derivative quantization; its license follows the parent model above.
+- Linear and attention weights go to int8 (per-row) or int4 (per-group), with fp32
+  scales. Norms, embeddings, and the MoE router are kept in fp16.{dt}
+- Target hardware is sm_70, where the fp16 tensor cores are firmware-limited, so the
+  integer `__dp4a` path is used for the matmuls.
+
+## Intended use and scope
+
+- For inference with the fni8 runtimes above, on Volta (sm_70) GPUs.
+- Out of scope: other GPU architectures (the kernels require sm_70), and anything the
+  parent model's license does not permit. It is a derivative, not a new model.
+
+## Limitations
+
+- Quantization is lossy. int8 and especially int4 outputs differ from the fp16/bf16
+  parent, and the difference varies by model and task.
+- This repository does not include per-model accuracy or benchmark measurements.
+  Evaluate on your own task before relying on it.
+- Any capabilities, biases, and risks of the parent model carry over. See the parent
+  model card for those.
+
+## License
+
+Follows the parent model{f' (`{license_tag}`)' if license_tag else ''}. This is a
+derivative quantization, not a relicense.
+
+---
+
+Part of the fni8 stack: [kernels](https://github.com/jajmangold/fni8) ·
+[LLM serving](https://github.com/jajmangold/fni8-serve) ·
+[ComfyUI DiTs](https://github.com/jajmangold/ComfyUI-fni8).
 """
     return "\n".join(fm) + "\n" + body
 

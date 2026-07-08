@@ -61,6 +61,27 @@ def test_model_card_links_back_to_github():
     assert "github.com/jajmangold/ComfyUI-fni8" in card
 
 
+def test_model_card_has_honest_sections_and_no_invented_metrics():
+    """Avoid AI model-card pitfalls: real Intended-use + Limitations sections, an
+    explicit 'no per-model benchmarks' disclaimer, and no fabricated accuracy numbers
+    (we never measured per-model, so the card must not imply we did)."""
+    card = model_card("Qwen/Qwen3-8B", "llm", [_q(8, 8.8)], license_tag="apache-2.0").lower()
+    assert "## intended use" in card
+    assert "out of scope" in card
+    assert "## limitations" in card
+    assert "does not include per-model accuracy" in card
+    # no invented eval metrics
+    for bad in ("mmlu", "humaneval", "perplexity", "% accuracy", "sqnr ="):
+        assert bad not in card
+
+
+def test_model_card_dit_points_to_comfyui_not_serve_for_usage():
+    card = model_card("black-forest-labs/FLUX.2-klein-4b", "dit", [_q(8)],
+                      license_tag="apache-2.0")
+    assert "UnetLoaderFNI8" in card          # dit usage path
+    assert "LLMEngine" not in card           # not the LLM path in How-to-use
+
+
 def test_model_card_inherits_parent_license_even_when_restricted():
     card = model_card("black-forest-labs/FLUX.1-dev", "dit", [_q(8)],
                       license_tag="flux-1-dev-non-commercial-license",
