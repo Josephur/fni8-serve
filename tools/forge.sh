@@ -18,6 +18,7 @@ docker compose -f "$FNI8_DIR/docker-compose.yml" run --rm \
   -e HUGGING_FACE_HUB_TOKEN \
   -e HF_HOME=/mnt/24tb/fni8-forge/hf \
   -e HF_HUB_ENABLE_HF_TRANSFER=1 \
+  -e HF_XET_HIGH_PERFORMANCE=1 \
   -e FORGE_BASE=/mnt/24tb/fni8-forge \
   -e FORGE_MIN_FREE_GB="${FORGE_MIN_FREE_GB:-300}" \
   test bash -lc "pip install -q huggingface_hub hf_transfer safetensors 2>/dev/null || pip install -q huggingface_hub safetensors 2>/dev/null; python3 /serve/tools/forge.py $*"
