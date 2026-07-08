@@ -32,11 +32,19 @@ class SparseMoE(nn.Module):
         act: str = "silu",
         shared_expert: tuple[QTensor, QTensor] | None = None,
         shared_expert_gate: torch.Tensor | None = None,   # [1, hidden] fp16 or None
+        scoring_func: str = "softmax",       # "softmax" (Qwen/Hunyuan/MiniMax) | "sigmoid" (GLM/DeepSeek/LFM2)
+        e_score_correction_bias: torch.Tensor | None = None,  # [E] fp32, sigmoid selection bias
+        routed_scaling_factor: float = 1.0,
     ):
         super().__init__()
         self.gate = nn.Parameter(gate)
         self.top_k = top_k
         self.norm_topk_prob = norm_topk_prob
+        self.scoring_func = scoring_func
+        self.routed_scaling_factor = routed_scaling_factor
+        self.register_buffer(
+            "e_score_bias", e_score_correction_bias.float() if e_score_correction_bias is not None
+            else None, persistent=False)
         self.experts = nn.ModuleList([GatedMLP(gu, dn, act=act) for gu, dn in experts])
         self.shared = GatedMLP(*shared_expert, act=act) if shared_expert else None
         self.shared_gate = nn.Parameter(shared_expert_gate) if shared_expert_gate is not None else None
@@ -45,11 +53,17 @@ class SparseMoE(nn.Module):
         B, S, H = x.shape
         xf = x.reshape(-1, H)                                    # [T, H]
         router_logits = F.linear(xf.float(), self.gate.float())  # [T, E]
-        weights = F.softmax(router_logits, dim=-1)               # softmax over ALL experts, fp32
-        topw, topi = torch.topk(weights, self.top_k, dim=-1)     # [T, k]
+        if self.scoring_func == "sigmoid":
+            scores = torch.sigmoid(router_logits)               # GLM/DeepSeek/LFM2
+            sel = scores + self.e_score_bias if self.e_score_bias is not None else scores
+            _, topi = torch.topk(sel, self.top_k, dim=-1)       # select by biased score
+            topw = scores.gather(-1, topi)                      # weight by UN-biased score
+        else:
+            scores = F.softmax(router_logits, dim=-1)           # softmax over ALL experts, fp32
+            topw, topi = torch.topk(scores, self.top_k, dim=-1)
         if self.norm_topk_prob:
-            topw = topw / topw.sum(dim=-1, keepdim=True)
-        topw = topw.to(x.dtype)
+            topw = topw / topw.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        topw = (topw * self.routed_scaling_factor).to(x.dtype)
 
         out = torch.zeros_like(xf)
         # gather tokens per expert (only run experts that got routed to)

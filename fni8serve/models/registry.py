@@ -53,8 +53,8 @@ def _resolve(arch: str) -> str | None:
         return a
     if a in _ALIASES:
         return _ALIASES[a]
-    # HF arch class names like "Qwen3ForCausalLM" -> "qwen3"
-    for key in _REGISTRY:
-        if a.startswith(key) or a.replace("forcausallm", "").rstrip("_") == key:
-            return key
-    return None
+    # HF arch class names like "Qwen3ForCausalLM" -> "qwen3". Strip the common
+    # suffix and match EXACTLY — never a bare startswith (that wrongly maps
+    # "qwen3_next" -> "qwen3"). Aliases (registered explicitly) handle the rest.
+    stripped = a.replace("forcausallm", "").replace("forconditionalgeneration", "").rstrip("_")
+    return stripped if stripped in _REGISTRY else None

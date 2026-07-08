@@ -106,3 +106,47 @@ class GatedDeltaNetAttention(nn.Module):
         o = recurrent_gated_delta_rule(q, k, v, beta.reshape(B, self.nv, L), g.reshape(B, self.nv, L))
         o = self.norm(o.transpose(1, 2).reshape(B, L, self.nv * self.vd))
         return self.out_proj(o)
+
+
+def lightning_attention(q, k, v, slopes) -> torch.Tensor:
+    """MiniMax lightning attention (TransNormer): data-INDEPENDENT fixed decay, no
+    delta correction. S_t = ratio_h S_{t-1} + k_t^T v_t ; o_t = q_t S_t, with per-head
+    ratio = exp(-slope). q,k: [B,H,L,Dk], v: [B,H,L,Dv], slopes: [H]. Scalar oracle."""
+    B, H, L, Dk = q.shape
+    Dv = v.shape[-1]
+    S = torch.zeros(B, H, Dv, Dk, dtype=torch.float32, device=q.device)
+    ratio = torch.exp(-slopes.float()).view(1, H, 1, 1)
+    qf, kf, vf = q.float(), k.float(), v.float()
+    out = torch.empty(B, H, L, Dv, dtype=torch.float32, device=q.device)
+    for t in range(L):
+        S = ratio * S + vf[:, :, t][..., :, None] * kf[:, :, t][..., None, :]   # k^T v outer
+        out[:, :, t] = torch.einsum("bhvk,bhk->bhv", S, qf[:, :, t])
+    return out.to(v.dtype)
+
+
+def lightning_slopes(num_heads: int, device="cpu") -> torch.Tensor:
+    """ALiBi-style per-head decay slopes: 2^(-8*(h+1)/H)."""
+    h = torch.arange(1, num_heads + 1, device=device, dtype=torch.float32)
+    return torch.pow(2.0, -8.0 * h / num_heads)
+
+
+class ShortConv(nn.Module):
+    """LFM2 double-gated causal depthwise short conv (LIV): out = out_proj(C * conv(B*x)),
+    with (B,C,x) = in_proj(h).chunk(3). in_proj/out_proj on dp4a; conv is depthwise k=3."""
+
+    def __init__(self, dim: int, *, in_proj: QTensor, out_proj: QTensor, conv_weight, kernel=3):
+        super().__init__()
+        self.dim = dim
+        self.kernel = kernel
+        self.in_proj = LinearW8A8(in_proj)
+        self.out_proj = LinearW8A8(out_proj)
+        self.register_buffer("conv_weight", conv_weight, persistent=False)   # [dim, 1, k]
+
+    def forward(self, x, positions=None, ctx=None, layer_idx=0):
+        B, L, _ = x.shape
+        bcx = self.in_proj(x)                                    # [B,L,3D]
+        Bg, Cg, xg = bcx.chunk(3, dim=-1)
+        u = (Bg * xg).transpose(1, 2)                            # [B,D,L]
+        u = F.pad(u, (self.kernel - 1, 0))
+        y = F.conv1d(u, self.conv_weight, groups=self.dim).transpose(1, 2)
+        return self.out_proj(Cg * y)

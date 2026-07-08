@@ -7,21 +7,31 @@ a thin `models/<family>.py` assembly over shared layers, registered with
 Support splits by **attention backend** — that's the axis that decides whether a
 family runs on today's fni8 dp4a kernels or needs a new one.
 
-Legend: ✅ concrete + GPU-tested · 🟡 framework/config ready, needs real weights ·
-🟧 scaffold (registered, fp16-fallback) · ⛔ needs a new fni8 kernel.
+Legend: ✅ concrete + GPU-tested (full decode) · 🟩 registered + prefill-tested
+(decode needs recurrent-state/latent cache) · 🟡 config ready, needs real weights ·
+🟧 scaffold · ⛔ int8 accel needs a new fni8 kernel (fp16 backend works).
 
 | family | released | attention backend | MLP | status | notes |
 |---|---|---|---|---|---|
 | **Qwen3** dense | ✅ | GQA (full) | SwiGLU | ✅ | QK-norm pre-RoPE, explicit head_dim=128, θ=1e6 |
 | **Qwen3-MoE** | ✅ | GQA (full) | top-k MoE (no shared) | ✅ | softmax→top-k→renorm; 128 experts / top-8 |
 | **Gemma3** (text) | ✅ | GQA (full + **sliding**) | GeGLU | ✅ | 5-local:1-global, dual-θ RoPE, (1+w) norm, √d embed, scale=`qpas^-0.5` |
-| **GLM-4.5/4.6** | ✅ | GQA + **partial RoPE** | MoE | 🟡 | partial-rotary in place; needs GLM weight-name map |
-| **Hunyuan (HY3)** | partial | GQA + **cross-layer attn** | MoE + shared expert | 🟡 | shared-expert done; CLA = KV-share across layers (config flag) |
-| **Qwen3-Next / Qwen3.5 / Qwen3.6** | ✅ | **hybrid: Gated DeltaNet (linear) + full** | ultra-sparse MoE + shared expert | ⛔ | full-attn + MoE + MTP covered; **DeltaNet linear-attn layers need a kernel** |
-| **DiffusionGemma** | ✅ (post-cutoff) | **bidirectional** over canvas | GeGLU MoE | 🟡 | uses `attn_int8_fwd(causal=False)`; needs DiffusionDecodeStrategy (PR3) |
-| **Gemma4 / gemma3n** | ✅ | GQA + AltUp/LAuReL/PLE/MatFormer | GeGLU | 🟧 | residual-mixing + per-layer-embeddings are new modules; settling upstream |
-| **DeepSeek-V3/V4** | V3 ✅ | **MLA (latent KV)** | fine-grained MoE + shared | ⛔ | **MLA needs a kernel** (or decompress-to-MHA fallback); MoE+MTP covered |
-| **MiniMax-Text** | ✅ | **lightning (linear) attn** hybrid | MoE | ⛔ | **linear-attn kernel** shared with Qwen3-Next DeltaNet |
+| **LFM2 / LFM2-MoE** | ✅ | hybrid **short-conv** + GQA | SwiGLU (w1/w3/w2) | 🟩 | `full_attn_idxs`; double-gated conv(k=3); QK-norm; sigmoid MoE router |
+| **GLM-4.5/4.6** | ✅ | GQA + **partial RoPE 0.5** + QKV-bias | sigmoid MoE + shared | 🟩 | e_score_correction_bias select, routed_scaling 2.5, first-k-dense |
+| **Hunyuan** (A13B) | ✅ | GQA + QK-norm | softmax MoE + shared | 🟩 | `mlp.gate.wg`, `shared_mlp`; CLA (Large) not modeled |
+| **Qwen3-Next / Qwen3.5 / Qwen3.6** | ✅ | **hybrid: Gated DeltaNet (linear) + full** | ultra-sparse MoE + shared | 🟩⛔ | fp16 DeltaNet backend runs; int8 chunked kernel = Track 2 |
+| **DeepSeek-V3/V4** | V3 ✅ | **MLA (latent KV)** | fine MoE + shared | 🟩⛔ | fp16 decompress MLA runs (prefill); absorb int8 kernel = Track 2 |
+| **MiniMax-Text** | ✅ | **lightning (linear)** + softmax hybrid | softmax MoE | 🟩⛔ | fp16 lightning backend runs; postnorm α/β scaling; int8 = Track 2 |
+| **DiffusionGemma** | ✅ (post-cutoff) | **bidirectional** over canvas | GeGLU MoE | 🟡 | `attn_int8_fwd(causal=False)`; needs DiffusionDecodeStrategy |
+| **Gemma4 / gemma3n** | ✅ | GQA + AltUp/LAuReL/PLE/MatFormer | GeGLU | 🟧 | residual-mixing + per-layer-embeddings are new modules |
+
+**Registered & prefill-tested this round** (`tests/test_more_models.py`,
+`test_deepseek.py`): LFM2, GLM, Hunyuan, MiniMax, Qwen3-Next, DeepSeek — all build
+through the registry and run a prefill forward on the fni8 dp4a kernels. Full
+autoregressive decode for the linear/conv/lightning/MLA families needs recurrent-
+state / latent caching (Track 1.5; the Track-2 int8 kernels provide it naturally).
+Generative multimodal (Z-Image, Qwen-Image, LTX, Wan, Qwen3-TTS) → see the
+diffusion-pipeline plan; the DiT backbone reuses these kernels, the pipeline is new.
 
 ## What's proven today (`tests/test_models.py`, GPU)
 
