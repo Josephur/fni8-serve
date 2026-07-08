@@ -52,6 +52,8 @@ class ForwardContext:
         seq_lens: torch.Tensor | None = None,
         slot_mapping: torch.Tensor | None = None,
         block_tables: torch.Tensor | None = None,
+        context_lens: torch.Tensor | None = None,
+        max_context_len: int | None = None,
         attn_mask=None,
         slots: list[int] | None = None,        # engine: which cache slot each batch row uses
         slot_lengths: list[int] | None = None,  # engine: per-row KV length (ragged decode)
@@ -61,8 +63,16 @@ class ForwardContext:
         self.lin_cache = lin_cache     # RecurrentStateCache for linear-attn layers
         self.cu_seqlens = cu_seqlens
         self.seq_lens = seq_lens
+        # `slot_mapping` / `block_tables` / `context_lens` / `max_context_len`: the
+        # CUDA-graph decode path (engine/cuda_graph.py) sets these to persistent
+        # device tensors + a compile-time int, so GQAAttention's paged-decode call
+        # reads fixed memory instead of rebuilding tensors from `slots`/
+        # `slot_lengths` every layer -- required for the whole step to be
+        # capturable. None (the default) keeps the eager list-based path.
         self.slot_mapping = slot_mapping
         self.block_tables = block_tables
+        self.context_lens = context_lens
+        self.max_context_len = max_context_len
         self.attn_mask = attn_mask     # e.g. bidirectional mask for diffusion
         self.slots = slots
         self.slot_lengths = slot_lengths

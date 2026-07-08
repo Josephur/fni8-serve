@@ -105,11 +105,16 @@ def test_paged_kv_recycles_blocks_across_requests():
     """A finished sequence's blocks must return to the shared pool so a later
     request can reuse them. Serially generate far more requests than the block
     pool could satisfy if blocks were ever leaked -- a leak would either exhaust
-    the pool (RuntimeError) or fail the exact free-count check below."""
+    the pool (RuntimeError) or fail the exact free-count check below.
+
+    `enable_cuda_graph=False`: this checks `PagedKVCache.free()` itself, which is
+    orthogonal to CUDA-graph decode -- graphed decode pins one scratch block
+    forever by design (see `tests/test_cuda_graph.py`), which would otherwise
+    make every round after the first look like a 1-block leak here."""
     torch.manual_seed(1)
     cfg = _cfg()
     sd = _sd(cfg)
-    eng = LLMEngine(cfg, sd, device="cuda", max_num_seqs=2, max_len=32)
+    eng = LLMEngine(cfg, sd, device="cuda", max_num_seqs=2, max_len=32, enable_cuda_graph=False)
     total_blocks = eng.cache.num_blocks
 
     for i in range(20):

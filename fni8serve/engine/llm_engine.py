@@ -12,6 +12,7 @@ import itertools
 
 from ..models.config import ModelConfig
 from ..models.registry import build_model
+from .cuda_graph import cuda_graph_enabled_by_env
 from .kv_cache import PagedKVCache
 from .model_runner import EngineRunner
 from .scheduler import Scheduler
@@ -21,17 +22,26 @@ from .sequence import SamplingParams, Sequence
 class LLMEngine:
     def __init__(self, cfg: ModelConfig, weights: dict, *, device="cuda",
                  max_num_seqs: int = 16, max_len: int = 2048, max_batch_tokens: int = 8192,
-                 eos_id: int | None = None):
+                 eos_id: int | None = None, enable_cuda_graph: bool | None = None):
         self.cfg = cfg
         self.device = device
         self.eos_id = eos_id
         self.model = build_model(cfg, weights).to(device).eval()
-        self.cache = PagedKVCache(cfg.num_hidden_layers, max_num_seqs,
+        graph_wanted = (cuda_graph_enabled_by_env() if enable_cuda_graph is None
+                       else enable_cuda_graph)
+        # `GraphedDecode` pins one extra, never-freed cache slot for its padding
+        # rows (see kv_cache.py `_scratch`). Give it a dedicated slot beyond
+        # `max_num_seqs` so real scheduling capacity -- what `max_num_seqs`
+        # promises the caller -- isn't silently reduced by one; the scheduler
+        # itself still never admits more than `max_num_seqs` running sequences.
+        num_slots = max_num_seqs + 1 if graph_wanted else max_num_seqs
+        self.cache = PagedKVCache(cfg.num_hidden_layers, num_slots,
                                   cfg.num_key_value_heads, max_len, cfg.resolved_head_dim(),
                                   device=device)
         self.scheduler = Scheduler(self.cache, max_num_seqs=max_num_seqs,
                                    max_batch_tokens=max_batch_tokens, eos_id=eos_id)
-        self.runner = EngineRunner(self.model, self.cache, device=device)
+        self.runner = EngineRunner(self.model, self.cache, device=device,
+                                   enable_cuda_graph=enable_cuda_graph)
         self._ids = itertools.count()
         self._out: dict[int, Sequence] = {}
 

@@ -14,15 +14,26 @@ import torch
 
 from ..layers.sampler import Sampler
 from ..models.base import ForwardContext
+from .cuda_graph import GraphedDecode, cuda_graph_enabled_by_env
 from .sequence import Sequence
 
 
 class EngineRunner:
-    def __init__(self, model, cache, *, device="cuda"):
+    def __init__(self, model, cache, *, device="cuda", enable_cuda_graph: bool | None = None):
         self.model = model
         self.cache = cache
         self.device = device
         self.sampler = Sampler()
+        # Decode is dispatch-bound (~3,200 cudaLaunchKernel/step on a 28-layer
+        # 0.6B model for ~18ms of real GPU work -- issue #42): `GraphedDecode`
+        # captures the whole decode step into a CUDA graph so replay re-issues
+        # every one of those launches as ONE `cudaGraphLaunch`. Defaults on;
+        # override with the `enable_cuda_graph` kwarg or `FNI8SERVE_CUDA_GRAPH=0`
+        # (eager stays available for debugging either way -- `decode()` falls
+        # back per-step whenever the graph can't serve a batch).
+        if enable_cuda_graph is None:
+            enable_cuda_graph = cuda_graph_enabled_by_env()
+        self.graphed = GraphedDecode(model, cache, device=device) if enable_cuda_graph else None
 
     def _sample(self, logits: torch.Tensor, batch: list[Sequence]) -> list[int]:
         temps = torch.tensor([s.params.temperature for s in batch],
@@ -48,6 +59,15 @@ class EngineRunner:
 
     @torch.inference_mode()
     def decode(self, batch: list[Sequence]) -> list[int]:
+        logits = self.graphed.try_decode(batch) if self.graphed is not None else None
+        if logits is None:
+            return self._decode_eager(batch)
+        for s in batch:
+            s.length += 1
+        return self._sample(logits, batch)
+
+    @torch.inference_mode()
+    def _decode_eager(self, batch: list[Sequence]) -> list[int]:
         ids = torch.tensor([[s.last_token] for s in batch], device=self.device)   # [B,1]
         pos = torch.tensor([[s.length] for s in batch], device=self.device)       # [B,1]
         slots = [s.slot for s in batch]

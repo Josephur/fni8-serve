@@ -75,8 +75,9 @@ class GQAAttention(nn.Module):
             ctx.kv_cache.write_prefill(layer_idx, k, v, slot=slot)
             out = fni8.attn_int8_fwd(q, k, v, causal=True, scale=self.scale,
                                      window_left=self.window_left)
-        elif ctx.slot_lengths is not None:
+        elif ctx.slot_lengths is not None or ctx.slot_mapping is not None:
             out = self._decode_batched(q, k, v, ctx, layer_idx)   # engine continuous batch
+                                                                    # (or CUDA-graph static path)
         else:
             k_all, v_all = ctx.kv_cache.append_decode(layer_idx, k, v)   # [B,Hkv,N,D]
             k_all, v_all = self._window(k_all, v_all)
@@ -103,6 +104,15 @@ class GQAAttention(nn.Module):
         cache = ctx.kv_cache
         k_new, v_new = k[:, :, 0, :], v[:, :, 0, :]           # [B,Hkv,D]: the one new token
         if self.window_left < 0:
+            if ctx.slot_mapping is not None:
+                # CUDA-graph decode (engine/cuda_graph.py): slot_mapping/block_tables/
+                # context_lens are persistent device buffers refreshed via `copy_`
+                # before replay, and max_context_len is a compile-time bucket int --
+                # no fresh per-layer tensor allocation and no `.item()` sync, so this
+                # whole call is capturable.
+                cache.write_decode_static(layer_idx, ctx.slot_mapping, k_new, v_new)
+                return cache.decode_attn_static(layer_idx, q, ctx.block_tables, ctx.context_lens,
+                                                ctx.max_context_len, scale=self.scale)
             cache.write_decode(layer_idx, ctx.slots, ctx.slot_lengths, k_new, v_new)
             return cache.decode_attn(layer_idx, q, ctx.slots, ctx.slot_lengths, scale=self.scale)
         outs = []

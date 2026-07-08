@@ -5,10 +5,11 @@
   "num_prompts": 4,
   "prompt_len": 128,
   "max_new_tokens": 64,
-  "load_s": 0.39979577000485733,
-  "ttft_s": 6.194308940030169,
-  "prefill_tok_s": 82.6565166440514,
-  "decode_tok_s": 30.569834796484297,
-  "peak_vram_gb": 1.34979072,
-  "gpu_load_caveat": "pinned real V100 idx4, idle"
+  "load_s": 0.33322712301742285,
+  "ttft_s": 5.876630552986171,
+  "prefill_tok_s": 87.12475548421716,
+  "decode_tok_s": 136.20391391059758,
+  "peak_vram_gb": 1.379029504,
+  "cuda_graph": true,
+  "gpu_load_caveat": "pinned real V100 idx4, idle; CUDA-graph decode (issue 42), default on"
 }

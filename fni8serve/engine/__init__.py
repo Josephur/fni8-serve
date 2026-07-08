@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Serving engine: request queue + continuous-batching scheduler + runner."""
+from .cuda_graph import GraphedDecode
 from .kv_cache import PagedKVCache
 from .llm_engine import LLMEngine
 from .model_runner import EngineRunner
@@ -14,4 +15,5 @@ __all__ = [
     "Scheduler",
     "EngineRunner",
     "PagedKVCache",
+    "GraphedDecode",
 ]

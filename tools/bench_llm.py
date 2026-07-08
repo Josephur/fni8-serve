@@ -78,7 +78,8 @@ def _weight_sqnr(fni8_path: str, hf_dir: str) -> dict[str, float] | None:
 
 
 def bench_one(path: str, *, num_prompts: int, prompt_len: int, max_new_tokens: int,
-              device: str = "cuda", hf_dir: str | None = None) -> dict:
+              device: str = "cuda", hf_dir: str | None = None,
+              enable_cuda_graph: bool | None = None) -> dict:
     cfg = _load_config(path)
     if not is_supported(cfg.arch):
         return {"model": _name(path), "arch": cfg.arch, "skipped": "arch not registered"}
@@ -96,7 +97,8 @@ def bench_one(path: str, *, num_prompts: int, prompt_len: int, max_new_tokens: i
 
     t_load0 = time.perf_counter()
     engine = LLMEngine(cfg, weights, device=device, max_num_seqs=max(num_prompts, 1),
-                       max_len=prompt_len + max_new_tokens + 8)
+                       max_len=prompt_len + max_new_tokens + 8,
+                       enable_cuda_graph=enable_cuda_graph)
     torch.cuda.synchronize()
     load_s = time.perf_counter() - t_load0
 
@@ -132,6 +134,7 @@ def bench_one(path: str, *, num_prompts: int, prompt_len: int, max_new_tokens: i
         "prefill_tok_s": prefill_toks / ttft_s if ttft_s > 0 else None,
         "decode_tok_s": decode_toks / decode_s if decode_s > 0 else None,
         "peak_vram_gb": torch.cuda.max_memory_allocated() / 1e9,
+        "cuda_graph": bool(engine.runner.graphed is not None and engine.runner.graphed.supported),
     }
     if hf_dir:
         sqnr = _weight_sqnr(path, hf_dir)
@@ -155,6 +158,9 @@ def main():
     ap.add_argument("--gpu-load-caveat", default=None,
                     help="free-text note on concurrent fleet load, stored alongside the result "
                          "(e.g. 'pinned to idx 11; idx 4/7/9 busy with forge quant jobs')")
+    ap.add_argument("--no-cuda-graph", action="store_true",
+                    help="disable CUDA-graph decode (issue #42); default is on, so this bench "
+                         "reports the eager baseline for an eager-vs-graphed comparison")
     a = ap.parse_args()
 
     out_dir = Path(a.out_dir)
@@ -165,7 +171,8 @@ def main():
         try:
             r = bench_one(ckpt, num_prompts=a.num_prompts, prompt_len=a.prompt_len,
                           max_new_tokens=a.max_new_tokens, device=a.device,
-                          hf_dir=a.hf_dir if len(a.checkpoints) == 1 else None)
+                          hf_dir=a.hf_dir if len(a.checkpoints) == 1 else None,
+                          enable_cuda_graph=not a.no_cuda_graph)
         except Exception as e:  # noqa: BLE001 - keep going, record the failure
             r = {"model": _name(ckpt), "error": str(e)}
         if a.gpu_load_caveat:

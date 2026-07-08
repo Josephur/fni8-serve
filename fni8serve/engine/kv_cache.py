@@ -81,6 +81,11 @@ class PagedKVCache:
                 for s, p in zip(slots, positions)]
         return torch.tensor(flat, dtype=torch.int32, device=self.device)
 
+    # Public alias -- `engine/cuda_graph.py` builds this tensor itself (once per
+    # step, reused across every layer) instead of going through `write_decode`.
+    def slot_mapping_for(self, slots: list[int], positions: list[int]) -> torch.Tensor:
+        return self._slot_mapping(slots, positions)
+
     def write_prefill(self, layer: int, k: torch.Tensor, v: torch.Tensor, *, slot: int):
         """k, v: [1, Hkv, S, D] fp16 -> quantize-on-write, one position at a time
         (the kernel's write granularity), into this one sequence's blocks."""
@@ -97,11 +102,19 @@ class PagedKVCache:
                      k_new: torch.Tensor, v_new: torch.Tensor):
         """k_new, v_new: [B, Hkv, D] fp16 -- the newest token for every sequence in
         the batch, committed with ONE `quantize_kv_write_paged` call."""
-        mapping = self._slot_mapping(slots, positions)
+        self.write_decode_static(layer, self._slot_mapping(slots, positions), k_new, v_new)
+
+    def write_decode_static(self, layer: int, slot_mapping: torch.Tensor,
+                            k_new: torch.Tensor, v_new: torch.Tensor):
+        """Same as `write_decode`, but takes an already-built `slot_mapping` device
+        tensor instead of python `slots`/`positions` lists -- the CUDA-graph decode
+        path (engine/cuda_graph.py) calls this with a persistent buffer it refreshes
+        via `copy_` before each replay, since a captured graph can only re-execute
+        kernels against fixed memory, not rebuild tensors from python lists."""
         fni8.quantize_kv_write_paged(
             k_new.contiguous(), v_new.contiguous(),
             self.k_cache[layer], self.k_scale[layer],
-            self.v_cache[layer], self.v_scale[layer], mapping,
+            self.v_cache[layer], self.v_scale[layer], slot_mapping,
         )
 
     def block_table(self, slots: list[int]) -> torch.Tensor:
@@ -121,11 +134,25 @@ class PagedKVCache:
         `lengths[i]` is the write position of the token just committed by
         `write_decode`, so the valid context per row is `lengths[i] + 1`."""
         context_lens = torch.tensor([n + 1 for n in lengths], dtype=torch.int32, device=self.device)
+        return self.decode_attn_static(layer, q, self.block_table(slots), context_lens,
+                                       int(context_lens.max().item()), scale=scale)
+
+    def decode_attn_static(self, layer: int, q: torch.Tensor, block_table: torch.Tensor,
+                           context_lens: torch.Tensor, max_context_len: int, *,
+                           scale: float) -> torch.Tensor:
+        """Same as `decode_attn`, but takes precomputed `block_table`/`context_lens`
+        device tensors and `max_context_len` as a plain python int instead of calling
+        `context_lens.max().item()` -- that `.item()` is a device->host sync, which
+        CUDA graph capture cannot contain. The CUDA-graph decode path passes a
+        per-bucket compile-time upper bound here (safe: `attn_paged_decode_cached`
+        only requires `max_context_len >= max(context_lens)`, since it just
+        upper-bounds kernel split-sizing and every row is still gated by its own
+        `context_lens` entry)."""
         return fni8.attn_paged_decode_cached(
             q, self.k_cache[layer], self.k_scale[layer],
             self.v_cache[layer], self.v_scale[layer],
-            self.block_table(slots), context_lens, self.block_size,
-            max_context_len=int(context_lens.max().item()), scale=scale,
+            block_table, context_lens, self.block_size,
+            max_context_len=max_context_len, scale=scale,
         )
 
     def read_dense(self, layer: int, slot: int, length: int, *, window: int | None = None):

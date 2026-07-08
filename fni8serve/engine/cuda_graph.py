@@ -1,0 +1,239 @@
+# SPDX-License-Identifier: MIT
+"""GraphedDecode -- CUDA-graph capture/replay for `EngineRunner.decode`.
+
+Decode is dispatch-bound, not compute-bound: a 28-layer 0.6B model launches
+~3,200 CUDA kernels/step (~114/layer) for ~18ms of real GPU work inside a
+131ms step (measured on Qwen3-0.6B int8, batch=8, V100 idx-4 -- see issue #42).
+Capturing the whole decode step (model forward + logits) into a CUDA graph and
+replaying it re-issues every one of those launches as ONE `cudaGraphLaunch`,
+collapsing dispatch overhead toward the real kernel time.
+
+Requirements for capture, and how each is met here:
+  * **Static shapes.** Decode batches are padded up to a batch-size bucket
+    (1, 2, 4, 8, 16, ...) and a max-context-length bucket; pad rows point at a
+    dedicated scratch cache slot (allocated once, never freed) and are simply
+    sliced off the output before sampling.
+  * **Persistent input buffers.** `ids`/`pos`/`slot_mapping`/`block_table`/
+    `context_lens` are allocated once per (batch_bucket, context_bucket) and
+    refreshed with `copy_` before every `replay()` -- captured kernels always
+    read/write the SAME memory, so replay only picks up new values if we
+    mutate that memory in place; a captured graph has no way to consume a
+    freshly-built python-list-derived tensor from a later call.
+  * **No mid-step sync.** `PagedKVCache.decode_attn_static` takes
+    `max_context_len` as a plain python int (the bucket value) instead of
+    `context_lens.max().item()` -- see kv_cache.py.
+  * **Sampling stays outside the graph.** The graph captures model forward +
+    `compute_logits` only; `EngineRunner._sample` (argmax/top-p + the final
+    `.tolist()` host copy) runs eagerly on the sliced, unpadded logits after
+    `replay()`.
+  * **Paged-decode attention consumes tensors, not python lists** -- see the
+    `ctx.slot_mapping is not None` branch in `GQAAttention._decode_batched`.
+
+Only plain full-attention (dense, non-MoE, no sliding-window) decode is
+capturable: MoE's per-expert token routing (`mask.nonzero()`, a data-dependent
+op) and the sliding-window fallback (`PagedKVCache.read_dense` + a python loop)
+cannot be represented in a CUDA graph. `_check_supported` detects this up
+front from the model config; unsupported models fall back to eager decode
+for every step (logged once).
+"""
+from __future__ import annotations
+
+import logging
+import os
+
+import torch
+
+from ..models.base import ForwardContext
+from .sequence import Sequence
+
+log = logging.getLogger(__name__)
+
+DEFAULT_BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
+DEFAULT_CONTEXT_BUCKET_SIZE = 128     # context-length bucket granularity (rounds up)
+DEFAULT_MAX_GRAPHS = 32               # cap the captured-graph set (each pins its own workspace)
+_WARMUP_ITERS = 3
+
+
+def cuda_graph_enabled_by_env(default: bool = True) -> bool:
+    """`FNI8SERVE_CUDA_GRAPH=0` disables graphed decode (eager stays available for
+    debugging); unset or any other value keeps the default."""
+    val = os.environ.get("FNI8SERVE_CUDA_GRAPH")
+    if val is None:
+        return default
+    return val not in ("0", "false", "False")
+
+
+def _next_bucket(buckets: tuple[int, ...], n: int) -> int | None:
+    for b in buckets:
+        if n <= b:
+            return b
+    return None
+
+
+def _round_up(n: int, multiple: int) -> int:
+    return ((n + multiple - 1) // multiple) * multiple
+
+
+class _CapturedGraph:
+    __slots__ = ("graph", "ids", "pos", "slot_mapping", "block_table", "context_lens",
+                 "logits", "batch_bucket", "context_bucket")
+
+    def __init__(self, *, graph, ids, pos, slot_mapping, block_table, context_lens, logits,
+                 batch_bucket, context_bucket):
+        self.graph = graph
+        self.ids = ids
+        self.pos = pos
+        self.slot_mapping = slot_mapping
+        self.block_table = block_table
+        self.context_lens = context_lens
+        self.logits = logits            # static output buffer -- read it before the next replay()
+        self.batch_bucket = batch_bucket
+        self.context_bucket = context_bucket
+
+
+class GraphedDecode:
+    """Lazily captures one CUDA graph per (batch_bucket, context_bucket) bucket
+    pair, replays on an exact match, and returns None (caller falls back to
+    eager `EngineRunner.decode`) on a miss: unsupported model, batch larger
+    than the widest bucket, or the captured-graph cap already reached."""
+
+    def __init__(self, model, cache, *, device: str = "cuda",
+                 batch_buckets: tuple[int, ...] = DEFAULT_BATCH_BUCKETS,
+                 context_bucket_size: int = DEFAULT_CONTEXT_BUCKET_SIZE,
+                 max_graphs: int = DEFAULT_MAX_GRAPHS):
+        self.model = model
+        self.cache = cache
+        self.device = device
+        # Never bucket past what the engine could ever schedule (`cache.num_slots`
+        # == `max_num_seqs`) -- a bigger bucket would just never be hit.
+        self.batch_buckets = tuple(sorted(b for b in set(batch_buckets) if b <= cache.num_slots))
+        self.context_bucket_size = context_bucket_size
+        self.max_graphs = max_graphs
+        self._graphs: dict[tuple[int, int], _CapturedGraph] = {}
+        self._scratch_slot: int | None = None
+        self.supported, self._unsupported_reason = self._check_supported()
+        if not self.supported:
+            log.warning("cuda-graph decode disabled: %s", self._unsupported_reason)
+
+    # -- capability check ------------------------------------------------
+    def _check_supported(self) -> tuple[bool, str]:
+        if self.device == "cpu" or not torch.cuda.is_available():
+            return False, "no CUDA device"
+        if not self.batch_buckets:
+            return False, "no batch bucket <= max_num_seqs"
+        cfg = self.model.config
+        if cfg.is_moe():
+            return False, "MoE routing is data-dependent (mask.nonzero()), not graph-capturable"
+        if cfg.linear_attention or cfg.latent_attention:
+            return False, "linear/latent-attention decode isn't wired for static capture"
+        for i in range(cfg.num_hidden_layers):
+            if cfg.attention_kind(i) != "full":
+                return False, f"layer {i} uses the '{cfg.attention_kind(i)}' attention backend " \
+                              "(sliding-window decode is a data-dependent python-loop fallback)"
+        return True, ""
+
+    def _scratch(self) -> int:
+        """A dedicated cache slot every pad row's slot/block-table entries point
+        at -- allocated once and never freed, so pad rows always read/write valid
+        (if inert) memory regardless of which real sequences are live."""
+        if self._scratch_slot is None:
+            self._scratch_slot = self.cache.alloc()
+            self.cache.ensure_capacity([self._scratch_slot], [1])
+        return self._scratch_slot
+
+    # -- public entry point -----------------------------------------------
+    def try_decode(self, batch: list[Sequence]) -> torch.Tensor | None:
+        """Returns next-token logits `[len(batch), vocab]` for `batch` via a
+        captured graph, or None if this step can't be served from one (the
+        caller should fall back to eager decode). Never mutates `Sequence`
+        state -- the caller owns `seq.length` bookkeeping either way."""
+        if not self.supported or not batch:
+            return None
+        B = len(batch)
+        batch_bucket = _next_bucket(self.batch_buckets, B)
+        if batch_bucket is None:
+            log.info("cuda-graph decode miss: batch size %d exceeds largest bucket %d",
+                     B, self.batch_buckets[-1])
+            return None
+        max_real_ctx = max(s.length for s in batch) + 1
+        cap = self.cache.max_blocks_per_seq * self.cache.block_size
+        context_bucket = min(_round_up(max_real_ctx, self.context_bucket_size), cap)
+        key = (batch_bucket, context_bucket)
+
+        g = self._graphs.get(key)
+        if g is None:
+            if len(self._graphs) >= self.max_graphs:
+                log.warning("cuda-graph decode miss: bucket cap (%d graphs) reached, "
+                            "not capturing batch=%d max_context=%d",
+                            self.max_graphs, batch_bucket, context_bucket)
+                return None
+            g = self._capture(batch_bucket, context_bucket)
+            self._graphs[key] = g
+            log.info("cuda-graph decode: captured bucket batch=%d max_context=%d "
+                     "(%d graphs total)", batch_bucket, context_bucket, len(self._graphs))
+
+        self._fill_inputs(g, batch)
+        g.graph.replay()
+        return g.logits[:B]
+
+    # -- capture ------------------------------------------------------------
+    def _capture(self, batch_bucket: int, context_bucket: int) -> _CapturedGraph:
+        cache = self.cache
+        scratch = self._scratch()
+
+        ids = torch.zeros(batch_bucket, 1, dtype=torch.long, device=self.device)
+        pos = torch.zeros(batch_bucket, 1, dtype=torch.long, device=self.device)
+        slot_mapping = cache.slot_mapping_for([scratch] * batch_bucket, [0] * batch_bucket)
+        block_table = cache.block_table([scratch] * batch_bucket)
+        context_lens = torch.ones(batch_bucket, dtype=torch.int32, device=self.device)
+
+        ctx = ForwardContext(is_prefill=False, kv_cache=cache, slot_mapping=slot_mapping,
+                             block_tables=block_table, context_lens=context_lens,
+                             max_context_len=context_bucket)
+
+        # Standard two-phase capture (PyTorch CUDA-graph guidance): warm up a few
+        # iterations on a side stream first so the caching allocator reaches a
+        # steady state (capture fails if it has to grow the pool mid-capture),
+        # THEN capture. Warmup runs against the same scratch-only inputs the
+        # graph is seeded with above -- it never touches a real sequence's data.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(_WARMUP_ITERS):
+                with torch.inference_mode():
+                    hidden = self.model(ids, pos, ctx)
+                    self.model.compute_logits(hidden[:, -1])
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.inference_mode(), torch.cuda.graph(graph):
+            hidden = self.model(ids, pos, ctx)
+            logits = self.model.compute_logits(hidden[:, -1])
+
+        return _CapturedGraph(graph=graph, ids=ids, pos=pos, slot_mapping=slot_mapping,
+                              block_table=block_table, context_lens=context_lens, logits=logits,
+                              batch_bucket=batch_bucket, context_bucket=context_bucket)
+
+    # -- per-step input refresh (eager -- runs before replay(), not captured) ----
+    def _fill_inputs(self, g: _CapturedGraph, batch: list[Sequence]):
+        cache = self.cache
+        B, Bmax = len(batch), g.batch_bucket
+        scratch = self._scratch()
+        pad = Bmax - B
+
+        real_slots = [s.slot for s in batch]
+        real_lengths = [s.length for s in batch]
+        cache.ensure_capacity(real_slots, [n + 1 for n in real_lengths])
+
+        slots = real_slots + [scratch] * pad
+        lengths = real_lengths + [0] * pad
+        ids_list = [[s.last_token] for s in batch] + [[0]] * pad
+        pos_list = [[s.length] for s in batch] + [[0]] * pad
+
+        g.ids.copy_(torch.tensor(ids_list, dtype=torch.long, device=self.device))
+        g.pos.copy_(torch.tensor(pos_list, dtype=torch.long, device=self.device))
+        g.slot_mapping.copy_(cache.slot_mapping_for(slots, lengths))
+        g.block_table.copy_(cache.block_table(slots))
+        g.context_lens.copy_(
+            torch.tensor([n + 1 for n in lengths], dtype=torch.int32, device=self.device))
