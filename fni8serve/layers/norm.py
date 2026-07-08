@@ -13,6 +13,7 @@ quantized.
 """
 from __future__ import annotations
 
+import fni8
 import torch
 import torch.nn as nn
 
@@ -44,6 +45,11 @@ class RMSNorm(nn.Module):
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Fused single-launch path (fni8.rmsnorm handles residual add + Gemma
+        # unit-offset internally); falls back to the eager chain on CPU / non-fp16.
+        if x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
+            return fni8.rmsnorm(x, self.weight, self.eps, residual=residual,
+                                unit_offset=self.add_unit_offset)
         if residual is None:
             return self._norm(x)
         # Fused add: return (normed, new_residual) so the caller keeps the residual
