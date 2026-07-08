@@ -14,10 +14,46 @@ def _id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex}"
 
 
+class FunctionDefinition(BaseModel):
+    name: str
+    description: str | None = None
+    parameters: dict = Field(default_factory=dict)
+
+
+class ToolDefinition(BaseModel):
+    """An OpenAI `tools[]` entry. Threaded straight into the tokenizer's
+    `apply_chat_template(tools=...)` (issue #40) -- HF's own tools-aware templates
+    (Qwen, etc.) already expect exactly this `{"type": "function", "function": {...}}`
+    shape, so no reshaping is needed between the request and the template."""
+    type: Literal["function"] = "function"
+    function: FunctionDefinition
+
+
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str  # JSON-encoded, per the OpenAI wire shape
+
+
+class ToolCall(BaseModel):
+    id: str = Field(default_factory=lambda: _id("call"))
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+
+class NamedToolChoice(BaseModel):
+    """`tool_choice={"type": "function", "function": {"name": ...}}` -- forces
+    that one function via the structured-output backend rather than free-form
+    generation (issue #40)."""
+    type: Literal["function"] = "function"
+    function: dict
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
     content: str | None = None
     name: str | None = None
+    tool_calls: list[ToolCall] | None = None
+    tool_call_id: str | None = None  # role="tool": which call this is the result of
 
 
 class JSONSchemaSpec(BaseModel):
@@ -49,6 +85,8 @@ class ChatCompletionRequest(BaseModel):
     # fni8-serve extension: a raw grammar (GBNF/EBNF), compiled by XGrammar the same
     # way as `response_format={"type": "json_schema"}`. Takes precedence if both are set.
     grammar: str | None = None
+    tools: list[ToolDefinition] | None = None
+    tool_choice: Literal["none", "auto", "required"] | NamedToolChoice | None = None
 
 
 class CompletionRequest(BaseModel):
@@ -72,7 +110,7 @@ class UsageInfo(BaseModel):
 class ChatCompletionResponseChoice(BaseModel):
     index: int = 0
     message: ChatMessage
-    finish_reason: str | None = None
+    finish_reason: str | None = None  # "tool_calls" when `message.tool_calls` is set
 
 
 class ChatCompletionResponse(BaseModel):

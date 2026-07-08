@@ -15,9 +15,23 @@ httpx = pytest.importorskip("httpx")
 from fni8serve.api.app import create_app  # noqa: E402
 from fni8serve.api.schemas import ChatCompletionRequest  # noqa: E402
 from fni8serve.engine.sequence import SamplingParams, Sequence, Status  # noqa: E402
+from fni8serve.structured import GrammarCompilerCache  # noqa: E402
 
 _VOCAB = {0: "Hello", 1: ",", 2: " world", 3: "!"}
 EOS = 4
+
+WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a location.",
+        "parameters": {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"],
+        },
+    },
+}
 
 
 class FakeTokenizer:
@@ -25,16 +39,19 @@ class FakeTokenizer:
     `apply_chat_template` that records exactly what the API layer passed it (the
     real Jinja rendering + sandboxing lives in `transformers` itself, upstream of
     this seam -- what we own, and what these tests check, is that our server calls
-    it correctly, including threading through a caller-supplied template override)."""
+    it correctly, including threading through a caller-supplied template override,
+    and the `tools` list for issue #40's tool-calling support)."""
     eos_token_id = EOS
 
     def __init__(self):
         self.chat_template_calls: list[str | None] = []
+        self.tools_calls: list[list[dict] | None] = []
 
     def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True,
-                            chat_template=None):
+                            chat_template=None, tools=None):
         assert messages[-1]["role"] == "user"
         self.chat_template_calls.append(chat_template)
+        self.tools_calls.append(tools)
         return [10, 11, 12]
 
     def encode(self, text, **kw):
@@ -43,6 +60,20 @@ class FakeTokenizer:
     def decode(self, ids, skip_special_tokens=True):
         kept = [t for t in ids if not (skip_special_tokens and t == EOS)]
         return "".join(_VOCAB.get(t, "") for t in kept)
+
+
+class FixedTextTokenizer(FakeTokenizer):
+    """A `FakeTokenizer` that decodes any non-empty token id sequence to a fixed
+    string, so a tool-call test can drive an exact model output (e.g. a
+    `<tool_call>...</tool_call>` tag, or schema-constrained JSON) without modeling
+    a real subword vocabulary."""
+
+    def __init__(self, text: str):
+        super().__init__()
+        self.text = text
+
+    def decode(self, ids, skip_special_tokens=True):
+        return self.text if ids else ""
 
 
 class FakeEngine:
@@ -191,6 +222,138 @@ def test_grammar_extension_field_parses():
         "grammar": 'root ::= "yes" | "no"',
     })
     assert req.grammar == 'root ::= "yes" | "no"'
+
+
+def test_tools_are_formatted_into_the_prompt(http_client, tokenizer):
+    """`tools` (issue #40) must reach `apply_chat_template` as the `tools` kwarg,
+    the same seam `chat_template` already uses -- HF's own tools-aware templates
+    (Qwen, etc.) render it from there, so fni8-serve just needs to pass it through."""
+    http_client.post("/v1/chat/completions", json={
+        "model": "fake-qwen3",
+        "messages": [{"role": "user", "content": "weather in SF?"}],
+        "tools": [WEATHER_TOOL],
+    })
+    assert tokenizer.tools_calls == [[WEATHER_TOOL]]
+
+
+def test_tool_choice_none_omits_tools_from_the_prompt(http_client, tokenizer):
+    http_client.post("/v1/chat/completions", json={
+        "model": "fake-qwen3",
+        "messages": [{"role": "user", "content": "weather in SF?"}],
+        "tools": [WEATHER_TOOL],
+        "tool_choice": "none",
+    })
+    assert tokenizer.tools_calls == [None]
+
+
+def test_tools_present_but_model_replies_with_plain_text(http_client):
+    """`tool_choice="auto"` (the default once `tools` is set): if the model just
+    answers in plain text, the response must look exactly like the no-tools case
+    -- no `tool_calls`, `finish_reason="stop"`."""
+    resp = http_client.post("/v1/chat/completions", json={
+        "model": "fake-qwen3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [WEATHER_TOOL],
+    })
+    message = resp.json()["choices"][0]["message"]
+    assert message["content"] == "Hello, world!"
+    assert message.get("tool_calls") is None
+    assert resp.json()["choices"][0]["finish_reason"] == "stop"
+
+
+def test_tool_call_round_trip_via_hermes_parser():
+    """The weather-tool round trip (issue #40): the model's raw text emits a
+    Qwen-style `<tool_call>{"name": ..., "arguments": {...}}</tool_call>` tag
+    (the `hermes` parser, the default `--tool-parser`); the parsed call in the
+    response must match it exactly."""
+    tool_call_text = (
+        '<tool_call>\n'
+        '{"name": "get_weather", "arguments": {"location": "San Francisco"}}\n'
+        '</tool_call>'
+    )
+    tokenizer = FixedTextTokenizer(tool_call_text)
+    engine = FakeEngine()
+    engine.reply = [0, EOS]
+    app = create_app(engine, tokenizer, served_model_name="fake-qwen3")
+    transport = httpx.ASGITransport(app=app)
+    with httpx.Client(transport=transport, base_url="http://testserver") as client:
+        resp = client.post("/v1/chat/completions", json={
+            "model": "fake-qwen3",
+            "messages": [{"role": "user", "content": "What's the weather in San Francisco?"}],
+            "tools": [WEATHER_TOOL],
+        })
+
+    assert resp.status_code == 200
+    choice = resp.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] is None
+    call = choice["message"]["tool_calls"][0]
+    assert call["type"] == "function"
+    assert call["function"]["name"] == "get_weather"
+    assert json.loads(call["function"]["arguments"]) == {"location": "San Francisco"}
+
+
+def test_forced_tool_choice_builds_a_schema_and_parses_the_result(monkeypatch):
+    """`tool_choice="required"` (issue #40) must drive generation through the
+    existing structured-output backend (issue #39), constrained to the named
+    tool's `parameters` schema, then parse the (guaranteed schema-valid) JSON
+    straight into `tool_calls` -- no text parser involved. `for_json_schema` is
+    mocked out here (its own correctness -- that XGrammar actually constrains
+    generation to a schema -- is `test_structured.py`'s job); this test only
+    proves the API layer wires tool_choice -> schema -> parsed result correctly,
+    without requiring `xgrammar` to be installed."""
+    built_schemas = []
+
+    def fake_for_json_schema(self, tok, schema):
+        built_schemas.append(schema)
+        return lambda input_ids, logits: logits
+
+    monkeypatch.setattr(GrammarCompilerCache, "for_json_schema", fake_for_json_schema)
+
+    tokenizer = FixedTextTokenizer(
+        '{"name": "get_weather", "arguments": {"location": "San Francisco"}}')
+    engine = FakeEngine()
+    engine.reply = [0, EOS]
+    app = create_app(engine, tokenizer, served_model_name="fake-qwen3")
+    transport = httpx.ASGITransport(app=app)
+    with httpx.Client(transport=transport, base_url="http://testserver") as client:
+        resp = client.post("/v1/chat/completions", json={
+            "model": "fake-qwen3",
+            "messages": [{"role": "user", "content": "What's the weather in San Francisco?"}],
+            "tools": [WEATHER_TOOL],
+            "tool_choice": "required",
+        })
+
+    assert resp.status_code == 200
+    choice = resp.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    call = choice["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "get_weather"
+    assert json.loads(call["function"]["arguments"]) == {"location": "San Francisco"}
+    assert built_schemas[0]["oneOf"][0]["properties"]["name"]["const"] == "get_weather"
+
+
+def test_named_tool_choice_forces_exactly_that_function(monkeypatch):
+    monkeypatch.setattr(GrammarCompilerCache, "for_json_schema",
+                        lambda self, tok, schema: (lambda input_ids, logits: logits))
+
+    tokenizer = FixedTextTokenizer(
+        '{"name": "get_weather", "arguments": {"location": "Berlin"}}')
+    engine = FakeEngine()
+    engine.reply = [0, EOS]
+    app = create_app(engine, tokenizer, served_model_name="fake-qwen3")
+    transport = httpx.ASGITransport(app=app)
+    with httpx.Client(transport=transport, base_url="http://testserver") as client:
+        resp = client.post("/v1/chat/completions", json={
+            "model": "fake-qwen3",
+            "messages": [{"role": "user", "content": "weather in Berlin?"}],
+            "tools": [WEATHER_TOOL],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+        })
+
+    assert resp.status_code == 200
+    call = resp.json()["choices"][0]["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "get_weather"
 
 
 def test_chat_template_override_is_threaded_through(tokenizer):

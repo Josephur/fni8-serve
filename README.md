@@ -162,6 +162,44 @@ renders through `apply_chat_template`, so it gets the same sandboxed Jinja
 environment (`jinja2.sandbox.ImmutableSandboxedEnvironment`, via `transformers`) as
 the model's own template -- a custom template is never given more than that.
 
+### Tools / tool_choice
+
+`tools` is threaded straight into `apply_chat_template(tools=...)`, so formatting
+comes from the model's own tools-aware chat template (same free-per-model
+mechanism as the rest of chat formatting) -- nothing fni8-serve-specific happens
+to the prompt.
+
+```python
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a location.",
+        "parameters": {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"],
+        },
+    },
+}]
+resp = client.chat.completions.create(
+    model="qwen3-8b.fni8",
+    messages=[{"role": "user", "content": "What's the weather in San Francisco?"}],
+    tools=tools,
+)
+print(resp.choices[0].message.tool_calls[0].function)
+```
+
+With the default `tool_choice="auto"`, the model free-generates and its
+raw-text tool-call emission is parsed by a per-model `fni8serve.tool_calls`
+parser (`--tool-parser`, default `hermes` -- Qwen 2.5/3's native
+`<tool_call>{"name": ..., "arguments": {...}}</tool_call>` tag convention).
+`tool_choice="required"`, or a named choice
+(`{"type": "function", "function": {"name": "get_weather"}}`), skips the parser
+entirely: it builds a JSON schema from the tool's `parameters` and constrains
+generation through the same XGrammar structured-output backend `response_format`
+uses, so the result is guaranteed schema-valid.
+
 ## Model support
 
 Model support is a registry: a family is a `ModelConfig` plus a thin `models/<family>.py`
@@ -189,6 +227,9 @@ over shared layers, registered with `@register_model`. The engine never changes.
 - [x] Structured outputs / grammars (`fni8serve.structured`): XGrammar behind the
       logit-processor hook, `response_format={type: json_schema}` + a `grammar`
       (GBNF/EBNF) extension
+- [x] `tools`/`tool_choice` (`fni8serve.tool_calls`): tools formatted into the
+      prompt via the chat template; `auto` parsed with a per-model text parser
+      (`hermes`), `required`/named forced through the structured-output backend
 - [ ] int8 dp4a DeltaNet and MLA kernels in `fni8` (the divergent-attention acceleration)
 - [ ] multi-GPU PP + MoE-EP with `fni8.transport`
 

@@ -40,6 +40,9 @@ def main() -> None:
                     help="HF repo id or local dir with the tokenizer (default: --model)")
     ap.add_argument("--chat-template", default=None,
                     help="path to a Jinja file overriding the tokenizer's own chat template")
+    ap.add_argument("--tool-parser", default="hermes",
+                    help="fni8serve.tool_calls parser for `tool_choice=auto` tool-call "
+                         "extraction (default: hermes, Qwen's native tool-calling format)")
     ap.add_argument("--served-model-name", default=None, help="default: --model")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
@@ -59,7 +62,7 @@ def main() -> None:
     engine = load_engine(args.model, device=args.device, max_num_seqs=args.max_num_seqs,
                          max_len=args.max_len, eos_id=tokenizer.eos_token_id)
     app = create_app(engine, tokenizer, served_model_name=args.served_model_name or args.model,
-                     chat_template=chat_template)
+                     chat_template=chat_template, tool_parser=args.tool_parser)
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)

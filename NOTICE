@@ -16,6 +16,11 @@ Attributions
 * Depends on `fni8` (the CUDA/dp4a attention kernels + `.fni8` weight format +
   transport codec), BSD-3-Clause, Copyright (c) 2026 fni8 authors.
 
+* `fni8serve.tool_calls`' Hermes-style `<tool_call>` tag convention was studied
+  from vLLM's `hermes_tool_parser.py` (https://github.com/vllm-project/vllm),
+  Apache License 2.0, Copyright (c) vLLM contributors. This project reimplements
+  the tag/JSON convention independently; it does not vendor vLLM source.
+
 Quantization approaches informed by SDNQ (GPL-3.0, referenced for approach only, no
 code), QuaRot / SageAttention / QLoRA-NF4 (studied for approach). No GPL code is
 included in this project.
