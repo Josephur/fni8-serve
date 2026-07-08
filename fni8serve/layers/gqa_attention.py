@@ -76,7 +76,7 @@ class GQAAttention(nn.Module):
             out = fni8.attn_int8_fwd(q, k, v, causal=True, scale=self.scale,
                                      window_left=self.window_left)
         elif ctx.slot_lengths is not None:
-            out = self._decode_ragged(q, k, v, ctx, layer_idx)   # engine continuous batch
+            out = self._decode_batched(q, k, v, ctx, layer_idx)   # engine continuous batch
         else:
             k_all, v_all = ctx.kv_cache.append_decode(layer_idx, k, v)   # [B,Hkv,N,D]
             k_all, v_all = self._window(k_all, v_all)
@@ -91,13 +91,23 @@ class GQAAttention(nn.Module):
             v_all = v_all[:, :, -self.window_left:].contiguous()
         return k_all, v_all
 
-    def _decode_ragged(self, q, k, v, ctx, layer_idx):
-        """Continuous-batch decode: rows have different KV lengths, so batch the
-        GEMMs (already done upstream) and loop the memory-bound attention call per
-        slot. Replaced by a batched block-table decode kernel when fni8 ships one."""
+    def _decode_batched(self, q, k, v, ctx, layer_idx):
+        """Continuous-batch decode: rows have different KV lengths (already batched
+        GEMMs upstream). The paged int8 cache commits every row's new token with ONE
+        `quantize_kv_write_paged` call and reads the whole ragged batch back with ONE
+        `attn_paged_decode_cached` launch -- no more per-slot Python loop.
+
+        Sliding-window layers are the one gap the paged-decode kernel doesn't cover
+        (no window parameter yet), so they fall back to a per-slot dequantized read
+        + `attn_int8_decode`, same as before this PR."""
+        cache = ctx.kv_cache
+        k_new, v_new = k[:, :, 0, :], v[:, :, 0, :]           # [B,Hkv,D]: the one new token
+        if self.window_left < 0:
+            cache.write_decode(layer_idx, ctx.slots, ctx.slot_lengths, k_new, v_new)
+            return cache.decode_attn(layer_idx, q, ctx.slots, ctx.slot_lengths, scale=self.scale)
         outs = []
         for b, (slot, n) in enumerate(zip(ctx.slots, ctx.slot_lengths)):
-            kb, vb = ctx.kv_cache.append_read_slot(layer_idx, slot, n, k[b], v[b])
-            kb, vb = self._window(kb, vb)
+            cache.write_decode(layer_idx, [slot], [n], k_new[b:b + 1], v_new[b:b + 1])
+            kb, vb = cache.read_dense(layer_idx, slot, n + 1, window=self.window_left)
             outs.append(fni8.attn_int8_decode(q[b:b + 1], kb, vb, scale=self.scale))
         return torch.cat(outs, dim=0)

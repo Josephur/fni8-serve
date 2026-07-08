@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 """Contiguous KV cache (v0) — one fp16 [L, B, Hkv, max_len, D] store per model.
 
-This is the simple, correct cache: prefill writes the whole sequence, decode
-appends one token. It is NOT paged — paged block-table decode needs the fni8
-decode kernel to accept block tables (a kernel TODO). The engine's block manager
-(PR3) swaps this out for paged blocks; the model code is unchanged because it only
-touches `write_prefill` / `append_decode`.
+This is the simple, correct cache used by the standalone `ModelRunner`: prefill
+writes the whole sequence, decode appends one token. The engine uses
+`fni8serve.engine.kv_cache.PagedKVCache` instead (int8, block-table paged); the
+model code is unchanged either way because it only touches `write_prefill` /
+`append_decode`.
 
 `length` is the number of valid tokens; the runner calls `advance(n)` once per step
 after all layers have written (all layers share one length).
@@ -28,7 +28,7 @@ class KVCache:
 
     def write_prefill(self, layer: int, k: torch.Tensor, v: torch.Tensor, *, slot=None):
         """k, v: [B, Hkv, S, D] at positions [0, S). `slot` is ignored (the simple
-        runner cache is single-batch); the engine's BatchedKVCache uses it."""
+        runner cache is single-batch); the engine's PagedKVCache uses it."""
         s = k.shape[2]
         self.k[layer, :, :, :s] = k
         self.v[layer, :, :, :s] = v

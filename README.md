@@ -85,7 +85,7 @@ changes. Registered today (all build + prefill through the dp4a kernels; see
 - [x] Modular **model registry** — 8+ families (Qwen3/-MoE, Gemma3, DeepSeek, Qwen3-Next,
       LFM2, GLM, Hunyuan, MiniMax); build + prefill validated
 - [ ] Recurrent-state / latent **decode caching** for the linear/DeltaNet/MLA families
-- [ ] **Paged‑KV** (block‑table) + int8 **quantize‑on‑write** in the `fni8` decode kernel
+- [x] **Paged‑KV** (block‑table) + int8 **quantize‑on‑write** in the `fni8` decode kernel
 - [ ] int8 dp4a **DeltaNet + MLA** kernels in `fni8` (the divergent-attention accel)
 - [ ] multi‑GPU **PP + MoE‑EP** with `fni8.transport`
 

@@ -10,12 +10,12 @@ from __future__ import annotations
 
 from collections import deque
 
-from .kv_cache import BatchedKVCache
+from .kv_cache import PagedKVCache
 from .sequence import Sequence, Status
 
 
 class Scheduler:
-    def __init__(self, cache: BatchedKVCache, *, max_num_seqs: int, max_batch_tokens: int,
+    def __init__(self, cache: PagedKVCache, *, max_num_seqs: int, max_batch_tokens: int,
                  eos_id: int | None):
         self.cache = cache
         self.max_num_seqs = max_num_seqs
@@ -35,7 +35,7 @@ class Scheduler:
         # Prefill newly-waiting sequences while we have slots + token budget.
         batch, tokens = [], 0
         while self.waiting and len(self.running) + len(batch) < self.max_num_seqs \
-                and self.cache._free:
+                and self.cache.has_free_slot():
             seq = self.waiting[0]
             if batch and tokens + seq.num_prompt > self.max_batch_tokens:
                 break

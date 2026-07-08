@@ -3,8 +3,8 @@
 
 Arch-agnostic: it drives any registered CausalLM. Build it from a ModelConfig + a
 weights dict (the `.fni8` loader output, or an HF state dict). Multi-GPU (PP +
-MoE-EP, never TP) and paged KV are later layers; this is the correct single-GPU
-continuous-batching engine over the current fni8 kernels.
+MoE-EP, never TP) is a later layer; KV storage is `PagedKVCache` -- int8
+quantize-on-write, block-table addressed, one batched decode launch per step.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import itertools
 
 from ..models.config import ModelConfig
 from ..models.registry import build_model
-from .kv_cache import BatchedKVCache
+from .kv_cache import PagedKVCache
 from .model_runner import EngineRunner
 from .scheduler import Scheduler
 from .sequence import SamplingParams, Sequence
@@ -26,9 +26,9 @@ class LLMEngine:
         self.device = device
         self.eos_id = eos_id
         self.model = build_model(cfg, weights).to(device).eval()
-        self.cache = BatchedKVCache(cfg.num_hidden_layers, max_num_seqs,
-                                    cfg.num_key_value_heads, max_len, cfg.resolved_head_dim(),
-                                    device=device)
+        self.cache = PagedKVCache(cfg.num_hidden_layers, max_num_seqs,
+                                  cfg.num_key_value_heads, max_len, cfg.resolved_head_dim(),
+                                  device=device)
         self.scheduler = Scheduler(self.cache, max_num_seqs=max_num_seqs,
                                    max_batch_tokens=max_batch_tokens, eos_id=eos_id)
         self.runner = EngineRunner(self.model, self.cache, device=device)

@@ -5,11 +5,10 @@ Replaces nano-vllm's fp16 flash-attention:
   * prefill  -> fni8.attn_int8_fwd (causal int8 dp4a; varlen path is fni8.attn_int8_varlen)
   * decode   -> fni8.attn_int8_decode (split-KV) / attn_decode_cached (int8 KV cache)
 
-TODO (needs kernel work in fni8):
-  * paged-KV (block-table) support in the decode kernel so we read nano-vllm's paged
-    cache directly instead of a contiguous [B,Hkv,N,D] gather;
-  * quantize-on-write int8 KV store.
-Until then this seam uses the contiguous-cache path (correct; not yet paged).
+This is the single-sequence seam used by the standalone `ModelRunner`. The engine's
+continuous-batch decode goes through `GQAAttention._decode_batched` instead, which
+reads paged-KV (block-table, int8 quantize-on-write) via `PagedKVCache` -- see
+`fni8serve/engine/kv_cache.py`.
 """
 from __future__ import annotations
 

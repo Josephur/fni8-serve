@@ -55,8 +55,12 @@ def test_engine_generates_for_concurrent_requests():
 
 
 def test_engine_matches_single_sequence_runner():
-    """Greedy engine output for one request must equal the standalone runner (the
-    ragged-decode path is numerically identical to the uniform path)."""
+    """Greedy engine output for one request must closely track the standalone
+    runner. Not bit-exact any more: the engine's decode KV cache is now paged
+    int8 (quantize-on-write), while the standalone runner stays fp16
+    contiguous, so a token can occasionally flip on a near-tied logit -- see
+    `tests/test_paged_engine.py` for the direct cosine-similarity check of the
+    two paths' logits."""
     torch.manual_seed(1)
     cfg = _cfg()
     sd = _sd(cfg)
@@ -69,7 +73,9 @@ def test_engine_matches_single_sequence_runner():
     runner = ModelRunner(model, cfg, max_batch=1, max_len=64, device="cuda")
     ref = runner.generate_greedy(torch.tensor([prompt], device="cuda"), max_new_tokens=5)[0].tolist()
 
-    assert eng_out == ref
+    assert eng_out[0] == ref[0]
+    agree = sum(1 for a, b in zip(eng_out, ref) if a == b) / len(ref)
+    assert agree >= 0.8, f"paged vs contiguous greedy diverged too much: {eng_out} vs {ref}"
 
 
 def test_engine_respects_eos():
