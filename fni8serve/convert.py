@@ -51,19 +51,32 @@ def quantize_weight_i4(w: torch.Tensor, group_size: int) -> QTensor:
 
 
 def quantize_state_dict(sd: dict, *, weight_bits: int = 8, group_size: int = 128) -> dict:
-    """fp16 state dict -> dict[name, QTensor]. Linears quantized; everything else
-    stored raw (fp16). Returns QTensors ready for `save_fni8`."""
+    """HF state dict (fp16/bf16) -> dict[name, QTensor]. Linears quantized from full
+    precision; everything else stored raw fp16 (fp32 only if fp16 would overflow — see
+    _raw_dtype). Returns QTensors ready for `save_fni8`."""
     out: dict[str, QTensor] = {}
     for name, w in sd.items():
-        w = w.detach().to(torch.float16).cpu()
+        w = w.detach().cpu()                            # keep NATIVE dtype (don't truncate bf16)
         if is_quantizable_linear(name) and w.dim() == 2 and w.shape[-1] % 4 == 0:
+            wf = w.float()                              # quantize from full precision
             if weight_bits == 4 and w.shape[-1] % group_size == 0:
-                out[name] = quantize_weight_i4(w, group_size)
+                out[name] = quantize_weight_i4(wf, group_size)
             else:
-                out[name] = quantize_weight_i8(w)
+                out[name] = quantize_weight_i8(wf)
         else:
-            out[name] = QTensor(w, None, scheme="raw")
+            out[name] = QTensor(_raw_dtype(w), None, scheme="raw")
     return out
+
+
+def _raw_dtype(w: torch.Tensor) -> torch.Tensor:
+    """Store a raw passthrough tensor (norm/embedding/router) as fp16 — which has MORE
+    mantissa than bf16, only less range — and upcast to fp32 ONLY if fp16 would
+    overflow a finite value. bf16-native models (Gemma, most DiTs) can carry
+    out-of-fp16-range tensors that otherwise become inf -> NaN / black output."""
+    w16 = w.to(torch.float16)
+    if torch.isinf(w16).any() and not torch.isinf(w.float()).any():
+        return w.float()
+    return w16
 
 
 def convert_hf_to_fni8(hf_dir: str, out_path: str, *, weight_bits: int = 8,
