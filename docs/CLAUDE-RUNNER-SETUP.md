@@ -1,8 +1,8 @@
 # Setting up Claude Code on GitHub (self-hosted Volta runner)
 
 This repo ships `.github/workflows/claude.yml`, which lets you drive Claude Code from
-GitHub — comment `@claude <task>` on an issue/PR, **assign** an issue to Claude, or add
-the **`claude`** label. Claude runs on a self-hosted runner **on your fleet** so it can
+GitHub — comment `@claude <task>` on an issue/PR, or add the **`claude`** label to an
+issue. Claude runs on a self-hosted runner **on your fleet** so it can
 actually build/test/bench the CUDA kernels in Docker, then opens a PR.
 
 There are three one-time steps (only you can do these — they need your browser, admin,
@@ -81,8 +81,8 @@ the compose device pins off the counter-locked CMP cards for profiling.
 
 - **Mention:** comment `@claude fix the D=256 decode kernel and add a perf test` on any
   issue or PR. Claude replies, works on the runner, and opens/updates a PR.
-- **Assign:** assign an issue to Claude (or apply the `claude` label) to auto-start with
-  no comment — good for "here's a scoped task, go."
+- **Label:** apply the `claude` label to an issue to auto-start with no comment —
+  good for "here's a scoped task, go."
 - **Iterate:** comment again on the PR (`@claude also run trailmark`) to continue.
 
 Claude auto-loads `CLAUDE.md` + `AGENTS.md`, so plan-mode-before-`csrc/`, the failing-
