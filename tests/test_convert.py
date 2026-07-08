@@ -53,6 +53,15 @@ def test_is_quantizable_linear_excludes_router_and_norms():
     assert not is_quantizable_linear("model.layers.0.mlp.gate.weight")      # MoE router
     assert not is_quantizable_linear("model.layers.0.input_layernorm.weight")
     assert not is_quantizable_linear("model.embed_tokens.weight")
+    # Non-standard MLP names (LFM2 feed_forward.w1/2/3, Mistral-style) must be
+    # quantized too -- the old name-allowlist silently left them fp16.
+    assert is_quantizable_linear("model.layers.0.feed_forward.w1.weight")
+    assert is_quantizable_linear("model.layers.0.feed_forward.w2.weight")
+    assert is_quantizable_linear("model.layers.0.feed_forward.w3.weight")
+    assert is_quantizable_linear("model.layers.0.self_attn.out_proj.weight")
+    # ...but a router by any common name still stays fp (routing is sensitive).
+    assert not is_quantizable_linear("model.layers.0.block_sparse_moe.gate.weight")
+    assert not is_quantizable_linear("model.layers.0.mlp.router.weight")
 
 
 def test_quantize_state_dict_schemes():

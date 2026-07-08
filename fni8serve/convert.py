@@ -27,14 +27,28 @@ from .models.config import ModelConfig
 # A weight is a quantizable linear iff its name ends with one of these. The MoE
 # router (`mlp.gate.weight`) ends with `.gate.weight` (NOT `.gate_proj.weight`), so
 # it correctly stays fp16.
-_LINEAR_SUFFIXES = (
-    ".q_proj.weight", ".k_proj.weight", ".v_proj.weight", ".o_proj.weight",
-    ".gate_proj.weight", ".up_proj.weight", ".down_proj.weight", "lm_head.weight",
-)
+# DENYLIST, not an allowlist: quantize EVERY 2-D matmul weight (the caller also
+# checks `w.dim()==2 and w.shape[-1]%4==0`) EXCEPT the numerically-sensitive /
+# non-matmul ones below. A name allowlist silently skipped any model with
+# non-standard naming (LFM2 `feed_forward.w1/2/3`, other MoE/hybrid layouts),
+# leaving the bulk of the model fp16 -> "4-bit" files nearly fp16-sized. For the
+# standard Llama/Qwen names this denylist quantizes the identical set (q/k/v/o,
+# gate/up/down, lm_head); it just no longer misses everything else.
+#   - `embed`/`wte`/`wpe`: token embeddings are an index LOOKUP, not a matmul
+#     (the serve embedding layer reads them as fp) -> keep raw. (Tied lm_head is
+#     quantized separately on the serve side.)
+#   - `norm`: layernorm/rmsnorm gains (tiny, load-bearing).
+#   - MoE `router`/`.gate.weight`/`.wg.weight`: routing logits are sensitive and
+#     tiny (NOT the MLP `gate_proj`, which stays quantizable).
+_QUANT_DENY_SUBSTR = ("norm", "embed", "wte", "wpe", "rotary", "router", "relative_attention")
+_QUANT_DENY_SUFFIX = (".gate.weight", ".router.weight", ".wg.weight")
 
 
 def is_quantizable_linear(name: str) -> bool:
-    return name.endswith(_LINEAR_SUFFIXES)
+    n = name.lower()
+    if any(s in n for s in _QUANT_DENY_SUBSTR):
+        return False
+    return not n.endswith(_QUANT_DENY_SUFFIX)
 
 
 def quantize_weight_i8(w: torch.Tensor) -> QTensor:
