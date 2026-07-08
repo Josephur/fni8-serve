@@ -40,13 +40,15 @@ class GQAAttention(nn.Module):
         k_norm: torch.Tensor | None = None,
         rms_norm_eps: float = 1e-6,
         window_left: int = -1,
+        qkv_bias=None,
+        o_bias=None,
     ):
         super().__init__()
         self.nh, self.nkv, self.hd = num_heads, num_kv_heads, head_dim
         self.scale = scale
         self.window_left = window_left
-        self.qkv_proj = LinearW8A8(qkv_proj)
-        self.o_proj = LinearW8A8(o_proj)
+        self.qkv_proj = LinearW8A8(qkv_proj, qkv_bias)
+        self.o_proj = LinearW8A8(o_proj, o_bias)
         self.rope = rope
         self.q_norm = RMSNorm(head_dim, rms_norm_eps, q_norm) if q_norm is not None else None
         self.k_norm = RMSNorm(head_dim, rms_norm_eps, k_norm) if k_norm is not None else None
