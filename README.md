@@ -42,19 +42,51 @@ Hadamard/smoothing flags, and a shard index for rank‑local partial loads. 4‑
 halve the footprint (2× model capacity in 16 GB) and speed weight‑bandwidth‑bound decode;
 they unpack to int8 in‑kernel for dp4a (sm_70 has no int4 matmul).
 
+## Quickstart
+
+```bash
+# 1. Convert an HF checkpoint to .fni8 (int8 or 4-bit weights, resident dp4a layout)
+python -m fni8serve.convert  /path/to/Qwen3-8B  qwen3-8b.fni8  --bits 8
+```
+
+```python
+# 2. Serve it — arch is auto-detected from the checkpoint; continuous batching.
+from fni8serve import ModelConfig, LLMEngine, SamplingParams, load_fni8_state_dict, checkpoint_info
+
+cfg = ModelConfig.from_hf(checkpoint_info("qwen3-8b.fni8")["meta"]["config"])
+engine = LLMEngine(cfg, load_fni8_state_dict("qwen3-8b.fni8"))
+out = engine.generate([[1, 2, 3]], SamplingParams(temperature=0.0, max_tokens=32))
+```
+
+Model support is a **registry**: a family is a `ModelConfig` + a thin
+`models/<family>.py` over shared layers, `@register_model`-ed — the engine never
+changes. Registered today (all build + prefill through the dp4a kernels; see
+[`fni8serve/models/COVERAGE.md`](fni8serve/models/COVERAGE.md)):
+
+- **Qwen3**, **Qwen3-MoE**, **Gemma3** (full decode) — GQA + QK-norm / sliding-window.
+- **DeepSeek** (MLA), **Qwen3-Next / 3.5 / 3.6** (hybrid Gated-DeltaNet + full attn),
+  **LFM2** (short-conv + attn), **GLM-4.5/4.6**, **Hunyuan**, **MiniMax** (lightning) —
+  the divergent-attention families, on ported fp16 backends (int8 accel is the
+  DeltaNet/MLA kernel track in `fni8`).
+
 ## Status / roadmap
 
-- [x] Scaffold + integration seams to `fni8` (this repo)
-- [x] `.fni8` zero‑transform weight loader (`fni8serve/loader.py`)
-- [x] Attention seam → `fni8` prefill/decode; Linear seam (int8/W4A8, fp16‑correct fallback)
-- [ ] **int8 / W4A8 dp4a GEMM** kernel in `fni8` (the #1 dependency; Linear flips to it)
-- [ ] **Paged‑KV** support in the `fni8` decode kernel (block‑table indirection)
-- [ ] int8 **quantize‑on‑write** KV store kernel
-- [ ] Port nano‑vllm engine (scheduler / block_manager / continuous batching)
-- [ ] v0: **single‑GPU W8A8 serving** end‑to‑end (Qwen3)
-- [ ] v1: multi‑GPU **PP + MoE‑EP** with `fni8.transport`
+- [x] `.fni8` zero‑transform weight loader + HF→`.fni8` converter (`fni8serve.convert`)
+- [x] **int8 / W4A8 dp4a GEMM** in `fni8`; the Linear seam runs it (fp16 fallback for NF4/CPU)
+- [x] Continuous-batching **engine** (scheduler + slot KV + `LLMEngine.generate()`)
+- [x] Modular **model registry** — 8+ families (Qwen3/-MoE, Gemma3, DeepSeek, Qwen3-Next,
+      LFM2, GLM, Hunyuan, MiniMax); build + prefill validated
+- [ ] Recurrent-state / latent **decode caching** for the linear/DeltaNet/MLA families
+- [ ] **Paged‑KV** (block‑table) + int8 **quantize‑on‑write** in the `fni8` decode kernel
+- [ ] int8 dp4a **DeltaNet + MLA** kernels in `fni8` (the divergent-attention accel)
+- [ ] multi‑GPU **PP + MoE‑EP** with `fni8.transport`
 
-`v0` is single‑GPU (no interconnect problem) and is the near‑term milestone.
+## The fni8 family
+
+Part of a three-repo stack on the same sm_70 fleet:
+[`fni8`](https://github.com/jajmangold/fni8) (the dp4a kernels + `.fni8` format) ·
+**`fni8-serve`** (this — LLM serving) ·
+[`ComfyUI-fni8`](https://github.com/jajmangold/ComfyUI-fni8) (diffusion DiTs in ComfyUI).
 
 ## License
 
