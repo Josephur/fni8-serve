@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: MIT
+"""Sequence + SamplingParams — a request's state through the engine."""
+from __future__ import annotations
+
+import enum
+from dataclasses import dataclass, field
+
+
+@dataclass
+class SamplingParams:
+    temperature: float = 0.0          # 0 => greedy
+    top_p: float = 1.0
+    max_tokens: int = 64
+    ignore_eos: bool = False
+
+
+class Status(enum.Enum):
+    WAITING = enum.auto()
+    RUNNING = enum.auto()
+    FINISHED = enum.auto()
+
+
+@dataclass
+class Sequence:
+    seq_id: int
+    prompt_ids: list[int]
+    params: SamplingParams
+    status: Status = Status.WAITING
+    slot: int = -1
+    output_ids: list[int] = field(default_factory=list)
+    length: int = 0                   # KV positions committed for this seq
+
+    @property
+    def num_prompt(self) -> int:
+        return len(self.prompt_ids)
+
+    @property
+    def last_token(self) -> int:
+        return self.output_ids[-1] if self.output_ids else self.prompt_ids[-1]
+
+    def is_finished(self, eos_id: int | None) -> bool:
+        if len(self.output_ids) >= self.params.max_tokens:
+            return True
+        if not self.params.ignore_eos and eos_id is not None and self.output_ids \
+                and self.output_ids[-1] == eos_id:
+            return True
+        return False

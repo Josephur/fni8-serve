@@ -26,8 +26,9 @@ class KVCache:
     def reset(self):
         self.length = 0
 
-    def write_prefill(self, layer: int, k: torch.Tensor, v: torch.Tensor):
-        """k, v: [B, Hkv, S, D] at positions [0, S)."""
+    def write_prefill(self, layer: int, k: torch.Tensor, v: torch.Tensor, *, slot=None):
+        """k, v: [B, Hkv, S, D] at positions [0, S). `slot` is ignored (the simple
+        runner cache is single-batch); the engine's BatchedKVCache uses it."""
         s = k.shape[2]
         self.k[layer, :, :, :s] = k
         self.v[layer, :, :, :s] = v

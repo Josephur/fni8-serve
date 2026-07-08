@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: MIT
+"""LLMEngine — request queue + scheduler + runner, with an offline generate() API.
+
+Arch-agnostic: it drives any registered CausalLM. Build it from a ModelConfig + a
+weights dict (the `.fni8` loader output, or an HF state dict). Multi-GPU (PP +
+MoE-EP, never TP) and paged KV are later layers; this is the correct single-GPU
+continuous-batching engine over the current fni8 kernels.
+"""
+from __future__ import annotations
+
+import itertools
+
+from ..models.config import ModelConfig
+from ..models.registry import build_model
+from .kv_cache import BatchedKVCache
+from .model_runner import EngineRunner
+from .scheduler import Scheduler
+from .sequence import SamplingParams, Sequence
+
+
+class LLMEngine:
+    def __init__(self, cfg: ModelConfig, weights: dict, *, device="cuda",
+                 max_num_seqs: int = 16, max_len: int = 2048, max_batch_tokens: int = 8192,
+                 eos_id: int | None = None):
+        self.cfg = cfg
+        self.device = device
+        self.eos_id = eos_id
+        self.model = build_model(cfg, weights).to(device).eval()
+        self.cache = BatchedKVCache(cfg.num_hidden_layers, max_num_seqs,
+                                    cfg.num_key_value_heads, max_len, cfg.resolved_head_dim(),
+                                    device=device)
+        self.scheduler = Scheduler(self.cache, max_num_seqs=max_num_seqs,
+                                   max_batch_tokens=max_batch_tokens, eos_id=eos_id)
+        self.runner = EngineRunner(self.model, self.cache, device=device)
+        self._ids = itertools.count()
+        self._out: dict[int, Sequence] = {}
+
+    def add_request(self, prompt_ids: list[int], params: SamplingParams | None = None) -> int:
+        seq = Sequence(next(self._ids), list(prompt_ids), params or SamplingParams())
+        self.scheduler.add(seq)
+        self._out[seq.seq_id] = seq
+        return seq.seq_id
+
+    def step(self):
+        batch, is_prefill = self.scheduler.schedule()
+        if not batch:
+            return
+        toks = self.runner.prefill(batch) if is_prefill else self.runner.decode(batch)
+        for seq, tok in zip(batch, toks):
+            seq.output_ids.append(int(tok))
+        self.scheduler.postprocess(batch, is_prefill)
+
+    def generate(self, prompts: list[list[int]],
+                 params: SamplingParams | None = None) -> list[list[int]]:
+        """Offline batched generation: returns the output token ids per prompt."""
+        ids = [self.add_request(p, params) for p in prompts]
+        while self.scheduler.has_work():
+            self.step()
+        return [self._out[i].output_ids for i in ids]

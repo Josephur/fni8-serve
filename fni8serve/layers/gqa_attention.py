@@ -69,15 +69,33 @@ class GQAAttention(nn.Module):
         v = v.transpose(1, 2).contiguous()
 
         if ctx.is_prefill:
-            ctx.kv_cache.write_prefill(layer_idx, k, v)
+            slot = ctx.slots[0] if ctx.slots is not None else None
+            ctx.kv_cache.write_prefill(layer_idx, k, v, slot=slot)
             out = fni8.attn_int8_fwd(q, k, v, causal=True, scale=self.scale,
                                      window_left=self.window_left)
+        elif ctx.slot_lengths is not None:
+            out = self._decode_ragged(q, k, v, ctx, layer_idx)   # engine continuous batch
         else:
             k_all, v_all = ctx.kv_cache.append_decode(layer_idx, k, v)   # [B,Hkv,N,D]
-            if self.window_left >= 0 and k_all.shape[2] > self.window_left:
-                k_all = k_all[:, :, -self.window_left:].contiguous()
-                v_all = v_all[:, :, -self.window_left:].contiguous()
+            k_all, v_all = self._window(k_all, v_all)
             out = fni8.attn_int8_decode(q, k_all, v_all, scale=self.scale)
 
         out = out.transpose(1, 2).reshape(B, S, self.nh * self.hd)
         return self.o_proj(out)
+
+    def _window(self, k_all, v_all):
+        if self.window_left >= 0 and k_all.shape[2] > self.window_left:
+            k_all = k_all[:, :, -self.window_left:].contiguous()
+            v_all = v_all[:, :, -self.window_left:].contiguous()
+        return k_all, v_all
+
+    def _decode_ragged(self, q, k, v, ctx, layer_idx):
+        """Continuous-batch decode: rows have different KV lengths, so batch the
+        GEMMs (already done upstream) and loop the memory-bound attention call per
+        slot. Replaced by a batched block-table decode kernel when fni8 ships one."""
+        outs = []
+        for b, (slot, n) in enumerate(zip(ctx.slots, ctx.slot_lengths)):
+            kb, vb = ctx.kv_cache.append_read_slot(layer_idx, slot, n, k[b], v[b])
+            kb, vb = self._window(kb, vb)
+            outs.append(fni8.attn_int8_decode(q[b:b + 1], kb, vb, scale=self.scale))
+        return torch.cat(outs, dim=0)
