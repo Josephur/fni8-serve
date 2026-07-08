@@ -83,13 +83,21 @@ def bench_one(path: str, *, num_prompts: int, prompt_len: int, max_new_tokens: i
     if not is_supported(cfg.arch):
         return {"model": _name(path), "arch": cfg.arch, "skipped": "arch not registered"}
 
-    torch.cuda.reset_peak_memory_stats(device)
+    # Resolve to a concrete device (torch rejects a bare "cuda" without an index in
+    # set_device / the memory-stat calls) and make it current, so the stat calls below
+    # can take no device argument.
+    _dev = torch.device(device)
+    if _dev.type == "cuda":
+        if _dev.index is None:
+            _dev = torch.device("cuda", torch.cuda.current_device())
+        torch.cuda.set_device(_dev)
+    torch.cuda.reset_peak_memory_stats()
     weights = load_fni8_state_dict(path, device=device)
 
     t_load0 = time.perf_counter()
     engine = LLMEngine(cfg, weights, device=device, max_num_seqs=max(num_prompts, 1),
                        max_len=prompt_len + max_new_tokens + 8)
-    torch.cuda.synchronize(device)
+    torch.cuda.synchronize()
     load_s = time.perf_counter() - t_load0
 
     # Synthetic prompts (real accuracy runs should tokenize real text instead —
@@ -98,17 +106,17 @@ def bench_one(path: str, *, num_prompts: int, prompt_len: int, max_new_tokens: i
     params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens, ignore_eos=True)
     ids = [engine.add_request(p, params) for p in prompts]
 
-    torch.cuda.synchronize(device)
+    torch.cuda.synchronize()
     t0 = time.perf_counter()
     engine.step()                      # first scheduled step is prefill for a cold batch
-    torch.cuda.synchronize(device)
+    torch.cuda.synchronize()
     ttft_s = time.perf_counter() - t0
     prefill_toks = sum(len(p) for p in prompts)
 
     t1 = time.perf_counter()
     while engine.scheduler.has_work():
         engine.step()
-    torch.cuda.synchronize(device)
+    torch.cuda.synchronize()
     decode_s = time.perf_counter() - t1
     decode_toks = sum(len(engine._out[i].output_ids) - 1 for i in ids)  # -1: TTFT token
 
@@ -123,7 +131,7 @@ def bench_one(path: str, *, num_prompts: int, prompt_len: int, max_new_tokens: i
         "ttft_s": ttft_s,
         "prefill_tok_s": prefill_toks / ttft_s if ttft_s > 0 else None,
         "decode_tok_s": decode_toks / decode_s if decode_s > 0 else None,
-        "peak_vram_gb": torch.cuda.max_memory_allocated(device) / 1e9,
+        "peak_vram_gb": torch.cuda.max_memory_allocated() / 1e9,
     }
     if hf_dir:
         sqnr = _weight_sqnr(path, hf_dir)
