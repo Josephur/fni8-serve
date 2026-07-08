@@ -40,7 +40,13 @@ class EngineRunner:
                              device=self.device, dtype=torch.float32)
         top_p = torch.tensor([s.params.top_p for s in batch],
                              device=self.device, dtype=torch.float32)
-        toks = self.sampler(logits, temps, top_p=top_p)
+        procs = [s.params.logit_processors for s in batch]
+        has_procs = any(procs)
+        toks = self.sampler(
+            logits, temps, top_p=top_p,
+            logit_processors=procs if has_procs else None,
+            input_ids=[s.all_token_ids for s in batch] if has_procs else None,
+        )
         return toks.tolist()
 
     @torch.inference_mode()

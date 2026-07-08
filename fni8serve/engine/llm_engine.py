@@ -51,6 +51,15 @@ class LLMEngine:
         self._out[seq.seq_id] = seq
         return seq.seq_id
 
+    def sequence(self, seq_id: int) -> Sequence:
+        return self._out[seq_id]
+
+    def forget(self, seq_id: int) -> None:
+        """Drop bookkeeping for a finished request. Needed by long-lived callers (the
+        API server) that generate() never returns to -- without this, `_out` would
+        retain every request's Sequence for the life of the process."""
+        self._out.pop(seq_id, None)
+
     def step(self):
         batch, is_prefill = self.scheduler.schedule()
         if not batch:

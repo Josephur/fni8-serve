@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable
 from dataclasses import dataclass, field
+
+# (this sequence's token ids so far, this step's logits row) -> logits row. Applied
+# before sampling -- the seam structured outputs / grammars (#39) plug into.
+LogitsProcessor = Callable[[list[int], "torch.Tensor"], "torch.Tensor"]
 
 
 @dataclass
@@ -12,6 +17,7 @@ class SamplingParams:
     top_p: float = 1.0
     max_tokens: int = 64
     ignore_eos: bool = False
+    logit_processors: list[LogitsProcessor] | None = None
 
 
 class Status(enum.Enum):
@@ -38,10 +44,17 @@ class Sequence:
     def last_token(self) -> int:
         return self.output_ids[-1] if self.output_ids else self.prompt_ids[-1]
 
-    def is_finished(self, eos_id: int | None) -> bool:
+    @property
+    def all_token_ids(self) -> list[int]:
+        return self.prompt_ids + self.output_ids
+
+    def finish_reason(self, eos_id: int | None) -> str | None:
         if len(self.output_ids) >= self.params.max_tokens:
-            return True
+            return "length"
         if not self.params.ignore_eos and eos_id is not None and self.output_ids \
                 and self.output_ids[-1] == eos_id:
-            return True
-        return False
+            return "stop"
+        return None
+
+    def is_finished(self, eos_id: int | None) -> bool:
+        return self.finish_reason(eos_id) is not None

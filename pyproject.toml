@@ -21,10 +21,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff"]
+dev = ["pytest", "ruff", "openai", "httpx"]
 # Only the HF-checkpoint conversion path (fni8serve.convert.convert_hf_to_fni8)
 # needs these; serving from a .fni8 file does not.
 convert = ["safetensors", "huggingface-hub"]
+# The OpenAI-compatible API server (fni8serve.api). transformers supplies the
+# tokenizer + apply_chat_template; the .fni8 file itself carries no tokenizer.
+serve = ["fastapi>=0.110", "uvicorn[standard]", "transformers"]
 
 [tool.setuptools.packages.find]
 include = ["fni8serve*"]

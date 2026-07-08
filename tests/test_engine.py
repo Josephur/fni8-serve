@@ -84,3 +84,21 @@ def test_engine_respects_eos():
     eng = LLMEngine(cfg, _sd(cfg), device="cuda", max_num_seqs=4, max_len=64, eos_id=None)
     out = eng.generate([[1, 2, 3]], SamplingParams(temperature=0.0, max_tokens=4))[0]
     assert len(out) == 4
+
+
+def test_engine_applies_logit_processors():
+    """A per-request logit processor can force a specific token every step, proving
+    the hook (issue #38) threads from SamplingParams through the engine's sampler."""
+    torch.manual_seed(3)
+    cfg = _cfg()
+    eng = LLMEngine(cfg, _sd(cfg), device="cuda", max_num_seqs=4, max_len=64)
+
+    def force_token_5(input_ids, logits):
+        logits = logits.clone()
+        logits[:] = float("-inf")
+        logits[5] = 0.0
+        return logits
+
+    params = SamplingParams(temperature=0.0, max_tokens=4, logit_processors=[force_token_5])
+    out = eng.generate([[1, 2, 3]], params)[0]
+    assert out == [5, 5, 5, 5]

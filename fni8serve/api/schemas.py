@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: MIT
+"""Pydantic request/response models mirroring the OpenAI REST API shapes closely
+enough that the `openai` Python client works unmodified against `base_url`."""
+from __future__ import annotations
+
+import time
+import uuid
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+def _id(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex}"
+
+
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str | None = None
+    name: str | None = None
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: list[ChatMessage]
+    temperature: float = 1.0
+    top_p: float = 1.0
+    max_tokens: int | None = None
+    stream: bool = False
+    stop: str | list[str] | None = None
+
+
+class CompletionRequest(BaseModel):
+    model: str
+    prompt: str | list[str]
+    temperature: float = 1.0
+    top_p: float = 1.0
+    max_tokens: int = 16
+    stream: bool = False
+    stop: str | list[str] | None = None
+
+
+class UsageInfo(BaseModel):
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class ChatCompletionResponseChoice(BaseModel):
+    index: int = 0
+    message: ChatMessage
+    finish_reason: str | None = None
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str = Field(default_factory=lambda: _id("chatcmpl"))
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: list[ChatCompletionResponseChoice]
+    usage: UsageInfo
+
+
+class DeltaMessage(BaseModel):
+    role: str | None = None
+    content: str | None = None
+
+
+class ChatCompletionChunkChoice(BaseModel):
+    index: int = 0
+    delta: DeltaMessage
+    finish_reason: str | None = None
+
+
+class ChatCompletionChunk(BaseModel):
+    id: str = Field(default_factory=lambda: _id("chatcmpl"))
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: list[ChatCompletionChunkChoice]
+
+
+class CompletionResponseChoice(BaseModel):
+    index: int = 0
+    text: str
+    finish_reason: str | None = None
+
+
+class CompletionResponse(BaseModel):
+    id: str = Field(default_factory=lambda: _id("cmpl"))
+    object: Literal["text_completion"] = "text_completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: list[CompletionResponseChoice]
+    usage: UsageInfo
+
+
+class CompletionChunkChoice(BaseModel):
+    index: int = 0
+    text: str
+    finish_reason: str | None = None
+
+
+class CompletionChunk(BaseModel):
+    id: str = Field(default_factory=lambda: _id("cmpl"))
+    object: Literal["text_completion"] = "text_completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: list[CompletionChunkChoice]
+
+
+class ModelCard(BaseModel):
+    id: str
+    object: Literal["model"] = "model"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    owned_by: str = "fni8-serve"
+
+
+class ModelList(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[ModelCard]

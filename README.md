@@ -85,6 +85,42 @@ engine = LLMEngine(cfg, load_fni8_state_dict("qwen3-8b.fni8"))
 out = engine.generate([[1, 2, 3]], SamplingParams(temperature=0.0, max_tokens=32))
 ```
 
+## OpenAI-compatible API server
+
+`fni8serve.api` puts an OpenAI-compatible HTTP surface over `LLMEngine`:
+`/v1/chat/completions`, `/v1/completions`, `/v1/models`, both streaming (SSE) and
+non-streaming. Chat formatting uses the model's own HF `apply_chat_template` (not a
+hardcoded template), so tool/template formatting comes free per model. Needs the
+`serve` extra: `pip install -e ".[serve]"`.
+
+```bash
+# The .fni8 file carries weights + config, not tokenizer files -- point --tokenizer
+# at the base model repo (or a fni8 quant repo that mirrors one).
+python -m fni8serve.api.server --model qwen3-8b.fni8 --tokenizer Qwen/Qwen3-8B
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+resp = client.chat.completions.create(
+    model="qwen3-8b.fni8",
+    messages=[{"role": "user", "content": "Say hi in five words."}],
+)
+print(resp.choices[0].message.content)
+```
+
+A per-step **logit-processor hook** sits in the sampler (`fni8serve.layers.sampler`,
+wired through `SamplingParams.logit_processors`): a list of
+`(input_ids, logits) -> logits` callables applied before sampling, per sequence.
+This is the seam structured outputs / grammars plug into.
+
+`--chat-template <file>` overrides the tokenizer's own embedded template with a
+Jinja source file (matches vLLM's `--chat-template` flag). The override still
+renders through `apply_chat_template`, so it gets the same sandboxed Jinja
+environment (`jinja2.sandbox.ImmutableSandboxedEnvironment`, via `transformers`) as
+the model's own template -- a custom template is never given more than that.
+
 ## Model support
 
 Model support is a registry: a family is a `ModelConfig` plus a thin `models/<family>.py`
@@ -107,6 +143,8 @@ over shared layers, registered with `@register_model`. The engine never changes.
 - [x] Modular model registry, 8+ families (build + prefill validated)
 - [x] Recurrent-state and latent decode caching for the linear/DeltaNet/MLA families
 - [x] Paged-KV block-table with int8 quantize-on-write, wired into the engine
+- [x] OpenAI-compatible API server (`fni8serve.api`) with SSE streaming, plus a
+      per-step logit-processor hook in the sampler for structured outputs / grammars
 - [ ] int8 dp4a DeltaNet and MLA kernels in `fni8` (the divergent-attention acceleration)
 - [ ] multi-GPU PP + MoE-EP with `fni8.transport`
 
