@@ -5,16 +5,18 @@ The weight is int8 (`per_row_i8`) or 4-bit (`per_group_i4`, int4/NF4) straight f
 the `.fni8` container — no dequant at load. At runtime the activation is quantized to
 int8 per-token and the matmul runs on dp4a.
 
-STATUS: the fused int8/W4A8 dp4a GEMM op is the #1 kernel still to build in `fni8`.
-Until it lands, `forward` uses a NUMERICALLY-CORRECT fp16 fallback (reconstruct the
-weight, torch.matmul) so the whole server runs end-to-end today; flipping to dp4a is a
-one-line swap to `fni8.int8_gemm(x_i8, w_i8, ...)`. The fallback is marked SLOW.
+The fast path is `fni8.linear(x, qt)`: it quantizes the activation per-token to int8
+and runs the dp4a GEMM (`gemm_w8a8` for `per_row_i8`, `gemm_w4a8` for `per_group_i4`
+int4). It is used whenever the weight is dp4a-compatible and x is on CUDA. NF4 weights
+(non-integer lookup codebook — not dp4a-able) and CPU tensors fall back to a
+NUMERICALLY-CORRECT fp16 path (reconstruct the weight, torch.matmul), marked SLOW.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
+import fni8
 from fni8 import QTensor
 
 try:  # NF4 codebook for 4-bit weight reconstruction (present in fni8)
@@ -53,9 +55,17 @@ class LinearW8A8(nn.Module):
         # in_features: int8 -> data.shape[1]; i4 packs 2/byte
         self.in_features = weight.data.shape[1] * (2 if weight.scheme == "per_group_i4" else 1)
 
+    def _dp4a_ok(self, x: torch.Tensor) -> bool:
+        """dp4a GEMM is CUDA-only and cannot consume NF4 (non-integer codebook)."""
+        if not x.is_cuda:
+            return False
+        qt = self.weight
+        if qt.scheme == "per_row_i8":
+            return True
+        return qt.scheme == "per_group_i4" and qt.codebook == "int4"
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO(fni8 GEMM): x_i8, x_scale = quantize per-token int8;
-        #                  y = fni8.int8_gemm(x_i8, self.weight.data, x_scale, self.weight.scale, ...)
-        w = _dequant_weight(self.weight).to(x.dtype)   # SLOW fp16 fallback (no dp4a yet)
-        y = torch.nn.functional.linear(x, w, self.bias)
-        return y
+        if self._dp4a_ok(x):
+            return fni8.linear(x, self.weight, bias=self.bias)   # int8/W4A8 dp4a
+        w = _dequant_weight(self.weight).to(x.dtype)   # SLOW fp16 fallback (NF4 / CPU)
+        return torch.nn.functional.linear(x, w, self.bias)

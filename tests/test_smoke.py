@@ -62,3 +62,33 @@ def test_shard_partial_load(tmp_path):
                                               ["model.layers.2.w", "model.layers.3.w"]]})
     w = load_fni8_checkpoint(path, device="cpu", shard="pp:1")
     assert set(w) == {"model.layers.2.w", "model.layers.3.w"}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="dp4a GEMM is CUDA-only")
+def test_linear_dp4a_matches_fallback_w8(tmp_path):
+    """On CUDA, LinearW8A8 routes through fni8.linear (dp4a); it must agree with the
+    fp16 dequant fallback to int8 tolerance."""
+    from fni8serve.layers.linear import _dequant_weight
+    cpu_qt = _i8(256, 512)
+    qt = QTensor(cpu_qt.data.cuda(), cpu_qt.scale.cuda(), scheme=cpu_qt.scheme)
+    lin = LinearW8A8(qt)
+    x = torch.randn(16, 512, device="cuda", dtype=torch.float16)
+    y = lin(x)                                                # dp4a path
+    w = _dequant_weight(qt).to(x.dtype)
+    ref = torch.nn.functional.linear(x, w)                    # fp16 reference
+    cos = torch.nn.functional.cosine_similarity(y.flatten().float(), ref.flatten().float(), dim=0)
+    assert cos.item() >= 0.99 and torch.isfinite(y).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="dp4a GEMM is CUDA-only")
+def test_linear_dp4a_w4(tmp_path):
+    from fni8serve.layers.linear import _dequant_weight
+    cpu_qt = _i4(128, 256, 32)
+    qt = QTensor(cpu_qt.data.cuda(), cpu_qt.scale.cuda(), scheme=cpu_qt.scheme,
+                 group_size=cpu_qt.group_size, codebook=cpu_qt.codebook)
+    lin = LinearW8A8(qt)
+    x = torch.randn(8, 256, device="cuda", dtype=torch.float16)
+    y = lin(x)                                                # W4A8 dp4a path
+    ref = torch.nn.functional.linear(x, _dequant_weight(qt).to(x.dtype))
+    cos = torch.nn.functional.cosine_similarity(y.flatten().float(), ref.flatten().float(), dim=0)
+    assert cos.item() >= 0.985 and torch.isfinite(y).all()
