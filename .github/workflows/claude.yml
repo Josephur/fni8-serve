@@ -21,7 +21,7 @@ on:
   pull_request_review:
     types: [submitted]
   issues:
-    types: [opened, assigned, labeled]
+    types: [opened, labeled]
 
 concurrency:
   group: claude-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
@@ -45,8 +45,7 @@ jobs:
         (github.event_name == 'issues' &&
           contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association) &&
           (contains(github.event.issue.body, '@claude') ||
-           github.event.label.name == 'claude' ||
-           github.event.action == 'assigned'))
+           github.event.label.name == 'claude'))
       )
     runs-on: [self-hosted, volta-gpu]
     timeout-minutes: 180
