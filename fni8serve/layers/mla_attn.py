@@ -14,7 +14,10 @@ Track 2 (fni8 csrc/) replaces the fp16 attention with the ABSORB-path int8 kerne
 is the correct oracle for that kernel. `absorb_qk_equiv` proves the identity the
 kernel relies on: q_nope·k_nope == (W_UK^T q_nope)·c_KV.
 
-KV cache stores only c_KV (kv_lora_rank) + k_pe (qk_rope_head_dim) per token.
+KV cache stores only c_KV (kv_lora_rank) + k_pe (qk_rope_head_dim) per token — see
+`models.cache.MLALatentCache`. Decode re-projects the *entire* cached latent through
+kv_b_proj every step (no weight absorption yet), so it costs O(N) extra GEMM work
+per step; that's exactly the naive path the Track-2 absorb kernel replaces.
 """
 from __future__ import annotations
 
@@ -56,6 +59,14 @@ class MLAAttention(nn.Module):
         self.o_proj = LinearW8A8(o_proj)
         self.rope = RotaryEmbedding(qk_rope_head_dim, max_pos, base=rope_theta)
 
+    def _up_kv(self, c_kv: torch.Tensor):
+        """c_kv [B,N,kv_lora] -> k_nope [B,N,nh,qk_nope], v [B,N,nh,vd] (the up-project
+        half of the decompress path; called on the whole cache every decode step since
+        weights aren't absorbed here — see Track 2)."""
+        B, N, _ = c_kv.shape
+        kv = self.kv_b_proj(c_kv).view(B, N, self.nh, self.qk_nope + self.vd)
+        return kv.split([self.qk_nope, self.vd], dim=-1)
+
     def forward(self, hidden, positions, ctx, layer_idx):
         B, L, _ = hidden.shape
         if positions is None:
@@ -66,20 +77,38 @@ class MLAAttention(nn.Module):
         kv_mqa = self.kv_a_proj(hidden)
         c_kv, k_pe = kv_mqa.split([self.kv_lora, self.qk_rope], dim=-1)
         c_kv = self.kv_a_norm(c_kv)
-        kv = self.kv_b_proj(c_kv).view(B, L, self.nh, self.qk_nope + self.vd)
-        k_nope, v = kv.split([self.qk_nope, self.vd], dim=-1)
         k_pe = k_pe.view(B, L, 1, self.qk_rope)
 
-        # decoupled RoPE on the rope part (k_pe shared across heads)
+        # decoupled RoPE on the rope part (k_pe shared across heads, cached post-RoPE)
         q_rope, k_pe = self.rope(positions, q_rope, k_pe)
-        k_pe = k_pe.expand(B, L, self.nh, self.qk_rope)
+
+        causal = True
+        if ctx is not None and ctx.kv_cache is not None:
+            latent = torch.cat([c_kv, k_pe.squeeze(2)], dim=-1)   # [B,L,kv_lora+qk_rope]
+            if ctx.is_prefill:
+                ctx.kv_cache.write_prefill(layer_idx, latent)
+                k_nope, v = self._up_kv(c_kv)
+                k_pe_all = k_pe.expand(B, L, self.nh, self.qk_rope)
+            else:
+                latent_all = ctx.kv_cache.append_decode(layer_idx, latent)  # [B,N,kv_lora+qk_rope]
+                c_kv_all, k_pe_all = latent_all.split([self.kv_lora, self.qk_rope], dim=-1)
+                N = latent_all.shape[1]
+                k_nope, v = self._up_kv(c_kv_all)
+                k_pe_all = k_pe_all.view(B, N, 1, self.qk_rope).expand(B, N, self.nh, self.qk_rope)
+                causal = False   # single query attends to all (already-causal) cached keys
+        else:
+            k_nope, v = self._up_kv(c_kv)
+            k_pe_all = k_pe.expand(B, L, self.nh, self.qk_rope)
+
         q = torch.cat([q_nope, q_rope], dim=-1).transpose(1, 2)          # [B,nh,L,qk_head]
-        k = torch.cat([k_nope, k_pe], dim=-1).transpose(1, 2)
-        v = v.transpose(1, 2)                                            # [B,nh,L,vd]
+        k = torch.cat([k_nope, k_pe_all], dim=-1).transpose(1, 2)        # [B,nh,N,qk_head]
+        v = v.transpose(1, 2)                                            # [B,nh,N,vd]
 
         scores = torch.einsum("bhqd,bhkd->bhqk", q.float(), k.float()) * self.scale
-        mask = torch.ones(L, L, device=hidden.device, dtype=torch.bool).tril()
-        scores = scores.masked_fill(~mask, float("-inf"))
+        if causal:
+            Lq, Nk = scores.shape[-2], scores.shape[-1]
+            mask = torch.ones(Lq, Nk, device=hidden.device, dtype=torch.bool).tril()
+            scores = scores.masked_fill(~mask, float("-inf"))
         p = torch.softmax(scores, dim=-1).to(v.dtype)
         o = torch.einsum("bhqk,bhkd->bhqd", p, v)                        # [B,nh,L,vd]
         return self.o_proj(o.transpose(1, 2).reshape(B, L, self.nh * self.vd))

@@ -12,7 +12,7 @@ from __future__ import annotations
 import torch
 
 from .base import ForwardContext
-from .cache import KVCache, RecurrentStateCache
+from .cache import KVCache, MLALatentCache, RecurrentStateCache
 from .config import ModelConfig
 
 
@@ -21,8 +21,12 @@ class ModelRunner:
         self.model = model
         self.cfg = cfg
         self.device = device
-        self.cache = KVCache(cfg.num_hidden_layers, max_batch, cfg.num_key_value_heads,
-                             max_len, cfg.resolved_head_dim(), device=device)
+        if cfg.latent_attention:
+            self.cache = MLALatentCache(cfg.num_hidden_layers, max_batch, cfg.mla_cache_dim(),
+                                        max_len, device=device)
+        else:
+            self.cache = KVCache(cfg.num_hidden_layers, max_batch, cfg.num_key_value_heads,
+                                 max_len, cfg.resolved_head_dim(), device=device)
         self.lin_cache = RecurrentStateCache()
 
     @torch.inference_mode()

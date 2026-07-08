@@ -46,6 +46,7 @@ def _mla(cfg: ModelConfig, sd: dict, p: str) -> MLAAttention:
 class DeepseekDecoderLayer(nn.Module):
     def __init__(self, cfg: ModelConfig, i: int, sd: dict):
         super().__init__()
+        self.layer_idx = i
         p = f"model.layers.{i}"
         self.self_attn = _mla(cfg, sd, f"{p}.self_attn")
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps,
@@ -74,7 +75,7 @@ class DeepseekDecoderLayer(nn.Module):
             h = self.input_layernorm(x)
         else:
             h, residual = self.input_layernorm(x, residual)
-        h = self.self_attn(h, positions, ctx, 0)
+        h = self.self_attn(h, positions, ctx, self.layer_idx)
         h, residual = self.post_attention_layernorm(h, residual)
         h = self.mlp(h)
         return h, residual

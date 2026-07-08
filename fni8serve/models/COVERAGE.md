@@ -20,16 +20,20 @@ Legend: ✅ concrete + GPU-tested (full decode) · 🟩 registered + prefill-tes
 | **GLM-4.5/4.6** | ✅ | GQA + **partial RoPE 0.5** + QKV-bias | sigmoid MoE + shared | 🟩 | e_score_correction_bias select, routed_scaling 2.5, first-k-dense |
 | **Hunyuan** (A13B) | ✅ | GQA + QK-norm | softmax MoE + shared | 🟩 | `mlp.gate.wg`, `shared_mlp`; CLA (Large) not modeled |
 | **Qwen3-Next / Qwen3.5 / Qwen3.6** | ✅ | **hybrid: Gated DeltaNet (linear) + full** | ultra-sparse MoE + shared | 🟩⛔ | fp16 DeltaNet backend runs; int8 chunked kernel = Track 2 |
-| **DeepSeek-V3/V4** | V3 ✅ | **MLA (latent KV)** | fine MoE + shared | 🟩⛔ | fp16 decompress MLA runs (prefill); absorb int8 kernel = Track 2 |
+| **DeepSeek-V3/V4** | V3 ✅ | **MLA (latent KV)** | fine MoE + shared | ✅⛔ | fp16 decompress MLA runs prefill + decode (`MLALatentCache`); absorb int8 kernel = Track 2 |
 | **MiniMax-Text** | ✅ | **lightning (linear)** + softmax hybrid | softmax MoE | 🟩⛔ | fp16 lightning backend runs; postnorm α/β scaling; int8 = Track 2 |
 | **DiffusionGemma** | ✅ (post-cutoff) | **bidirectional** over canvas | GeGLU MoE | 🟡 | `attn_int8_fwd(causal=False)`; needs DiffusionDecodeStrategy |
 | **Gemma4 / gemma3n** | ✅ | GQA + AltUp/LAuReL/PLE/MatFormer | GeGLU | 🟧 | residual-mixing + per-layer-embeddings are new modules |
 
 **Registered & prefill-tested this round** (`tests/test_more_models.py`,
-`test_deepseek.py`): LFM2, GLM, Hunyuan, MiniMax, Qwen3-Next, DeepSeek — all build
-through the registry and run a prefill forward on the fni8 dp4a kernels. Full
-autoregressive decode for the linear/conv/lightning/MLA families needs recurrent-
-state / latent caching (Track 1.5; the Track-2 int8 kernels provide it naturally).
+`test_deepseek.py`): LFM2, GLM, Hunyuan, MiniMax, Qwen3-Next — all build through the
+registry and run a prefill forward on the fni8 dp4a kernels. DeepSeek additionally
+runs full autoregressive decode (`ModelRunner.generate_greedy`) through
+`MLALatentCache` — the compressed `c_KV + k_pe` per token, up-projected via
+`kv_b_proj` each decode step (no weight absorption yet, so it's O(N) extra GEMM work
+per step; the Track-2 absorb kernel removes that). Full autoregressive decode for the
+remaining linear/conv/lightning families still needs recurrent-state caching
+(Track 1.5; the Track-2 int8 kernels provide it naturally).
 Generative multimodal (Z-Image, Qwen-Image, LTX, Wan, Qwen3-TTS) → see the
 diffusion-pipeline plan; the DiT backbone reuses these kernels, the pipeline is new.
 

@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""DeepSeek (MLA + fine-grained MoE + shared expert) registration + prefill.
+"""DeepSeek (MLA + fine-grained MoE + shared expert) registration + prefill/decode.
 
-Builds a small random DeepSeek through the registry and runs a prefill forward
-(MLA decompress path + first-dense-then-MoE layers). MLA decode needs latent-KV
-caching (the Track-2 absorb kernel's home), so this covers build + prefill."""
+Builds a small random DeepSeek through the registry and runs prefill (MLA decompress
+path + first-dense-then-MoE layers) plus a full greedy-decode loop through the
+latent-KV cache (`MLALatentCache`, wired in via `ModelRunner`/`cfg.latent_attention`).
+"""
 import pytest
 import torch
 
@@ -21,7 +22,7 @@ def _cfg():
         num_attention_heads=4, num_key_value_heads=4, intermediate_size=256,
         max_position_embeddings=64, head_dim=48, tie_word_embeddings=True,
         num_experts=4, num_experts_per_tok=2, moe_intermediate_size=128,
-        rms_norm_eps=1e-6,
+        rms_norm_eps=1e-6, latent_attention=True,
         extra=dict(q_lora_rank=96, kv_lora_rank=64, qk_nope_head_dim=32,
                    qk_rope_head_dim=16, v_head_dim=32, first_k_dense_replace=1),
     )
@@ -68,13 +69,64 @@ def test_deepseek_registered():
 
 def test_deepseek_prefill():
     from fni8serve.models.base import ForwardContext
-    from fni8serve.models.cache import KVCache
+    from fni8serve.models.cache import MLALatentCache
     cfg = _cfg()
     model = build_model(cfg, _sd(cfg)).cuda().eval()
     ids = torch.randint(0, cfg.vocab_size, (1, 6), device="cuda")
     pos = torch.arange(6, device="cuda").unsqueeze(0)
-    cache = KVCache(cfg.num_hidden_layers, 1, cfg.num_key_value_heads, 16,
-                    cfg.resolved_head_dim(), device="cuda")
+    cache = MLALatentCache(cfg.num_hidden_layers, 1, cfg.mla_cache_dim(), 16, device="cuda")
     hidden = model(ids, pos, ForwardContext(is_prefill=True, kv_cache=cache))
     logits = model.compute_logits(hidden[:, -1])
     assert logits.shape == (1, cfg.vocab_size) and torch.isfinite(logits).all()
+
+
+def test_deepseek_generate():
+    """Full autoregressive loop: prefill then decode through the latent-KV cache,
+    end to end via ModelRunner (the seam other families' generate tests exercise)."""
+    from fni8serve.models import ModelRunner
+    from fni8serve.models.cache import MLALatentCache
+
+    cfg = _cfg()
+    model = build_model(cfg, _sd(cfg)).cuda().eval()
+    runner = ModelRunner(model, cfg, max_batch=1, max_len=32, device="cuda")
+    assert isinstance(runner.cache, MLALatentCache)
+    prompt = torch.randint(0, cfg.vocab_size, (1, 6), device="cuda")
+    logits = runner.prefill(prompt)
+    assert logits.shape == (1, cfg.vocab_size) and torch.isfinite(logits).all()
+    out = runner.generate_greedy(prompt, max_new_tokens=4)
+    assert out.shape == (1, 4) and (out >= 0).all() and (out < cfg.vocab_size).all()
+
+
+def test_deepseek_decode_cache_matches_full_recompute():
+    """Parity: decoding one token at a time through the latent cache must match a
+    one-shot forward over the whole sequence (the same decompress-path math with a
+    fresh cache each time is the module's own oracle — see `mla_attn.py`). Dense-only
+    (no MoE) so the comparison isn't at the mercy of top-k routing flipping on the
+    tiny floating-point differences between batched-prefill and single-token softmax."""
+    from fni8serve.models.base import ForwardContext
+    from fni8serve.models.cache import MLALatentCache
+
+    cfg = _cfg()
+    cfg.num_experts = 0
+    cfg.num_experts_per_tok = 0
+    cfg.extra = dict(cfg.extra, first_k_dense_replace=cfg.num_hidden_layers)
+    model = build_model(cfg, _sd(cfg)).cuda().eval()
+    S = 6
+    ids = torch.randint(0, cfg.vocab_size, (1, S), device="cuda")
+    pos_full = torch.arange(S, device="cuda").unsqueeze(0)
+
+    ref_cache = MLALatentCache(cfg.num_hidden_layers, 1, cfg.mla_cache_dim(), S, device="cuda")
+    ref_hidden = model(ids, pos_full, ForwardContext(is_prefill=True, kv_cache=ref_cache))
+
+    step_cache = MLALatentCache(cfg.num_hidden_layers, 1, cfg.mla_cache_dim(), S, device="cuda")
+    prefill_n = S - 1
+    pre_hidden = model(ids[:, :prefill_n], pos_full[:, :prefill_n],
+                       ForwardContext(is_prefill=True, kv_cache=step_cache))
+    step_cache.advance(prefill_n)
+    pos_last = pos_full[:, prefill_n:prefill_n + 1]
+    dec_hidden = model(ids[:, prefill_n:prefill_n + 1], pos_last,
+                       ForwardContext(is_prefill=False, kv_cache=step_cache))
+    step_cache.advance(1)
+
+    got = torch.cat([pre_hidden, dec_hidden], dim=1)
+    torch.testing.assert_close(got.float(), ref_hidden.float(), rtol=2e-2, atol=2e-2)

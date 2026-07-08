@@ -73,3 +73,32 @@ class RecurrentStateCache:
     def reset(self):
         self._state.clear()
         self._conv_tail.clear()
+
+
+class MLALatentCache:
+    """Latent-KV cache for MLA (DeepSeek): stores only the compressed c_KV + k_pe
+    per token (`latent_dim = kv_lora_rank + qk_rope_head_dim`), one shared MQA-style
+    "head", instead of full per-head K/V. `MLAAttention` up-projects the read-back
+    latent through kv_b_proj to get per-head K/V at decode time.
+    """
+
+    def __init__(self, num_layers, batch, latent_dim, max_len, *, device, dtype=torch.float16):
+        self.kv = torch.zeros((num_layers, batch, max_len, latent_dim), device=device, dtype=dtype)
+        self.length = 0
+
+    def reset(self):
+        self.length = 0
+
+    def write_prefill(self, layer: int, latent: torch.Tensor):
+        """latent: [B, S, D] at positions [0, S)."""
+        s = latent.shape[1]
+        self.kv[layer, :, :s] = latent
+
+    def append_decode(self, layer: int, latent: torch.Tensor) -> torch.Tensor:
+        """latent: [B, 1, D] at position `length`. Returns [B, length+1, D]."""
+        p = self.length
+        self.kv[layer, :, p:p + 1] = latent
+        return self.kv[layer, :, :p + 1]
+
+    def advance(self, n: int = 1):
+        self.length += n

@@ -83,6 +83,11 @@ class ModelConfig:
     def resolved_head_dim(self) -> int:
         return self.head_dim or (self.hidden_size // self.num_attention_heads)
 
+    def mla_cache_dim(self) -> int:
+        """Latent-KV cache width for MLA (DeepSeek): kv_lora_rank + qk_rope_head_dim,
+        the per-token c_KV + k_pe that decode up-projects and attends over."""
+        return self.extra["kv_lora_rank"] + self.extra["qk_rope_head_dim"]
+
     def is_moe(self) -> bool:
         return self.num_experts > 0
 
