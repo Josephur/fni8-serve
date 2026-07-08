@@ -29,21 +29,21 @@ concurrency:
 
 jobs:
   claude:
-    # Only trigger on @claude / assignment / "claude" label AND only from a
-    # trusted author (owner / org member / collaborator).
+    # HARD LOCK: only the repo OWNER can ever start a run. This agent has a live
+    # HF token + GPU + the host docker socket, so `github.actor == repository_owner`
+    # is the gate — no member/collaborator/fork-PR/outside contributor can trigger
+    # it, regardless of @claude mention or label. (Also set repo Settings → Actions →
+    # "Require approval for all outside collaborators" as defence-in-depth.)
     if: >
+      github.actor == github.repository_owner &&
       (
         (github.event_name == 'issue_comment' &&
-          contains(github.event.comment.body, '@claude') &&
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+          contains(github.event.comment.body, '@claude')) ||
         (github.event_name == 'pull_request_review_comment' &&
-          contains(github.event.comment.body, '@claude') &&
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+          contains(github.event.comment.body, '@claude')) ||
         (github.event_name == 'pull_request_review' &&
-          contains(github.event.review.body, '@claude') &&
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) ||
+          contains(github.event.review.body, '@claude')) ||
         (github.event_name == 'issues' &&
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association) &&
           (contains(github.event.issue.body, '@claude') ||
            github.event.label.name == 'claude'))
       )
@@ -60,6 +60,12 @@ jobs:
           fetch-depth: 0
 
       - uses: anthropics/claude-code-action@v1
+        # Owner-only (see if: above), so the agent gets full capability: the HF token,
+        # GPU visibility, and the /mnt/24tb weights archive — enough to drive forge
+        # quant + benchmarks itself, not just author code.
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
           # Subscription auth (matches your local Claude Code sign-in). Generate the
           # long-lived token with `claude setup-token` and store it as this secret.
@@ -67,5 +73,10 @@ jobs:
           # --- OR, if you use a console.anthropic.com API key instead, comment the
           # line above and uncomment: ---
           # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # --add-dir mounts the weights archive into the agent's sandbox so it can
+          # inspect/point at .fni8 files; nvidia-smi + forge/bench wrappers let it run
+          # quant + on-cluster benchmarks. Only reachable because the trigger is
+          # owner-locked above.
           claude_args: |
-            --allowedTools "Bash(docker compose:*),Bash(git:*),Bash(gh:*),Bash(python3:*),Bash(pytest:*),Bash(ruff:*),Bash(trailmark:*),Edit,Read,Write,Glob,Grep"
+            --add-dir /mnt/24tb
+            --allowedTools "Bash(docker compose:*),Bash(git:*),Bash(gh:*),Bash(python3:*),Bash(pytest:*),Bash(ruff:*),Bash(trailmark:*),Bash(nvidia-smi:*),Bash(bash tools/forge.sh:*),Bash(bash tools/bench.sh:*),Bash(ls:*),Bash(cat:*),Edit,Read,Write,Glob,Grep"
