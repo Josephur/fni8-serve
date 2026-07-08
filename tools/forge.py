@@ -97,7 +97,7 @@ _DIT_SKIP = ("norm", "modulation", "adaln", "ada_ln", "pos_embed", "patch_embed"
              "guidance_in", "context_embedder", "final_layer", "proj_out")
 
 
-def quant_dit(repo: str, subfolder: str, bits: int) -> Path:
+def quant_dit(repo: str, subfolder: str, bits: int, weight_file: str | None = None) -> Path:
     import torch
     from safetensors.torch import load_file
 
@@ -107,10 +107,16 @@ def quant_dit(repo: str, subfolder: str, bits: int) -> Path:
 
     name = _name(repo)
     stage, out = STAGING / name, WEIGHTS / f"{name}.dit.b{bits}.fni8"
-    _download(repo, stage, ["*.safetensors", "config.json"], subfolder=subfolder)
-    tdir = stage / subfolder if (stage / subfolder).exists() else stage
+    if weight_file:
+        # Flat repos (e.g. Lightricks/LTX-2.3 ships many variants) — grab ONE file.
+        _download(repo, stage, [weight_file, "config.json"])
+        files = [stage / weight_file]
+    else:
+        _download(repo, stage, ["*.safetensors", "config.json"], subfolder=subfolder)
+        tdir = stage / subfolder if (stage / subfolder).exists() else stage
+        files = sorted(tdir.glob("*.safetensors"))
     sd: dict = {}
-    for f in sorted(tdir.glob("*.safetensors")):
+    for f in files:
         sd.update(load_file(str(f)))
     src_bf16 = any(w.dtype == torch.bfloat16 for w in sd.values())
     qsd: dict = {}
@@ -147,7 +153,8 @@ def _expected_out(repo: str, kind: str, bits: int) -> Path:
     return WEIGHTS / (f"{name}.dit.b{bits}.fni8" if kind == "dit" else f"{name}.b{bits}.fni8")
 
 
-def forge_one(repo: str, *, kind: str, bits: int, group: int, subfolder: str) -> bool:
+def forge_one(repo: str, *, kind: str, bits: int, group: int, subfolder: str,
+              weight_file: str | None = None) -> bool:
     if _expected_out(repo, kind, bits).exists():
         print(f"[skip] {repo} b{bits} already done"); return True
     stage = STAGING / _name(repo)
@@ -171,7 +178,8 @@ def forge_one(repo: str, *, kind: str, bits: int, group: int, subfolder: str) ->
             say(f"size probe failed ({e}); proceeding")
         _set(repo, status="downloading", started=time.time())
         say(f"quant {kind} bits={bits} ...")
-        out = quant_dit(repo, subfolder, bits) if kind == "dit" else quant_llm(repo, bits, group)
+        out = (quant_dit(repo, subfolder, bits, weight_file) if kind == "dit"
+               else quant_llm(repo, bits, group))
         size = out.stat().st_size / 1e9
         # Record per-bits under `outputs` so an int4 run doesn't clobber the int8 record.
         m = _manifest()
@@ -246,6 +254,9 @@ def main():
     ap.add_argument("--bits", type=int, default=8, choices=(4, 8))
     ap.add_argument("--group", type=int, default=128)
     ap.add_argument("--subfolder", default="transformer")
+    ap.add_argument("--weight-file", default=None,
+                    help="DiT: quant ONE specific safetensors file from a flat repo "
+                         "(e.g. ltx-2.3-22b-distilled-1.1.safetensors)")
     ap.add_argument("--hf-user", default="jajmangold", help="HF account for *-fni8 repos")
     ap.add_argument("--private", action="store_true", help="create private repos")
     a = ap.parse_args()
@@ -265,7 +276,8 @@ def main():
         return
 
     if a.action == "one":
-        ok = forge_one(a.target, kind=a.kind, bits=a.bits, group=a.group, subfolder=a.subfolder)
+        ok = forge_one(a.target, kind=a.kind, bits=a.bits, group=a.group,
+                       subfolder=a.subfolder, weight_file=a.weight_file)
         sys.exit(0 if ok else 1)
 
     # batch: lines "repo[,kind[,bits]]", '#' comments
