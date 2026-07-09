@@ -50,6 +50,19 @@ class EngineRunner:
         return toks.tolist()
 
     @torch.inference_mode()
+    def encode(self, batch: list[Sequence]) -> torch.Tensor:
+        hiddens = []
+        for seq in batch:
+            ids = torch.tensor([seq.prompt_ids], device=self.device)
+            pos = torch.arange(seq.num_prompt, device=self.device).unsqueeze(0)
+            self.cache.ensure_capacity([seq.slot], [seq.num_prompt])
+            ctx = ForwardContext(is_prefill=True, kv_cache=self.cache, slots=[seq.slot])
+            hidden = self.model(ids, pos, ctx)
+            pooled = hidden.mean(dim=1)
+            hiddens.append(pooled)
+        return torch.cat(hiddens, dim=0)
+
+    @torch.inference_mode()
     def prefill(self, batch: list[Sequence]) -> list[int]:
         out = []
         for seq in batch:

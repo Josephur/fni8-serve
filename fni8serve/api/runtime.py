@@ -48,6 +48,10 @@ class EngineWorker:
         self._inbox.put(req)
         return req.out_queue
 
+    def encode(self, prompt_ids: list[int]) -> list[float]:
+        """Encode a prompt and return the pooled embedding vector."""
+        return self.engine.encode(prompt_ids)
+
     async def stream(
         self, prompt_ids: list[int], params: SamplingParams,
     ) -> AsyncIterator[int | Done]:

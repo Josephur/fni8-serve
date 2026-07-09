@@ -205,6 +205,49 @@ class CreateBatchRequest(BaseModel):
     metadata: dict | None = None
 
 
+class EmbeddingRequest(BaseModel):
+    model: str
+    input: str | list[str]
+    encoding_format: Literal["float", "base64"] = "float"
+
+
+class EmbeddingData(BaseModel):
+    object: Literal["embedding"] = "embedding"
+    embedding: list[float]
+    index: int
+
+
+class EmbeddingResponse(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[EmbeddingData]
+    model: str
+    usage: UsageInfo
+
+
+class RerankDocument(BaseModel):
+    text: str
+
+
+class RerankResult(BaseModel):
+    index: int
+    relevance_score: float
+    document: RerankDocument | None = None
+
+
+class RerankRequest(BaseModel):
+    model: str
+    query: str
+    documents: list[str]
+    top_n: int | None = None
+
+
+class RerankResponse(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[RerankResult]
+    model: str
+    usage: UsageInfo
+
+
 class Batch(BaseModel):
     """OpenAI `/v1/batches` shape (issue #41). This server has no background job
     queue, so `POST /v1/batches` runs the file to completion before returning --

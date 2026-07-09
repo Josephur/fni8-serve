@@ -17,6 +17,7 @@ continuous-batching loop instead of contending for the engine.
 """
 from __future__ import annotations
 
+import math
 from collections.abc import AsyncIterator
 
 from fastapi import FastAPI
@@ -47,9 +48,16 @@ from .schemas import (
     CompletionResponse,
     CompletionResponseChoice,
     DeltaMessage,
+    EmbeddingData,
+    EmbeddingRequest,
+    EmbeddingResponse,
     ModelCard,
     ModelList,
     NamedToolChoice,
+    RerankDocument,
+    RerankRequest,
+    RerankResponse,
+    RerankResult,
     UsageInfo,
 )
 
@@ -135,6 +143,49 @@ def create_app(engine, tokenizer, *, served_model_name: str,
             choices=[CompletionResponseChoice(text=text, finish_reason=reason)],
             usage=UsageInfo(prompt_tokens=len(prompt_ids), completion_tokens=len(output_ids),
                             total_tokens=len(prompt_ids) + len(output_ids)),
+        )
+
+    @app.post("/v1/embeddings")
+    async def embeddings(req: EmbeddingRequest):
+        inputs = [req.input] if isinstance(req.input, str) else req.input
+        all_data: list[EmbeddingData] = []
+        total_tokens = 0
+        for i, text in enumerate(inputs):
+            prompt_ids = tokenizer.encode(text)
+            embedding = worker.encode(prompt_ids)
+            all_data.append(EmbeddingData(embedding=embedding, index=i))
+            total_tokens += len(prompt_ids)
+        if req.encoding_format == "float":
+            pass
+        return EmbeddingResponse(
+            model=req.model,
+            data=all_data,
+            usage=UsageInfo(prompt_tokens=total_tokens,
+                            completion_tokens=0,
+                            total_tokens=total_tokens),
+        )
+
+    @app.post("/v1/rerank")
+    async def rerank(req: RerankRequest):
+        results: list[RerankResult] = []
+        total_tokens = 0
+        for i, doc in enumerate(req.documents):
+            text = f"{req.query}\n{doc}"
+            prompt_ids = tokenizer.encode(text)
+            embedding = worker.encode(prompt_ids)
+            score = 1.0 / (1.0 + math.exp(-embedding[0]))
+            results.append(RerankResult(
+                index=i, relevance_score=score, document=RerankDocument(text=doc)))
+            total_tokens += len(prompt_ids)
+        results.sort(key=lambda r: r.relevance_score, reverse=True)
+        if req.top_n is not None:
+            results = results[:req.top_n]
+        return RerankResponse(
+            model=req.model,
+            data=results,
+            usage=UsageInfo(prompt_tokens=total_tokens,
+                            completion_tokens=0,
+                            total_tokens=total_tokens),
         )
 
     register_batch_routes(app, worker, tokenizer, grammars, chat_template=chat_template,

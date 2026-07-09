@@ -16,7 +16,7 @@ from .cuda_graph import cuda_graph_enabled_by_env
 from .kv_cache import PagedKVCache
 from .model_runner import EngineRunner
 from .scheduler import Scheduler
-from .sequence import SamplingParams, Sequence
+from .sequence import SamplingParams, Sequence, Status
 
 
 class LLMEngine:
@@ -68,6 +68,19 @@ class LLMEngine:
         for seq, tok in zip(batch, toks):
             seq.output_ids.append(int(tok))
         self.scheduler.postprocess(batch, is_prefill)
+
+    def encode(self, prompt_ids: list[int]) -> list[float]:
+        seq_id = self.add_request(prompt_ids)
+        batch, is_prefill = self.scheduler.schedule()
+        if not batch:
+            self.forget(seq_id)
+            return []
+        pooled = self.runner.encode(batch)
+        for seq in batch:
+            seq.status = Status.FINISHED
+        self.scheduler.postprocess(batch, is_prefill)
+        self.forget(seq_id)
+        return pooled[0].cpu().tolist()
 
     def generate(self, prompts: list[list[int]],
                  params: SamplingParams | None = None) -> list[list[int]]:

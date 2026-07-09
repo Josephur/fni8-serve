@@ -88,6 +88,9 @@ class FakeEngine:
         self._seqs: dict[int, Sequence] = {}
         self._ids = itertools.count()
 
+    def encode(self, prompt_ids: list[int]) -> list[float]:
+        return [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
     def add_request(self, prompt_ids, params: SamplingParams | None = None) -> int:
         seq_id = next(self._ids)
         self._seqs[seq_id] = Sequence(seq_id, list(prompt_ids), params or SamplingParams())
@@ -354,6 +357,90 @@ def test_named_tool_choice_forces_exactly_that_function(monkeypatch):
     assert resp.status_code == 200
     call = resp.json()["choices"][0]["message"]["tool_calls"][0]
     assert call["function"]["name"] == "get_weather"
+
+
+def test_embeddings_single_input(http_client):
+    resp = http_client.post("/v1/embeddings", json={
+        "model": "fake-qwen3", "input": "Hello world",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "list"
+    assert len(body["data"]) == 1
+    assert body["data"][0]["object"] == "embedding"
+    assert body["data"][0]["index"] == 0
+    assert isinstance(body["data"][0]["embedding"], list)
+    assert len(body["data"][0]["embedding"]) == 10
+    assert body["model"] == "fake-qwen3"
+    assert "usage" in body
+    assert "prompt_tokens" in body["usage"]
+
+
+def test_embeddings_batch_input(http_client):
+    resp = http_client.post("/v1/embeddings", json={
+        "model": "fake-qwen3", "input": ["Hello world", "Goodbye"],
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["data"]) == 2
+    assert body["data"][0]["index"] == 0
+    assert body["data"][1]["index"] == 1
+    assert len(body["data"][0]["embedding"]) == 10
+    assert len(body["data"][1]["embedding"]) == 10
+    assert body["usage"]["prompt_tokens"] == 6  # 3 tokens per input
+
+
+def test_embeddings_via_openai_client(http_client):
+    client = openai.OpenAI(
+        api_key="unused", base_url="http://testserver/v1", http_client=http_client)
+    resp = client.embeddings.create(
+        model="fake-qwen3", input="Hello world")
+    assert len(resp.data) == 1
+    assert len(resp.data[0].embedding) == 10
+    assert resp.data[0].index == 0
+
+
+def test_rerank(http_client):
+    resp = http_client.post("/v1/rerank", json={
+        "model": "fake-qwen3",
+        "query": "capital of France",
+        "documents": ["Paris is the capital.", "London is the capital."],
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "list"
+    assert len(body["data"]) == 2
+    for r in body["data"]:
+        assert "index" in r
+        assert "relevance_score" in r
+        assert isinstance(r["relevance_score"], float)
+        assert "document" in r
+        assert "text" in r["document"]
+    assert body["model"] == "fake-qwen3"
+    assert "usage" in body
+
+
+def test_rerank_with_top_n(http_client):
+    resp = http_client.post("/v1/rerank", json={
+        "model": "fake-qwen3",
+        "query": "capital of France",
+        "documents": ["Paris is the capital.", "London is the capital.",
+                      "Berlin is the capital."],
+        "top_n": 2,
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["data"]) == 2
+
+
+def test_rerank_sorted_by_score_descending(http_client):
+    resp = http_client.post("/v1/rerank", json={
+        "model": "fake-qwen3",
+        "query": "test",
+        "documents": ["doc a", "doc b", "doc c"],
+    })
+    scores = [r["relevance_score"] for r in resp.json()["data"]]
+    assert scores == sorted(scores, reverse=True)
 
 
 def test_chat_template_override_is_threaded_through(tokenizer):
