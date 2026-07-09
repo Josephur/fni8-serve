@@ -14,6 +14,8 @@ import pytest
 pytest.importorskip("fastapi")
 httpx = pytest.importorskip("httpx")
 
+from starlette.testclient import TestClient  # noqa: E402  (sync client for the ASGI app)
+
 from fni8serve.api.app import create_app  # noqa: E402
 from fni8serve.engine.sequence import SamplingParams, Sequence, Status  # noqa: E402
 
@@ -100,8 +102,7 @@ class FakeEngine:
 @pytest.fixture
 def http_client():
     app = create_app(FakeEngine(), FakeTokenizer(), served_model_name="fake-qwen3")
-    transport = httpx.ASGITransport(app=app)
-    with httpx.Client(transport=transport, base_url="http://testserver") as c:
+    with TestClient(app) as c:
         yield c
 
 
@@ -225,8 +226,7 @@ def test_batch_chat_completions_line_with_tools_round_trips_tool_call():
     tokenizer = FixedTextTokenizer(tool_call_text)
     engine = FakeEngine(eos_id=999, reply=[0, 999])
     app = create_app(engine, tokenizer, served_model_name="fake-qwen3")
-    transport = httpx.ASGITransport(app=app)
-    with httpx.Client(transport=transport, base_url="http://testserver") as client:
+    with TestClient(app) as client:
         input_file_id = _upload(client, [
             {"custom_id": "tool-1", "url": "/v1/chat/completions",
              "body": {"model": "fake-qwen3",
@@ -254,8 +254,7 @@ def test_batch_mixes_tool_and_plain_chat_lines_without_cross_contamination():
     tokenizer = FakeTokenizer()
     engine = FakeEngine()
     app = create_app(engine, tokenizer, served_model_name="fake-qwen3")
-    transport = httpx.ASGITransport(app=app)
-    with httpx.Client(transport=transport, base_url="http://testserver") as client:
+    with TestClient(app) as client:
         input_file_id = _upload(client, [
             {"custom_id": "plain", "url": "/v1/chat/completions",
              "body": {"model": "fake-qwen3", "messages": [{"role": "user", "content": "hi"}],

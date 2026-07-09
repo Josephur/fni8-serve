@@ -12,6 +12,8 @@ pytest.importorskip("fastapi")
 openai = pytest.importorskip("openai")
 httpx = pytest.importorskip("httpx")
 
+from starlette.testclient import TestClient  # noqa: E402  (sync client for the ASGI app)
+
 from fni8serve.api.app import create_app  # noqa: E402
 from fni8serve.api.schemas import ChatCompletionRequest  # noqa: E402
 from fni8serve.engine.sequence import SamplingParams, Sequence, Status  # noqa: E402
@@ -117,8 +119,9 @@ def app(tokenizer):
 
 @pytest.fixture
 def http_client(app):
-    transport = httpx.ASGITransport(app=app)
-    with httpx.Client(transport=transport, base_url="http://testserver") as c:
+    # TestClient drives the async ASGI app synchronously (httpx.Client + ASGITransport
+    # can't — ASGITransport is async-only). Same .get/.post/.stream interface.
+    with TestClient(app) as c:
         yield c
 
 
@@ -275,8 +278,7 @@ def test_tool_call_round_trip_via_hermes_parser():
     engine = FakeEngine()
     engine.reply = [0, EOS]
     app = create_app(engine, tokenizer, served_model_name="fake-qwen3")
-    transport = httpx.ASGITransport(app=app)
-    with httpx.Client(transport=transport, base_url="http://testserver") as client:
+    with TestClient(app) as client:
         resp = client.post("/v1/chat/completions", json={
             "model": "fake-qwen3",
             "messages": [{"role": "user", "content": "What's the weather in San Francisco?"}],
@@ -315,8 +317,7 @@ def test_forced_tool_choice_builds_a_schema_and_parses_the_result(monkeypatch):
     engine = FakeEngine()
     engine.reply = [0, EOS]
     app = create_app(engine, tokenizer, served_model_name="fake-qwen3")
-    transport = httpx.ASGITransport(app=app)
-    with httpx.Client(transport=transport, base_url="http://testserver") as client:
+    with TestClient(app) as client:
         resp = client.post("/v1/chat/completions", json={
             "model": "fake-qwen3",
             "messages": [{"role": "user", "content": "What's the weather in San Francisco?"}],
@@ -342,8 +343,7 @@ def test_named_tool_choice_forces_exactly_that_function(monkeypatch):
     engine = FakeEngine()
     engine.reply = [0, EOS]
     app = create_app(engine, tokenizer, served_model_name="fake-qwen3")
-    transport = httpx.ASGITransport(app=app)
-    with httpx.Client(transport=transport, base_url="http://testserver") as client:
+    with TestClient(app) as client:
         resp = client.post("/v1/chat/completions", json={
             "model": "fake-qwen3",
             "messages": [{"role": "user", "content": "weather in Berlin?"}],
@@ -364,8 +364,7 @@ def test_chat_template_override_is_threaded_through(tokenizer):
     custom = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}"
     app = create_app(FakeEngine(), tokenizer, served_model_name="fake-qwen3",
                      chat_template=custom)
-    transport = httpx.ASGITransport(app=app)
-    with httpx.Client(transport=transport, base_url="http://testserver") as client:
+    with TestClient(app) as client:
         client.post("/v1/chat/completions", json={
             "model": "fake-qwen3", "messages": [{"role": "user", "content": "hi"}],
         })

@@ -200,4 +200,6 @@ def test_convert_hf_to_fni8_multi_shard_output_matches_single_shard(tmp_path):
 
     info_one, info_many = checkpoint_info(str(out_one)), checkpoint_info(str(out_many))
     assert info_one["num_tensors"] == info_many["num_tensors"] == len(sd)
-    assert info_one["arch"] == info_many["arch"] == cfg.arch
+    # header "arch" is the hardware target (sm70); the model arch lives in meta.
+    assert info_one["arch"] == info_many["arch"]
+    assert info_one["meta"]["arch"] == info_many["meta"]["arch"] == cfg.arch

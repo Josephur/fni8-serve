@@ -23,12 +23,15 @@ jobs:
           path: serve
 
       - name: Clone fni8 (kernel dependency)
-        run: git clone --depth 1 https://github.com/jajmangold/fni8 "$GITHUB_WORKSPACE/fni8"
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/fni8"   # self-hosted runner reuses the workspace
+          git clone --depth 1 https://github.com/jajmangold/fni8 "$GITHUB_WORKSPACE/fni8"
 
       - name: Build fni8 + run the serve suite
         run: |
           docker run --rm --gpus all \
             -e WS="$GITHUB_WORKSPACE" \
+            -e MAX_JOBS=4 -e NVCC_THREADS=2 \
             -e PYTHONPATH="$GITHUB_WORKSPACE/fni8:$GITHUB_WORKSPACE/serve" \
             -v "$GITHUB_WORKSPACE/fni8:$GITHUB_WORKSPACE/fni8" \
             -v "$GITHUB_WORKSPACE/serve:$GITHUB_WORKSPACE/serve" \
