@@ -102,3 +102,18 @@ def test_engine_applies_logit_processors():
     params = SamplingParams(temperature=0.0, max_tokens=4, logit_processors=[force_token_5])
     out = eng.generate([[1, 2, 3]], params)[0]
     assert out == [5, 5, 5, 5]
+
+
+def test_preempt_and_resume():
+    """When load exceeds max_num_seqs, the scheduler preempts running sequences
+    (evict/recompute) instead of blocking; every request completes with the
+    correct number of output tokens."""
+    torch.manual_seed(0)
+    cfg = _cfg()
+    eng = LLMEngine(cfg, _sd(cfg), device="cuda", max_num_seqs=2, max_len=64)
+    # 5 prompts with max_num_seqs=2 -> slot pressure forces preemption
+    prompts = [[1, 2, 3], [4, 5, 6, 7, 8], [9], [10, 11], [12, 13, 14]]
+    outs = eng.generate(prompts, SamplingParams(temperature=0.0, max_tokens=8))
+    assert len(outs) == 5
+    for o in outs:
+        assert len(o) == 8 and all(0 <= t < cfg.vocab_size for t in o)
