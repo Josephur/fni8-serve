@@ -8,6 +8,7 @@ also has a SwiGLU FFN (w1/w3/w2 naming). Attention is GQA with per-head QK-norm
 `out_proj`. Plain RMSNorm eps 1e-5, tied embeddings. Layer wiring:
 `h += mixer(operator_norm(h)); h += ffn(ffn_norm(h))`.
 """
+
 from __future__ import annotations
 
 import torch.nn as nn
@@ -30,6 +31,44 @@ def _swiglu(sd, p):
     return GatedMLP(gate_up, to_qtensor(sd[f"{p}.feed_forward.w2.weight"]), act="silu")
 
 
+def _has_moe_weights(sd: dict, p: str) -> bool:
+    return f"{p}.feed_forward.w1_experts.weight" in sd
+
+
+def _lfm2_moe(sd: dict, p: str, cfg):
+    from .moe import SparseMoE
+
+    router = sd[f"{p}.feed_forward.router.weight"]
+    w1_exp = sd[f"{p}.feed_forward.w1_experts.weight"]
+    w3_exp = sd[f"{p}.feed_forward.w3_experts.weight"]
+    w2_exp = sd[f"{p}.feed_forward.w2_experts.weight"]
+
+    num_experts = cfg.num_experts or router.shape[0]
+    mi = cfg.moe_intermediate_size or (
+        w1_exp.shape[-1] if w1_exp.dim() == 3 else w1_exp.shape[0] // num_experts
+    )
+    H = cfg.hidden_size
+
+    experts = []
+    for e in range(num_experts):
+        if w1_exp.dim() == 3:
+            e_w1, e_w3, e_w2 = w1_exp[e], w3_exp[e], w2_exp[e]
+        else:
+            e_w1 = w1_exp[e * mi : (e + 1) * mi]
+            e_w3 = w3_exp[e * mi : (e + 1) * mi]
+            e_w2 = w2_exp[e * H : (e + 1) * H]
+        gate_up = merge_qtensor([e_w1, e_w3])
+        experts.append((gate_up, to_qtensor(e_w2)))
+
+    return SparseMoE(
+        gate=router,
+        experts=experts,
+        top_k=cfg.num_experts_per_tok,
+        norm_topk_prob=False,
+        scoring_func="sigmoid",
+    )
+
+
 class Lfm2Layer(nn.Module):
     def __init__(self, cfg: ModelConfig, i: int, sd: dict, rope: RotaryEmbedding, is_attn: bool):
         super().__init__()
@@ -38,20 +77,33 @@ class Lfm2Layer(nn.Module):
         if is_attn:
             a = f"{p}.self_attn"
             self.mixer = GQAAttention(
-                num_heads=cfg.num_attention_heads, num_kv_heads=cfg.num_key_value_heads,
-                head_dim=hd, qkv_proj=merge_qtensor([sd[f"{a}.q_proj.weight"],
-                    sd[f"{a}.k_proj.weight"], sd[f"{a}.v_proj.weight"]]),
-                o_proj=to_qtensor(sd[f"{a}.out_proj.weight"]), scale=hd ** -0.5, rope=rope,
-                q_norm=sd.get(f"{a}.q_layernorm.weight"), k_norm=sd.get(f"{a}.k_layernorm.weight"),
-                rms_norm_eps=cfg.rms_norm_eps)
+                num_heads=cfg.num_attention_heads,
+                num_kv_heads=cfg.num_key_value_heads,
+                head_dim=hd,
+                qkv_proj=merge_qtensor(
+                    [sd[f"{a}.q_proj.weight"], sd[f"{a}.k_proj.weight"], sd[f"{a}.v_proj.weight"]]
+                ),
+                o_proj=to_qtensor(sd[f"{a}.out_proj.weight"]),
+                scale=hd**-0.5,
+                rope=rope,
+                q_norm=sd.get(f"{a}.q_layernorm.weight"),
+                k_norm=sd.get(f"{a}.k_layernorm.weight"),
+                rms_norm_eps=cfg.rms_norm_eps,
+            )
         else:
             c = f"{p}.conv"
-            self.mixer = ShortConv(cfg.hidden_size, in_proj=to_qtensor(sd[f"{c}.in_proj.weight"]),
-                                   out_proj=to_qtensor(sd[f"{c}.out_proj.weight"]),
-                                   conv_weight=sd[f"{c}.conv.weight"], kernel=cfg.extra.get("conv_L_cache", 3))
-        self.operator_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, sd[f"{p}.operator_norm.weight"])
+            self.mixer = ShortConv(
+                cfg.hidden_size,
+                in_proj=to_qtensor(sd[f"{c}.in_proj.weight"]),
+                out_proj=to_qtensor(sd[f"{c}.out_proj.weight"]),
+                conv_weight=sd[f"{c}.conv.weight"],
+                kernel=cfg.extra.get("conv_L_cache", 3),
+            )
+        self.operator_norm = RMSNorm(
+            cfg.hidden_size, cfg.rms_norm_eps, sd[f"{p}.operator_norm.weight"]
+        )
         self.ffn_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, sd[f"{p}.ffn_norm.weight"])
-        self.feed_forward = _swiglu(sd, p)
+        self.feed_forward = _lfm2_moe(sd, p, cfg) if _has_moe_weights(sd, p) else _swiglu(sd, p)
 
     def forward(self, x, positions, ctx, layer_idx):
         x = x + self.mixer(self.operator_norm(x), positions, ctx, layer_idx)
@@ -65,11 +117,19 @@ class Lfm2ForCausalLM(nn.Module):
         self.config = cfg
         attn_idxs = set(cfg.extra.get("full_attn_idxs", []))
         self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"])
-        rope = RotaryEmbedding(cfg.resolved_head_dim(), cfg.max_position_embeddings, base=cfg.rope_theta)
+        rope = RotaryEmbedding(
+            cfg.resolved_head_dim(), cfg.max_position_embeddings, base=cfg.rope_theta
+        )
         self.layers = nn.ModuleList(
-            [Lfm2Layer(cfg, i, sd, rope, i in attn_idxs) for i in range(cfg.num_hidden_layers)])
-        self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, sd["model.embedding_norm.weight"]
-                            if "model.embedding_norm.weight" in sd else sd["model.norm.weight"])
+            [Lfm2Layer(cfg, i, sd, rope, i in attn_idxs) for i in range(cfg.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            sd["model.embedding_norm.weight"]
+            if "model.embedding_norm.weight" in sd
+            else sd["model.norm.weight"],
+        )
         lm_w = sd["model.embed_tokens.weight"] if cfg.tie_word_embeddings else sd["lm_head.weight"]
         self.lm_head = LMHead(to_qtensor(lm_w))
 
