@@ -10,8 +10,11 @@ name: Backlog Manager (DeepSeek)
 # repos; falls back to the workflow token for its own repo.
 
 on:
+  workflow_run:                  # EVENT-DRIVEN: react the moment a PR's CI (or the kernel
+    workflows: ["CI", "Kernel Reviewer (DeepSeek)"]
+    types: [completed]           # reviewer) finishes → merge green PRs / promote immediately
   schedule:
-    - cron: '17 * * * *'        # hourly autonomous management tick
+    - cron: '*/15 * * * *'       # backstop tick (every 15 min) in case an event is missed
   issue_comment:
     types: [created]
   workflow_dispatch: {}          # manual trigger for validation
@@ -25,6 +28,7 @@ jobs:
     if: >
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'workflow_run' ||
       (github.event_name == 'issue_comment' &&
         github.actor == github.repository_owner &&
         contains(github.event.comment.body, '@manager') &&
