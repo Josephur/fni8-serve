@@ -17,13 +17,19 @@ from __future__ import annotations
 
 from collections import deque
 
+from ..models.cache import MLALatentCache
 from .kv_cache import PagedKVCache
 from .sequence import Sequence, Status
 
 
 class Scheduler:
     def __init__(
-        self, cache: PagedKVCache, *, max_num_seqs: int, max_batch_tokens: int, eos_id: int | None
+        self,
+        cache: PagedKVCache | MLALatentCache,
+        *,
+        max_num_seqs: int,
+        max_batch_tokens: int,
+        eos_id: int | None,
     ):
         self.cache = cache
         self.max_num_seqs = max_num_seqs

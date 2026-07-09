@@ -12,7 +12,7 @@ from __future__ import annotations
 import itertools
 
 from ..models.base import ForwardContext
-from ..models.cache import RecurrentStateCache
+from ..models.cache import MLALatentCache, RecurrentStateCache
 from ..models.config import ModelConfig
 from ..models.registry import build_model
 from .cuda_graph import cuda_graph_enabled_by_env
@@ -55,14 +55,23 @@ class LLMEngine:
         # promises the caller -- isn't silently reduced by one; the scheduler
         # itself still never admits more than `max_num_seqs` running sequences.
         num_slots = max_num_seqs + 1 if graph_wanted else max_num_seqs
-        self.cache = PagedKVCache(
-            cfg.num_hidden_layers,
-            num_slots,
-            cfg.num_key_value_heads,
-            max_len,
-            cfg.resolved_head_dim(),
-            device=device,
-        )
+        if cfg.latent_attention:
+            self.cache = MLALatentCache(
+                cfg.num_hidden_layers,
+                num_slots,
+                cfg.mla_cache_dim(),
+                max_len,
+                device=device,
+            )
+        else:
+            self.cache = PagedKVCache(
+                cfg.num_hidden_layers,
+                num_slots,
+                cfg.num_key_value_heads,
+                max_len,
+                cfg.resolved_head_dim(),
+                device=device,
+            )
         self.scheduler = Scheduler(
             self.cache, max_num_seqs=max_num_seqs, max_batch_tokens=max_batch_tokens, eos_id=eos_id
         )

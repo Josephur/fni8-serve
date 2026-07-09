@@ -84,25 +84,86 @@ class MLALatentCache:
     per token (`latent_dim = kv_lora_rank + qk_rope_head_dim`), one shared MQA-style
     "head", instead of full per-head K/V. `MLAAttention` up-projects the read-back
     latent through kv_b_proj to get per-head K/V at decode time.
+
+    Engine-compatible: provides ``alloc``/``free`` slot management (simple free-list
+    over the fixed ``batch`` dimension), plus no-op stubs for the scheduler's
+    prefix-cache and capacity hooks that only ``PagedKVCache`` implements.
     """
 
     def __init__(self, num_layers, batch, latent_dim, max_len, *, device, dtype=torch.float16):
         self.kv = torch.zeros((num_layers, batch, max_len, latent_dim), device=device, dtype=dtype)
         self.length = 0
+        self.num_slots = batch
+        self.max_len = max_len
+        self._free_slots = list(range(batch))
+
+    # -- slot management (engine / scheduler interface) -----------------------
+
+    def alloc(self) -> int:
+        if not self._free_slots:
+            raise RuntimeError("MLALatentCache: no free slots")
+        return self._free_slots.pop()
+
+    def free(self, slot: int):
+        if slot not in self._free_slots:
+            self._free_slots.append(slot)
+
+    def has_free_slot(self) -> bool:
+        return len(self._free_slots) > 0
+
+    def ensure_capacity(self, slots: list[int], lengths: list[int]):
+        pass  # MLALatentCache is pre-allocated; capacity is fixed.
+
+    def store_prefix(self, token_ids: list[int], slot: int):
+        pass  # Prefix cache not applicable to latent storage.
+
+    def lookup_prefix(self, token_ids: list[int]) -> tuple[int, list[int]]:
+        return 0, []
+
+    def share_blocks(self, slot: int, blocks: list[int]):
+        pass  # No block sharing for latent cache.
+
+    # -- latent-KV read/write ------------------------------------------------
 
     def reset(self):
         self.length = 0
 
-    def write_prefill(self, layer: int, latent: torch.Tensor):
-        """latent: [B, S, D] at positions [0, S)."""
+    def write_prefill(self, layer: int, latent: torch.Tensor, *, slot: int | None = None):
+        """latent: [B, S, D] at positions [0, S). When *slot* is given, B must be 1
+        and only that slot row is written (engine path — one seq at a time)."""
         s = latent.shape[1]
-        self.kv[layer, :, :s] = latent
+        if slot is not None:
+            self.kv[layer, slot, :s] = latent[0]
+        else:
+            self.kv[layer, : latent.shape[0], :s] = latent
 
-    def append_decode(self, layer: int, latent: torch.Tensor) -> torch.Tensor:
-        """latent: [B, 1, D] at position `length`. Returns [B, length+1, D]."""
+    def append_decode(
+        self,
+        layer: int,
+        latent: torch.Tensor,
+        *,
+        slot: int | None = None,
+        slots: list[int] | None = None,
+    ) -> torch.Tensor:
+        """latent: [B, 1, D] at position ``length``.
+
+        *slot*  (int, engine prefill): B=1, write/return that slot row only.
+        *slots* (list[int], engine decode): write each batch row to its slot
+                 and return the per-slot cached history.
+        Neither (ModelRunner path): write/return rows 0..B-1.
+        """
         p = self.length
-        self.kv[layer, :, p : p + 1] = latent
-        return self.kv[layer, :, : p + 1]
+        if slots is not None:
+            B = latent.shape[0]
+            for i in range(B):
+                self.kv[layer, slots[i], p : p + 1] = latent[i : i + 1]
+            return torch.stack([self.kv[layer, s, : p + 1] for s in slots], dim=0)
+        if slot is not None:
+            self.kv[layer, slot, p : p + 1] = latent[0:1]
+            return self.kv[layer, slot : slot + 1, : p + 1]
+        B = latent.shape[0]
+        self.kv[layer, :B, p : p + 1] = latent
+        return self.kv[layer, :B, : p + 1]
 
     def advance(self, n: int = 1):
         self.length += n
