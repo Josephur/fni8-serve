@@ -6,13 +6,13 @@ the `fni8serve/layers` seams.
 
 Port checklist:
 
-- [ ] `sequence.py`      — request/sequence state, token ids, block table
+- [x] `sequence.py`      — request/sequence state, token ids, block table
 - [ ] `block_manager.py` — paged-KV block allocation; here the blocks hold **int8** KV
       (+ per-block scales) instead of fp16 — half the cache footprint
-- [ ] `scheduler.py`     — continuous batching: admit/prefill/decode scheduling, preemption
-- [ ] `model_runner.py`  — builds the model from a `.fni8` checkpoint (via
+- [x] `scheduler.py`     — continuous batching: admit/prefill/decode scheduling, preemption
+- [x] `model_runner.py`  — builds the model from a `.fni8` checkpoint (via
       `fni8serve.load_fni8_checkpoint`), runs prefill/decode through `layers/`
-- [ ] `llm_engine.py`    — top-level `generate()` loop + sampler
+- [x] `llm_engine.py`    — top-level `generate()` loop + sampler
 
 Fleet-specific deltas vs nano-vllm:
 - KV cache is int8 (block_manager sizes for int8 + scales).

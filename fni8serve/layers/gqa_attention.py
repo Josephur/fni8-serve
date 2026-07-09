@@ -10,7 +10,7 @@ Config-driven so Qwen3, Qwen3-MoE, Gemma3, GLM, Hunyuan all reuse it unchanged:
   * sliding-window local layers via fni8's window_left (prefill) / cache slice (decode).
 
 This is the `full`/`sliding` AttentionBackend. `linear` (DeltaNet) and `latent`
-(MLA) backends are separate — see fni8serve/models/backends.py.
+(MLA) backends are separate — see layers/linear_attn.py and layers/mla_attn.py.
 """
 from __future__ import annotations
 
