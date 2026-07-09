@@ -1,8 +1,11 @@
 name: CI
 
-# Required gate for fni8-serve PRs: build fni8 (serve imports its compiled kernels) and
-# run the serve suite on the self-hosted Volta runner. Branch protection makes the
-# `build-test` check mandatory to merge — so the backlog manager only merges green PRs.
+# Required gate for fni8-serve PRs. serve is PURE PYTHON — it only *imports* fni8's
+# compiled kernels, it never rebuilds them. So instead of cloning + nvcc-compiling fni8
+# on every PR (~35 min, the old flow, and the source of the concurrent-build OOMs), we
+# run against the prebuilt `fni8-built:sm70` image (fni8 baked in, refreshed on each
+# fni8-master merge). ~3 min, no nvcc → many serve PRs can test concurrently without
+# ever touching the box's compile budget. Branch protection makes `build-test` mandatory.
 
 on:
   pull_request:
@@ -13,32 +16,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-test:
+  build-test:                       # <- required status check name; keep it
     runs-on: [self-hosted, volta-gpu]
-    timeout-minutes: 55
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: serve
 
-      - name: Clone fni8 (kernel dependency)
+      - name: Test against prebuilt fni8 (light lane — no nvcc)
         run: |
-          rm -rf "$GITHUB_WORKSPACE/fni8"   # self-hosted runner reuses the workspace
-          git clone --depth 1 https://github.com/jajmangold/fni8 "$GITHUB_WORKSPACE/fni8"
-
-      - name: Build fni8 + run the serve suite
-        run: |
+          # fni8-built:sm70 has fni8 already installed (editable at /opt/fni8). If it's
+          # somehow absent on this runner, fall back to building it once from a fresh
+          # clone so CI is self-healing rather than hard-failing.
+          if ! docker image inspect fni8-built:sm70 >/dev/null 2>&1; then
+            echo "::warning::fni8-built:sm70 missing — building it once (slow path)"
+            rm -rf "$GITHUB_WORKSPACE/fni8"
+            git clone --depth 1 https://github.com/jajmangold/fni8 "$GITHUB_WORKSPACE/fni8"
+            docker build -f "$GITHUB_WORKSPACE/fni8/docker/Dockerfile.built" \
+              -t fni8-built:sm70 "$GITHUB_WORKSPACE/fni8"
+          fi
           docker run --rm --gpus all \
-            -e WS="$GITHUB_WORKSPACE" \
-            -e MAX_JOBS=4 -e NVCC_THREADS=2 \
-            -e PYTHONPATH="$GITHUB_WORKSPACE/fni8:$GITHUB_WORKSPACE/serve" \
-            -v "$GITHUB_WORKSPACE/fni8:$GITHUB_WORKSPACE/fni8" \
+            -e PYTHONPATH="$GITHUB_WORKSPACE/serve" \
             -v "$GITHUB_WORKSPACE/serve:$GITHUB_WORKSPACE/serve" \
             -w "$GITHUB_WORKSPACE/serve" \
-            fni8-dev bash -lc '
+            fni8-built:sm70 bash -lc '
               set -e
-              cd "$WS/fni8"  && pip install -e . --no-build-isolation -q
-              cd "$WS/serve" && pip install -e ".[dev,convert,serve,structured]" -q
+              pip install -e ".[dev,convert,serve,structured]" --no-build-isolation -q
               pytest -q
             '
