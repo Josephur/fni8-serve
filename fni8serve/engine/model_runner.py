@@ -15,15 +15,19 @@ import torch
 
 from ..layers.sampler import Sampler
 from ..models.base import ForwardContext
+from ..models.cache import RecurrentStateCache
 from .cuda_graph import GraphedDecode, cuda_graph_enabled_by_env
 from .sequence import Sequence
 
 
 class EngineRunner:
-    def __init__(self, model, cache, *, device="cuda", enable_cuda_graph: bool | None = None):
+    def __init__(
+        self, model, cache, *, device="cuda", enable_cuda_graph: bool | None = None, lin_cache=None
+    ):
         self.model = model
         self.cache = cache
         self.device = device
+        self.lin_cache = lin_cache or RecurrentStateCache()
         self.sampler = Sampler()
         # Decode is dispatch-bound (~3,200 cudaLaunchKernel/step on a 28-layer
         # 0.6B model for ~18ms of real GPU work -- issue #42): `GraphedDecode`
@@ -58,12 +62,14 @@ class EngineRunner:
     def encode(self, batch: list[Sequence]) -> torch.Tensor:
         hiddens = []
         for seq in batch:
+            self.lin_cache.reset()
             ids = torch.tensor([seq.prompt_ids], device=self.device)
             pos = torch.arange(seq.num_prompt, device=self.device).unsqueeze(0)
             self.cache.ensure_capacity([seq.slot], [seq.num_prompt])
             ctx = ForwardContext(
                 is_prefill=True,
                 kv_cache=self.cache,
+                lin_cache=self.lin_cache,
                 slots=[seq.slot],
                 prefill_start=seq.prefix_matched_len,
             )
@@ -76,12 +82,14 @@ class EngineRunner:
     def prefill(self, batch: list[Sequence]) -> list[int]:
         out = []
         for seq in batch:
+            self.lin_cache.reset()
             ids = torch.tensor([seq.prompt_ids], device=self.device)  # [1, S]
             pos = torch.arange(seq.num_prompt, device=self.device).unsqueeze(0)
             self.cache.ensure_capacity([seq.slot], [seq.num_prompt])
             ctx = ForwardContext(
                 is_prefill=True,
                 kv_cache=self.cache,
+                lin_cache=self.lin_cache,
                 slots=[seq.slot],
                 prefill_start=seq.prefix_matched_len,
             )
@@ -108,7 +116,11 @@ class EngineRunner:
         lengths = [s.length for s in batch]
         self.cache.ensure_capacity(slots, [n + 1 for n in lengths])
         ctx = ForwardContext(
-            is_prefill=False, kv_cache=self.cache, slots=slots, slot_lengths=lengths
+            is_prefill=False,
+            kv_cache=self.cache,
+            lin_cache=self.lin_cache,
+            slots=slots,
+            slot_lengths=lengths,
         )
         hidden = self.model(ids, pos, ctx)
         for s in batch:

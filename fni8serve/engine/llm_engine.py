@@ -12,6 +12,7 @@ from __future__ import annotations
 import itertools
 
 from ..models.base import ForwardContext
+from ..models.cache import RecurrentStateCache
 from ..models.config import ModelConfig
 from ..models.registry import build_model
 from .cuda_graph import cuda_graph_enabled_by_env
@@ -65,8 +66,13 @@ class LLMEngine:
         self.scheduler = Scheduler(
             self.cache, max_num_seqs=max_num_seqs, max_batch_tokens=max_batch_tokens, eos_id=eos_id
         )
+        self.lin_cache = RecurrentStateCache()
         self.runner = EngineRunner(
-            self.model, self.cache, device=device, enable_cuda_graph=enable_cuda_graph
+            self.model,
+            self.cache,
+            device=device,
+            enable_cuda_graph=enable_cuda_graph,
+            lin_cache=self.lin_cache,
         )
         self._ids = itertools.count()
         self._out: dict[int, Sequence] = {}
@@ -95,7 +101,9 @@ class LLMEngine:
                 total_len = seq.num_prompt + seq.params.max_tokens
                 self.cache.ensure_capacity([seq.slot], [total_len])
                 seq.length = total_len
-                ctx = ForwardContext(is_prefill=True, kv_cache=self.cache, slots=[seq.slot])
+                ctx = ForwardContext(
+                    is_prefill=True, kv_cache=self.cache, lin_cache=self.lin_cache, slots=[seq.slot]
+                )
                 out_tokens = self._diffusion_strategy.generate(
                     self.model, self.cache, self.device, seq, ctx
                 )
