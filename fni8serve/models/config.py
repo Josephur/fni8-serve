@@ -9,12 +9,36 @@ sub-dict of a multimodal one) onto this schema.
 
 Axes captured: GQA dims, norm style (plain vs Gemma (1+w)), activation, RoPE
 (single- or dual-theta for Gemma local/global), sliding-window pattern, QK-norm,
-attention/query scaling + soft-caps, MoE routing, MTP depth, and the decode
-strategy (autoregressive vs diffusion).
+attention/query scaling + soft-caps, MoE routing, MTP depth, decode strategy
+(autoregressive vs diffusion), and multimodal VLM detection (VisionConfig for
+Qwen2-VL/Qwen2.5-VL, LLaVA/LLaVA-Next).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+
+# Architecture keys that carry a vision backbone. Any model_type matching
+# this set triggers is_multimodal and vision_config parsing in from_hf().
+_MULTIMODAL_ARCHS = frozenset({
+    "qwen2_vl", "qwen2_5_vl", "llava", "llava_next",
+})
+
+
+@dataclass
+class VisionConfig:
+    """Configuration for a vision backbone (ViT / SigLIP) within a VLM.
+
+    Extracted from the ``vision_config`` sub-dict of a multimodal HF config.json.
+    Qwen2-VL family stores the layer count as ``depth``; LLaVA family uses
+    ``num_hidden_layers``. ``spatial_merge_size`` is Qwen-specific (defaults to 1
+    for LLaVA which doesn't use it).
+    """
+    hidden_size: int
+    patch_size: int
+    num_layers: int
+    image_token_id: int
+    spatial_merge_size: int = 1
 
 
 @dataclass
@@ -78,6 +102,11 @@ class ModelConfig:
     # quantization intent (how weights were stored in the .fni8)
     weight_bits: int = 8
 
+    # multimodal vision-language fields (populated from VLM configs only)
+    is_multimodal: bool = False
+    vision_config: VisionConfig | None = None
+    image_token_id: int | None = None
+
     extra: dict = field(default_factory=dict)    # arch-specific overflow
 
     def resolved_head_dim(self) -> int:
@@ -136,6 +165,22 @@ class ModelConfig:
             c = {**c, **dict(c["text_config"])}
         resolved_arch = arch or model_type or (archs[0] if archs else "unknown")
         n_heads = c["num_attention_heads"]
+
+        # Multimodal VLM detection — read vision_config and expose on ModelConfig.
+        if resolved_arch in _MULTIMODAL_ARCHS:
+            v_raw = hf.get("vision_config") or {}
+            img_tok = hf.get("image_token_id") or hf.get("image_token_index")
+            n_layers = v_raw.get("depth") or v_raw.get("num_hidden_layers", 0)
+            vision_cfg = VisionConfig(
+                hidden_size=v_raw.get("hidden_size", 0),
+                patch_size=v_raw.get("patch_size", 0),
+                num_layers=n_layers,
+                image_token_id=img_tok or 0,
+                spatial_merge_size=v_raw.get("spatial_merge_size", 1),
+            ) if v_raw else None
+        else:
+            vision_cfg = None
+
         return cls(
             arch=resolved_arch,
             vocab_size=c["vocab_size"],
@@ -165,6 +210,9 @@ class ModelConfig:
             decoder_sparse_step=c.get("decoder_sparse_step", 1),
             mlp_only_layers=tuple(c.get("mlp_only_layers", []) or []),
             num_mtp_layers=c.get("num_nextn_predict_layers", 0),
+            is_multimodal=vision_cfg is not None,
+            vision_config=vision_cfg,
+            image_token_id=vision_cfg.image_token_id if vision_cfg else None,
             extra={k: v for k, v in c.items() if k not in _KNOWN_HF_KEYS},
         )
 
@@ -179,4 +227,7 @@ _KNOWN_HF_KEYS = {
     "num_experts", "num_experts_per_tok", "moe_intermediate_size", "norm_topk_prob",
     "shared_expert_intermediate_size", "decoder_sparse_step", "mlp_only_layers",
     "num_nextn_predict_layers",
+    # VLM / multimodal keys — consumed by from_hf, not leaked into extra
+    "vision_config", "image_token_id", "image_token_index", "video_token_id",
+    "vision_start_token_id", "vision_end_token_id",
 }
