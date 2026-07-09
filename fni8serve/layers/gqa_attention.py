@@ -42,11 +42,13 @@ class GQAAttention(nn.Module):
         window_left: int = -1,
         qkv_bias=None,
         o_bias=None,
+        causal: bool = True,
     ):
         super().__init__()
         self.nh, self.nkv, self.hd = num_heads, num_kv_heads, head_dim
         self.scale = scale
         self.window_left = window_left
+        self.causal = causal
         self.qkv_proj = LinearW8A8(qkv_proj, qkv_bias)
         self.o_proj = LinearW8A8(o_proj, o_bias)
         self.rope = rope
@@ -73,8 +75,8 @@ class GQAAttention(nn.Module):
         if ctx.is_prefill:
             slot = ctx.slots[0] if ctx.slots is not None else None
             ctx.kv_cache.write_prefill(layer_idx, k, v, slot=slot)
-            out = fni8.attn_int8_fwd(q, k, v, causal=True, scale=self.scale,
-                                     window_left=self.window_left)
+            out = fni8.attn_int8_fwd(q, k, v, causal=self.causal, scale=self.scale,
+                                      window_left=self.window_left)
         elif ctx.slot_lengths is not None or ctx.slot_mapping is not None:
             out = self._decode_batched(q, k, v, ctx, layer_idx)   # engine continuous batch
                                                                     # (or CUDA-graph static path)

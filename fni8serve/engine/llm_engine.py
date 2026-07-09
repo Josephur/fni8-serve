@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import itertools
 
+from ..models.base import ForwardContext
 from ..models.config import ModelConfig
 from ..models.registry import build_model
 from .cuda_graph import cuda_graph_enabled_by_env
+from .decode_strategy import DiffusionDecodeStrategy
 from .kv_cache import PagedKVCache
 from .model_runner import EngineRunner
 from .scheduler import Scheduler
@@ -22,11 +24,17 @@ from .sequence import SamplingParams, Sequence, Status
 class LLMEngine:
     def __init__(self, cfg: ModelConfig, weights: dict, *, device="cuda",
                  max_num_seqs: int = 16, max_len: int = 2048, max_batch_tokens: int = 8192,
-                 eos_id: int | None = None, enable_cuda_graph: bool | None = None):
+                 eos_id: int | None = None, enable_cuda_graph: bool | None = None,
+                 num_diffusion_steps: int = 8):
         self.cfg = cfg
         self.device = device
         self.eos_id = eos_id
         self.model = build_model(cfg, weights).to(device).eval()
+        self._diffusion_strategy = (
+            DiffusionDecodeStrategy(num_steps=num_diffusion_steps)
+            if cfg.decode_strategy == "diffusion"
+            else None
+        )
         graph_wanted = (cuda_graph_enabled_by_env() if enable_cuda_graph is None
                        else enable_cuda_graph)
         # `GraphedDecode` pins one extra, never-freed cache slot for its padding
@@ -64,9 +72,20 @@ class LLMEngine:
         batch, is_prefill = self.scheduler.schedule()
         if not batch:
             return
-        toks = self.runner.prefill(batch) if is_prefill else self.runner.decode(batch)
-        for seq, tok in zip(batch, toks):
-            seq.output_ids.append(int(tok))
+        if self._diffusion_strategy is not None and is_prefill:
+            for seq in batch:
+                total_len = seq.num_prompt + seq.params.max_tokens
+                self.cache.ensure_capacity([seq.slot], [total_len])
+                seq.length = total_len
+                ctx = ForwardContext(is_prefill=True, kv_cache=self.cache,
+                                     slots=[seq.slot])
+                out_tokens = self._diffusion_strategy.generate(
+                    self.model, self.cache, self.device, seq, ctx)
+                seq.output_ids.extend(out_tokens)
+        else:
+            toks = self.runner.prefill(batch) if is_prefill else self.runner.decode(batch)
+            for seq, tok in zip(batch, toks):
+                seq.output_ids.append(int(tok))
         self.scheduler.postprocess(batch, is_prefill)
 
     def encode(self, prompt_ids: list[int]) -> list[float]:
