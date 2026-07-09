@@ -13,6 +13,7 @@ attention/query scaling + soft-caps, MoE routing, MTP depth, decode strategy
 (autoregressive vs diffusion), and multimodal VLM detection (VisionConfig for
 Qwen2-VL/Qwen2.5-VL, LLaVA/LLaVA-Next).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -20,9 +21,14 @@ from dataclasses import dataclass, field
 
 # Architecture keys that carry a vision backbone. Any model_type matching
 # this set triggers is_multimodal and vision_config parsing in from_hf().
-_MULTIMODAL_ARCHS = frozenset({
-    "qwen2_vl", "qwen2_5_vl", "llava", "llava_next",
-})
+_MULTIMODAL_ARCHS = frozenset(
+    {
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "llava",
+        "llava_next",
+    }
+)
 
 
 @dataclass
@@ -34,16 +40,28 @@ class VisionConfig:
     ``num_hidden_layers``. ``spatial_merge_size`` is Qwen-specific (defaults to 1
     for LLaVA which doesn't use it).
     """
+
     hidden_size: int
     patch_size: int
     num_layers: int
     image_token_id: int
     spatial_merge_size: int = 1
+    num_attention_heads: int = 0
+    intermediate_size: int = 0
+    in_channels: int = 3
+    layer_norm_eps: float = 1e-6
+    hidden_act: str = "gelu_pytorch_tanh"
+
+    @property
+    def head_dim(self) -> int:
+        if self.num_attention_heads <= 0:
+            return 0
+        return self.hidden_size // self.num_attention_heads
 
 
 @dataclass
 class ModelConfig:
-    arch: str                                   # registry key, e.g. "qwen3"
+    arch: str  # registry key, e.g. "qwen3"
     vocab_size: int
     hidden_size: int
     num_hidden_layers: int
@@ -51,22 +69,22 @@ class ModelConfig:
     num_key_value_heads: int
     intermediate_size: int
     max_position_embeddings: int = 32768
-    head_dim: int | None = None                 # explicit; else hidden // heads
+    head_dim: int | None = None  # explicit; else hidden // heads
     hidden_act: str = "silu"
     rms_norm_eps: float = 1e-6
-    rope_theta: float = 1e6                      # global-layer theta
-    rope_local_theta: float | None = None       # Gemma local-layer theta (dual-RoPE)
+    rope_theta: float = 1e6  # global-layer theta
+    rope_local_theta: float | None = None  # Gemma local-layer theta (dual-RoPE)
     tie_word_embeddings: bool = False
 
     # norm / embedding style
-    norm_add_unit_offset: bool = False          # Gemma (1+w) RMSNorm
-    embed_scale: float | None = None            # Gemma sqrt(hidden) embedding scale
-    qk_norm: bool = False                        # per-head RMSNorm on Q,K (Qwen3/Gemma3)
-    qkv_bias: bool = False                       # Qwen2 had it; Qwen3/Gemma3 do not
+    norm_add_unit_offset: bool = False  # Gemma (1+w) RMSNorm
+    embed_scale: float | None = None  # Gemma sqrt(hidden) embedding scale
+    qk_norm: bool = False  # per-head RMSNorm on Q,K (Qwen3/Gemma3)
+    qkv_bias: bool = False  # Qwen2 had it; Qwen3/Gemma3 do not
 
     # attention scaling / caps
     query_pre_attn_scalar: float | None = None  # Gemma: scale = scalar**-0.5
-    attn_logit_softcap: float | None = None      # Gemma2 (removed in Gemma3)
+    attn_logit_softcap: float | None = None  # Gemma2 (removed in Gemma3)
     final_logit_softcap: float | None = None
 
     # partial rotary (GLM, Qwen3-Next gated attn): rotate only factor*head_dim dims
@@ -74,30 +92,30 @@ class ModelConfig:
 
     # sliding window (Gemma3 local layers, Mistral). pattern P => global every Pth.
     sliding_window: int | None = None
-    sliding_window_pattern: int | None = None    # e.g. 6 => layers where (i+1)%6==0 are global
+    sliding_window_pattern: int | None = None  # e.g. 6 => layers where (i+1)%6==0 are global
 
     # hybrid linear-attention backbone (Qwen3-Next / Qwen3.5/3.6, MiniMax lightning):
     # a subset of layers use linear attention; the rest are full softmax attention.
-    linear_attention: bool = False               # this family has linear-attn layers
-    full_attention_interval: int = 0             # full-attn every Nth layer (0 => none/all)
+    linear_attention: bool = False  # this family has linear-attn layers
+    full_attention_interval: int = 0  # full-attn every Nth layer (0 => none/all)
 
     # multi-head latent attention (DeepSeek-V2/V3/V4): compressed latent KV
     latent_attention: bool = False
 
     # MoE (Qwen3-MoE)
-    num_experts: int = 0                         # 0 => dense
+    num_experts: int = 0  # 0 => dense
     num_experts_per_tok: int = 0
     moe_intermediate_size: int = 0
     norm_topk_prob: bool = True
-    shared_expert_intermediate_size: int = 0     # 0 => no shared expert
-    decoder_sparse_step: int = 1                 # every Nth layer is MoE (else dense)
-    mlp_only_layers: tuple[int, ...] = ()        # layer indices forced dense
+    shared_expert_intermediate_size: int = 0  # 0 => no shared expert
+    decoder_sparse_step: int = 1  # every Nth layer is MoE (else dense)
+    mlp_only_layers: tuple[int, ...] = ()  # layer indices forced dense
 
     # MTP (multi-token prediction; Qwen3-Next / DeepSeek-V3 style)
     num_mtp_layers: int = 0
 
     # decode strategy
-    decode_strategy: str = "autoregressive"      # or "diffusion"
+    decode_strategy: str = "autoregressive"  # or "diffusion"
 
     # quantization intent (how weights were stored in the .fni8)
     weight_bits: int = 8
@@ -107,7 +125,7 @@ class ModelConfig:
     vision_config: VisionConfig | None = None
     image_token_id: int | None = None
 
-    extra: dict = field(default_factory=dict)    # arch-specific overflow
+    extra: dict = field(default_factory=dict)  # arch-specific overflow
 
     def resolved_head_dim(self) -> int:
         return self.head_dim or (self.hidden_size // self.num_attention_heads)
@@ -171,13 +189,22 @@ class ModelConfig:
             v_raw = hf.get("vision_config") or {}
             img_tok = hf.get("image_token_id") or hf.get("image_token_index")
             n_layers = v_raw.get("depth") or v_raw.get("num_hidden_layers", 0)
-            vision_cfg = VisionConfig(
-                hidden_size=v_raw.get("hidden_size", 0),
-                patch_size=v_raw.get("patch_size", 0),
-                num_layers=n_layers,
-                image_token_id=img_tok or 0,
-                spatial_merge_size=v_raw.get("spatial_merge_size", 1),
-            ) if v_raw else None
+            vision_cfg = (
+                VisionConfig(
+                    hidden_size=v_raw.get("hidden_size", 0),
+                    patch_size=v_raw.get("patch_size", 0),
+                    num_layers=n_layers,
+                    image_token_id=img_tok or 0,
+                    spatial_merge_size=v_raw.get("spatial_merge_size", 1),
+                    num_attention_heads=v_raw.get("num_attention_heads", 0),
+                    intermediate_size=v_raw.get("intermediate_size", 0),
+                    in_channels=v_raw.get("in_channels", v_raw.get("in_chans", 3)),
+                    layer_norm_eps=v_raw.get("layer_norm_eps", 1e-6),
+                    hidden_act=v_raw.get("hidden_act", "gelu_pytorch_tanh"),
+                )
+                if v_raw
+                else None
+            )
         else:
             vision_cfg = None
 
@@ -218,16 +245,41 @@ class ModelConfig:
 
 
 _KNOWN_HF_KEYS = {
-    "text_config", "architectures", "model_type", "vocab_size", "hidden_size",
-    "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
-    "intermediate_size", "max_position_embeddings", "head_dim", "hidden_act",
-    "rms_norm_eps", "rope_theta", "rope_local_base_freq", "tie_word_embeddings",
-    "attention_bias", "query_pre_attn_scalar", "attn_logit_softcapping",
-    "final_logit_softcapping", "sliding_window", "sliding_window_pattern",
-    "num_experts", "num_experts_per_tok", "moe_intermediate_size", "norm_topk_prob",
-    "shared_expert_intermediate_size", "decoder_sparse_step", "mlp_only_layers",
+    "text_config",
+    "architectures",
+    "model_type",
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "intermediate_size",
+    "max_position_embeddings",
+    "head_dim",
+    "hidden_act",
+    "rms_norm_eps",
+    "rope_theta",
+    "rope_local_base_freq",
+    "tie_word_embeddings",
+    "attention_bias",
+    "query_pre_attn_scalar",
+    "attn_logit_softcapping",
+    "final_logit_softcapping",
+    "sliding_window",
+    "sliding_window_pattern",
+    "num_experts",
+    "num_experts_per_tok",
+    "moe_intermediate_size",
+    "norm_topk_prob",
+    "shared_expert_intermediate_size",
+    "decoder_sparse_step",
+    "mlp_only_layers",
     "num_nextn_predict_layers",
     # VLM / multimodal keys — consumed by from_hf, not leaked into extra
-    "vision_config", "image_token_id", "image_token_index", "video_token_id",
-    "vision_start_token_id", "vision_end_token_id",
+    "vision_config",
+    "image_token_id",
+    "image_token_index",
+    "video_token_id",
+    "vision_start_token_id",
+    "vision_end_token_id",
 }
