@@ -122,6 +122,82 @@ def test_engine_applies_logit_processors():
     assert out == [5, 5, 5, 5]
 
 
+def test_varlen_prefill_matches_individual():
+    """Multiple sequences of DIFFERENT lengths packed into one varlen forward pass
+    must produce identical first-token output (per sequence) as individual
+    single-sequence prefills. Proves the packed attention kernel, cumulative
+    sequence lengths, and paged KV slot_mapping all thread correctly."""
+    torch.manual_seed(42)
+    cfg = _cfg()
+    sd = _sd(cfg)
+    prompts = [
+        [1, 2, 3, 4],
+        [5, 6],
+        [7, 8, 9, 10, 11, 12, 13],
+    ]
+    params = SamplingParams(temperature=0.0, max_tokens=1)
+    kv_cfg = dict(device="cuda", max_num_seqs=8, max_len=64, max_batch_tokens=8192)
+
+    eng = LLMEngine(cfg, sd, **kv_cfg)
+    outs_varlen = eng.generate(prompts, params)
+
+    outs_ref: list[list[int]] = []
+    for p in prompts:
+        eng2 = LLMEngine(cfg, sd, **kv_cfg)
+        outs_ref.append(eng2.generate([p], params)[0])
+
+    for i, (v, ref) in enumerate(zip(outs_varlen, outs_ref)):
+        assert v == ref, f"seq {i} (len={len(prompts[i])}): varlen {v} != individual {ref}"
+
+
+def test_varlen_prefill_same_length():
+    """Same-length sequences also hit the varlen path when batch > 1 and should
+    still match individual prefills."""
+    torch.manual_seed(42)
+    cfg = _cfg()
+    sd = _sd(cfg)
+    prompts = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+    params = SamplingParams(temperature=0.0, max_tokens=1)
+    kv_cfg = dict(device="cuda", max_num_seqs=8, max_len=64, max_batch_tokens=8192)
+
+    eng = LLMEngine(cfg, sd, **kv_cfg)
+    outs_varlen = eng.generate(prompts, params)
+
+    outs_ref: list[list[int]] = []
+    for p in prompts:
+        eng2 = LLMEngine(cfg, sd, **kv_cfg)
+        outs_ref.append(eng2.generate([p], params)[0])
+
+    for i, (v, ref) in enumerate(zip(outs_varlen, outs_ref)):
+        assert v == ref, f"seq {i}: varlen {v} != individual {ref}"
+
+
+def test_varlen_prefill_and_decode():
+    """Varlen prefill followed by decode must produce the same full multi-token
+    output as individual prefills + decodes."""
+    torch.manual_seed(42)
+    cfg = _cfg()
+    sd = _sd(cfg)
+    prompts = [
+        [1, 2, 3, 4],
+        [5, 6, 7],
+        [8, 9, 10, 11, 12],
+    ]
+    params = SamplingParams(temperature=0.0, max_tokens=4)
+    kv_cfg = dict(device="cuda", max_num_seqs=8, max_len=64, max_batch_tokens=8192)
+
+    eng = LLMEngine(cfg, sd, **kv_cfg)
+    outs_varlen = eng.generate(prompts, params)
+
+    outs_ref: list[list[int]] = []
+    for p in prompts:
+        eng2 = LLMEngine(cfg, sd, **kv_cfg)
+        outs_ref.append(eng2.generate([p], params)[0])
+
+    for i, (v, ref) in enumerate(zip(outs_varlen, outs_ref)):
+        assert v == ref, f"seq {i} (prompt len={len(prompts[i])}): varlen {v} != individual {ref}"
+
+
 def test_preempt_and_resume():
     """When load exceeds max_num_seqs, the scheduler preempts running sequences
     (evict/recompute) instead of blocking; every request completes with the

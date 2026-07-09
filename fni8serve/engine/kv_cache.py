@@ -175,6 +175,25 @@ class PagedKVCache:
                 mapping,
             )
 
+    def write_prefill_varlen(
+        self, layer: int, slot_mapping: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ):
+        """k, v: [total_tokens, Hkv, D] fp16. slot_mapping: [total_tokens] int32.
+        Write every token's K/V to its correct page in ONE call — the varlen
+        batched prefill path. Every token's slot_mapping entry points to the
+        correct physical page + offset for its sequence and position, including
+        tokens that were already filled by a shared prefix (overwrite is cheap
+        and avoids per-sequence branching)."""
+        fni8.quantize_kv_write_paged(
+            k.contiguous(),
+            v.contiguous(),
+            self.k_cache[layer],
+            self.k_scale[layer],
+            self.v_cache[layer],
+            self.v_scale[layer],
+            slot_mapping,
+        )
+
     def write_decode(
         self,
         layer: int,

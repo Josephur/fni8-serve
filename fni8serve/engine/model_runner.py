@@ -80,6 +80,10 @@ class EngineRunner:
 
     @torch.inference_mode()
     def prefill(self, batch: list[Sequence]) -> list[int]:
+        from .kv_cache import PagedKVCache
+
+        if len(batch) > 1 and isinstance(self.cache, PagedKVCache):
+            return self._prefill_varlen(batch)
         out = []
         for seq in batch:
             self.lin_cache.reset()
@@ -99,6 +103,57 @@ class EngineRunner:
             logits = self.model.compute_logits(hidden[:, -1])
             out.append(self._sample(logits, [seq])[0])
         return out
+
+    @torch.inference_mode()
+    def _prefill_varlen(self, batch: list[Sequence]) -> list[int]:
+        """Pack multiple sequences into one varlen forward pass with cumulative
+        sequence lengths. Attention cost scales with total tokens, not
+        max_len × batch (fni8.attn_int8_varlen kernel)."""
+        self.lin_cache.reset()
+
+        self.cache.ensure_capacity([s.slot for s in batch], [s.num_prompt for s in batch])
+
+        all_ids: list[int] = []
+        all_positions: list[int] = []
+        cu_seqlens: list[int] = [0]
+        slot_mapping_flat: list[int] = []
+
+        for seq in batch:
+            n = seq.num_prompt
+            all_ids.extend(seq.prompt_ids)
+            all_positions.extend(range(n))
+            cu_seqlens.append(cu_seqlens[-1] + n)
+            for t in range(n):
+                slot_mapping_flat.append(self.cache._slot_mapping([seq.slot], [t]).item())
+
+        total_tokens = cu_seqlens[-1]
+        ids = torch.tensor([all_ids], device=self.device)  # [1, total_tok]
+        pos = torch.tensor([all_positions], device=self.device)
+        cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=self.device)
+        sm = torch.tensor(slot_mapping_flat, dtype=torch.int32, device=self.device)
+
+        ctx = ForwardContext(
+            is_prefill=True,
+            kv_cache=self.cache,
+            lin_cache=self.lin_cache,
+            slots=[s.slot for s in batch],
+            cu_seqlens=cu,
+            slot_mapping=sm,
+        )
+
+        hidden = self.model(ids, pos, ctx)  # [1, total_tok, hidden]
+
+        for seq in batch:
+            seq.length = seq.num_prompt
+
+        last_indices = torch.tensor(
+            [cu_seqlens[i] - 1 for i in range(1, len(cu_seqlens))],
+            device=self.device,
+            dtype=torch.long,
+        )
+        logits = self.model.compute_logits(hidden[:, last_indices]).squeeze(0)  # [B, vocab]
+
+        return self._sample(logits, batch)
 
     @torch.inference_mode()
     def decode(self, batch: list[Sequence]) -> list[int]:

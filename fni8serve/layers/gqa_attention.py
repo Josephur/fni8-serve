@@ -74,11 +74,32 @@ class GQAAttention(nn.Module):
         v = v.transpose(1, 2).contiguous()
 
         if ctx.is_prefill:
-            slot = ctx.slots[0] if ctx.slots is not None else None
-            ctx.kv_cache.write_prefill(layer_idx, k, v, slot=slot, start=ctx.prefill_start)
-            out = fni8.attn_int8_fwd(
-                q, k, v, causal=self.causal, scale=self.scale, window_left=self.window_left
-            )
+            if ctx.cu_seqlens is not None:
+                # Varlen batched prefill: q,k,v [1, H, total_tokens, D] -> [total_tokens, H, D]
+                # (token-major, heads interleaved — the flash_attn_varlen convention).
+                q_v = q.squeeze(0).transpose(0, 1).contiguous()  # [total_tok, H, D]
+                k_v = k.squeeze(0).transpose(0, 1).contiguous()  # [total_tok, Hkv, D]
+                v_v = v.squeeze(0).transpose(0, 1).contiguous()  # [total_tok, Hkv, D]
+                ctx.kv_cache.write_prefill_varlen(layer_idx, ctx.slot_mapping, k_v, v_v)
+                max_seqlen = int((ctx.cu_seqlens[1:] - ctx.cu_seqlens[:-1]).max().item())
+                out_v = fni8.attn_int8_varlen(
+                    q_v,
+                    k_v,
+                    v_v,
+                    ctx.cu_seqlens,
+                    ctx.cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
+                    causal=self.causal,
+                    scale=self.scale,
+                )
+                out = out_v.transpose(0, 1).unsqueeze(0)  # back to [1, H, total_tok, D]
+            else:
+                slot = ctx.slots[0] if ctx.slots is not None else None
+                ctx.kv_cache.write_prefill(layer_idx, k, v, slot=slot, start=ctx.prefill_start)
+                out = fni8.attn_int8_fwd(
+                    q, k, v, causal=self.causal, scale=self.scale, window_left=self.window_left
+                )
         elif ctx.slot_lengths is not None or ctx.slot_mapping is not None:
             out = self._decode_batched(q, k, v, ctx, layer_idx)  # engine continuous batch
             # (or CUDA-graph static path)
