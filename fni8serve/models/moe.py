@@ -10,6 +10,7 @@ v0 loops experts in Python (correct, simple). A batched grouped-GEMM that runs a
 active experts in one launch is the eventual fni8 kernel (moe grouped-GEMM), noted
 in the coverage matrix; the win is at high expert counts.
 """
+
 from __future__ import annotations
 
 import torch
@@ -25,16 +26,19 @@ class SparseMoE(nn.Module):
     def __init__(
         self,
         *,
-        gate: torch.Tensor,                 # router weight [num_experts, hidden] fp16
-        experts: list[tuple[QTensor, QTensor]],   # per-expert (gate_up, down)
+        gate: torch.Tensor,  # router weight [num_experts, hidden] fp16
+        experts: list[tuple[QTensor, QTensor]],  # per-expert (gate_up, down)
         top_k: int,
         norm_topk_prob: bool = True,
         act: str = "silu",
         shared_expert: tuple[QTensor, QTensor] | None = None,
-        shared_expert_gate: torch.Tensor | None = None,   # [1, hidden] fp16 or None
-        scoring_func: str = "softmax",       # "softmax" (Qwen/Hunyuan/MiniMax) | "sigmoid" (GLM/DeepSeek/LFM2)
+        shared_expert_gate: torch.Tensor | None = None,  # [1, hidden] fp16 or None
+        scoring_func: str = "softmax",  # "softmax" (Qwen/Hunyuan/MiniMax) | "sigmoid" (GLM/DeepSeek/LFM2)
         e_score_correction_bias: torch.Tensor | None = None,  # [E] fp32, sigmoid selection bias
         routed_scaling_factor: float = 1.0,
+        num_expert_groups: int
+        | None = None,  # partition experts into groups for group-limited top-k
+        topk_group: int | None = None,  # number of groups to select (used with num_expert_groups)
     ):
         super().__init__()
         self.gate = nn.Parameter(gate)
@@ -42,25 +46,50 @@ class SparseMoE(nn.Module):
         self.norm_topk_prob = norm_topk_prob
         self.scoring_func = scoring_func
         self.routed_scaling_factor = routed_scaling_factor
+        self.num_expert_groups = num_expert_groups
+        self.topk_group = topk_group
         self.register_buffer(
-            "e_score_bias", e_score_correction_bias.float() if e_score_correction_bias is not None
-            else None, persistent=False)
+            "e_score_bias",
+            e_score_correction_bias.float() if e_score_correction_bias is not None else None,
+            persistent=False,
+        )
         self.experts = nn.ModuleList([GatedMLP(gu, dn, act=act) for gu, dn in experts])
         self.shared = GatedMLP(*shared_expert, act=act) if shared_expert else None
-        self.shared_gate = nn.Parameter(shared_expert_gate) if shared_expert_gate is not None else None
+        self.shared_gate = (
+            nn.Parameter(shared_expert_gate) if shared_expert_gate is not None else None
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, S, H = x.shape
-        xf = x.reshape(-1, H)                                    # [T, H]
+        xf = x.reshape(-1, H)  # [T, H]
         router_logits = F.linear(xf.float(), self.gate.float())  # [T, E]
         if self.scoring_func == "sigmoid":
-            scores = torch.sigmoid(router_logits)               # GLM/DeepSeek/LFM2
+            scores = torch.sigmoid(router_logits)  # GLM/DeepSeek/LFM2
             sel = scores + self.e_score_bias if self.e_score_bias is not None else scores
-            _, topi = torch.topk(sel, self.top_k, dim=-1)       # select by biased score
-            topw = scores.gather(-1, topi)                      # weight by UN-biased score
         else:
-            scores = F.softmax(router_logits, dim=-1)           # softmax over ALL experts, fp32
-            topw, topi = torch.topk(scores, self.top_k, dim=-1)
+            scores = F.softmax(router_logits, dim=-1)  # softmax over ALL experts, fp32
+            sel = scores
+
+        if self.num_expert_groups is not None and self.topk_group is not None:
+            T = B * S
+            experts_per_group = sel.shape[-1] // self.num_expert_groups
+            group_scores = sel.view(T, self.num_expert_groups, experts_per_group).amax(dim=-1)
+            selected_groups = group_scores.topk(self.topk_group, dim=-1)[1]
+            offsets = torch.arange(experts_per_group, device=sel.device).view(
+                1, 1, experts_per_group
+            )
+            expert_idx = (selected_groups.unsqueeze(-1) * experts_per_group + offsets).reshape(
+                T, -1
+            )
+            mask = torch.full_like(sel, float("-inf"))
+            mask.scatter_(1, expert_idx, 0.0)
+            sel = sel + mask
+
+        if self.scoring_func == "sigmoid":
+            _, topi = torch.topk(sel, self.top_k, dim=-1)  # select by biased (and masked) score
+            topw = scores.gather(-1, topi)  # weight by UN-biased score
+        else:
+            topw, topi = torch.topk(sel, self.top_k, dim=-1)
         if self.norm_topk_prob:
             topw = topw / topw.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         topw = (topw * self.routed_scaling_factor).to(x.dtype)
@@ -68,10 +97,10 @@ class SparseMoE(nn.Module):
         out = torch.zeros_like(xf)
         # gather tokens per expert (only run experts that got routed to)
         for e in range(len(self.experts)):
-            mask = (topi == e)                                   # [T, k]
+            mask = topi == e  # [T, k]
             if not mask.any():
                 continue
-            tok_idx, slot = mask.nonzero(as_tuple=True)           # which tokens, which slot
+            tok_idx, slot = mask.nonzero(as_tuple=True)  # which tokens, which slot
             contrib = self.experts[e](xf[tok_idx].unsqueeze(1)).squeeze(1)  # [n, H]
             out.index_add_(0, tok_idx, contrib * topw[tok_idx, slot].unsqueeze(-1))
 

@@ -41,6 +41,9 @@ def _cfg():
             qk_rope_head_dim=16,
             v_head_dim=32,
             first_k_dense_replace=1,
+            num_expert_groups=2,
+            topk_group=1,
+            routed_scaling_factor=1.0,
         ),
     )
 
@@ -69,6 +72,7 @@ def _sd(cfg):
         sd[f"{a}.o_proj.weight"] = r(H, nh * x["v_head_dim"])
         if i >= x["first_k_dense_replace"]:
             sd[f"{p}.mlp.gate.weight"] = r(cfg.num_experts, H)
+            sd[f"{p}.mlp.e_score_correction_bias"] = r(cfg.num_experts)
             for e in range(cfg.num_experts):
                 sd[f"{p}.mlp.experts.{e}.gate_proj.weight"] = r(cfg.moe_intermediate_size, H)
                 sd[f"{p}.mlp.experts.{e}.up_proj.weight"] = r(cfg.moe_intermediate_size, H)
@@ -198,3 +202,64 @@ def test_deepseek_decode_cache_matches_full_recompute():
 
     got = torch.cat([pre_hidden, dec_hidden], dim=1)
     torch.testing.assert_close(got.float(), ref_hidden.float(), rtol=2e-2, atol=2e-2)
+
+
+def test_group_limited_routing():
+    """Group-limited top-k: with 2 groups of 2 experts and topk_group=1, only
+    experts from one group can be selected per token."""
+    from fni8serve.models.moe import SparseMoE
+    from fni8serve.models.weights import gate_up_weight, to_qtensor
+
+    torch.manual_seed(42)
+    H, E, k = 256, 4, 2
+    n_groups, topk_g = 2, 1
+    sd = {}
+    for e in range(E):
+        sd[f"e{e}.gate_proj.weight"] = (
+            torch.randn(128, H, device="cuda", dtype=torch.float16) * 0.05
+        )
+        sd[f"e{e}.up_proj.weight"] = torch.randn(128, H, device="cuda", dtype=torch.float16) * 0.05
+        sd[f"e{e}.down_proj.weight"] = (
+            torch.randn(H, 128, device="cuda", dtype=torch.float16) * 0.05
+        )
+    experts = [
+        (gate_up_weight(sd, f"e{e}"), to_qtensor(sd[f"e{e}.down_proj.weight"])) for e in range(E)
+    ]
+    bias = torch.randn(E, device="cuda", dtype=torch.float32) * 0.1
+    moe = SparseMoE(
+        gate=torch.randn(E, H, device="cuda", dtype=torch.float16) * 0.05,
+        experts=experts,
+        top_k=k,
+        norm_topk_prob=True,
+        scoring_func="sigmoid",
+        e_score_correction_bias=bias,
+        num_expert_groups=n_groups,
+        topk_group=topk_g,
+    ).cuda()
+
+    x = torch.randn(2, 4, H, device="cuda", dtype=torch.float16)
+    y = moe(x)
+    assert y.shape == x.shape and torch.isfinite(y).all()
+
+    # Verify per-token expert selection respects groups: experts [0,1] are group 0,
+    # experts [2,3] are group 1. With topk_group=1 all selected experts must be from
+    # the same group.
+    T = x.shape[0] * x.shape[1]
+    router_logits = torch.mm(x.reshape(-1, H).float(), moe.gate.float().T)
+    scores = torch.sigmoid(router_logits)
+    sel = scores + bias
+    E_per_group = E // n_groups
+    group_scores = sel.view(T, n_groups, E_per_group).amax(dim=-1)
+    selected_groups = group_scores.topk(topk_g, dim=-1)[1]
+    offsets = torch.arange(E_per_group, device=sel.device).view(1, 1, E_per_group)
+    expert_idx = (selected_groups.unsqueeze(-1) * E_per_group + offsets).reshape(T, -1)
+    mask = torch.full_like(sel, float("-inf"))
+    mask.scatter_(1, expert_idx, 0.0)
+    sel_masked = sel + mask
+    _, topi = torch.topk(sel_masked, k, dim=-1)
+    for t in range(T):
+        g = selected_groups[t, 0].item()
+        allowed = {g * E_per_group + i for i in range(E_per_group)}
+        assert set(topi[t].tolist()).issubset(allowed), (
+            f"token {t}: experts {topi[t].tolist()} not all in allowed group {g} ({allowed})"
+        )
