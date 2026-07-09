@@ -163,11 +163,28 @@ class ShortConv(nn.Module):
         self.out_proj = LinearW8A8(out_proj)
         self.register_buffer("conv_weight", conv_weight, persistent=False)   # [dim, 1, k]
 
+    def _conv(self, u, tail=None):
+        """Causal depthwise conv1d(k) over the last dimension of `u` [B,D,L]. `tail`:
+        optional [B,D,K-1] trailing window from the previous call — carries decode
+        history in instead of zero-padding. Returns (activated [B,L,D], new_tail
+        [B,D,K-1])."""
+        B, D, L = u.shape
+        K = self.kernel
+        if tail is None:
+            tail = u.new_zeros(B, D, K - 1)
+        u_ext = torch.cat([tail, u], dim=-1)                      # [B,D,K-1+L]
+        new_tail = u_ext[:, :, -(K - 1):] if K > 1 else u.new_zeros(B, D, 0)
+        y = F.conv1d(u_ext, self.conv_weight, groups=D).transpose(1, 2)
+        return y, new_tail
+
     def forward(self, x, positions=None, ctx=None, layer_idx=0):
         B, L, _ = x.shape
         bcx = self.in_proj(x)                                    # [B,L,3D]
         Bg, Cg, xg = bcx.chunk(3, dim=-1)
         u = (Bg * xg).transpose(1, 2)                            # [B,D,L]
-        u = F.pad(u, (self.kernel - 1, 0))
-        y = F.conv1d(u, self.conv_weight, groups=self.dim).transpose(1, 2)
+        cache = ctx.lin_cache if ctx is not None else None
+        tail = cache.get_conv_tail(layer_idx) if cache is not None else None
+        y, new_tail = self._conv(u, tail)
+        if cache is not None:
+            cache.set_conv_tail(layer_idx, new_tail)
         return self.out_proj(Cg * y)

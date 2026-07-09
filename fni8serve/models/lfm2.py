@@ -75,8 +75,8 @@ class Lfm2ForCausalLM(nn.Module):
 
     def forward(self, input_ids, positions, ctx: ForwardContext):
         h = self.embed_tokens(input_ids)
-        for layer in self.layers:
-            h = layer(h, positions, ctx, 0)
+        for i, layer in enumerate(self.layers):
+            h = layer(h, positions, ctx, i)
         return self.norm(h)
 
     def compute_logits(self, hidden):

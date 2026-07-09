@@ -10,7 +10,7 @@ pytest.importorskip("fni8")
 
 from fni8serve.models import ModelConfig, ModelRunner, build_model, is_supported
 from fni8serve.models.base import ForwardContext
-from fni8serve.models.cache import KVCache
+from fni8serve.models.cache import KVCache, RecurrentStateCache
 
 CUDA = torch.cuda.is_available()
 pytestmark = pytest.mark.skipif(not CUDA, reason="projections use the dp4a GEMM")
@@ -146,6 +146,52 @@ def test_lfm2_prefill():
             sd[f"{p}.conv.out_proj.weight"] = _r(H, H)
             sd[f"{p}.conv.conv.weight"] = _r(H, 1, 3)
     _prefill(cfg, sd)
+
+
+def _lfm2_cfg_sd():
+    cfg = ModelConfig(arch="lfm2", vocab_size=64, hidden_size=128, num_hidden_layers=3,
+                      num_attention_heads=4, num_key_value_heads=2, intermediate_size=256,
+                      max_position_embeddings=64, head_dim=32, qk_norm=True, tie_word_embeddings=True,
+                      rms_norm_eps=1e-5, extra=dict(full_attn_idxs=[1], conv_L_cache=3))
+    H = cfg.hidden_size
+    sd = {"model.embed_tokens.weight": _r(cfg.vocab_size, H), "model.norm.weight": _r(H)}
+    for i in range(cfg.num_hidden_layers):
+        p = f"model.layers.{i}"
+        sd[f"{p}.operator_norm.weight"] = _r(H)
+        sd[f"{p}.ffn_norm.weight"] = _r(H)
+        for w, d in (("w1", cfg.intermediate_size), ("w3", cfg.intermediate_size), ("w2", H)):
+            sd[f"{p}.feed_forward.{w}.weight"] = _r(d, H if w != "w2" else cfg.intermediate_size)
+        if i == 1:  # attention layer
+            _attn_sd(sd, f"{p}.self_attn", cfg, qk=("q_layernorm", "k_layernorm"))
+        else:       # conv layer
+            sd[f"{p}.conv.in_proj.weight"] = _r(3 * H, H)
+            sd[f"{p}.conv.out_proj.weight"] = _r(H, H)
+            sd[f"{p}.conv.conv.weight"] = _r(H, 1, 3)
+    return cfg, sd
+
+
+def test_lfm2_decode_matches_teacher_forced():
+    """Full generate (prefill + N decode steps) must match a single teacher-forced
+    forward over the whole (prompt + generated) sequence. This is the property the
+    conv-tail state caching now preserves for ShortConv layers: decode reads the
+    trailing `kernel-1` window from the previous step instead of zero-padding, so
+    the stepwise output matches the batched prefill output exactly."""
+    cfg, sd = _lfm2_cfg_sd()
+    model = build_model(cfg, sd).cuda().eval()
+    runner = ModelRunner(model, cfg, max_batch=1, max_len=32, device="cuda")
+    prompt = torch.randint(0, cfg.vocab_size, (1, 5), device="cuda")
+    gen = runner.generate_greedy(prompt, max_new_tokens=4)
+
+    full_ids = torch.cat([prompt, gen], dim=1)
+    pos = torch.arange(full_ids.shape[1], device="cuda").unsqueeze(0)
+    ref_cache = KVCache(cfg.num_hidden_layers, 1, cfg.num_key_value_heads, 32,
+                        cfg.resolved_head_dim(), device="cuda")
+    ref_lin_cache = RecurrentStateCache()
+    hidden = model(full_ids, pos, ForwardContext(is_prefill=True, kv_cache=ref_cache,
+                                                  lin_cache=ref_lin_cache))
+    logits = model.compute_logits(hidden)
+    ref_tokens = logits[:, prompt.shape[1] - 1:-1].argmax(-1)
+    assert torch.equal(ref_tokens, gen)
 
 
 def test_glm_prefill():

@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from fni8serve.layers.linear_attn import (
     GatedDeltaNetAttention,
+    ShortConv,
     _l2norm,
     lightning_attention,
     lightning_slopes,
@@ -118,6 +119,35 @@ def test_deltanet_conv_tail_matches_full_sequence():
     tail, outs = None, []
     for t in range(L):
         y, tail = GatedDeltaNetAttention._conv(harness, x[:, t:t + 1], tail)
+        outs.append(y)
+
+    torch.testing.assert_close(torch.cat(outs, dim=1), full, rtol=1e-5, atol=1e-5)
+
+
+class _ShortConvHarness:
+    """Bare object exposing only what `ShortConv._conv` touches, so the
+    ShortConv causal-conv decode-tail logic can be unit tested without building the
+    full nn.Module (whose projections need the CUDA dp4a kernels)."""
+
+    def __init__(self, kernel, conv_weight):
+        self.kernel = kernel
+        self.conv_weight = conv_weight
+
+
+def test_short_conv_tail_matches_full_sequence():
+    """The ShortConv depthwise conv must carry its trailing `kernel-1` raw window
+    across decode calls instead of zero-padding it away: one token at a time with
+    the tail threaded through must match a single whole-sequence call."""
+    torch.manual_seed(3)
+    B, L, D, K = 2, 7, 5, 3
+    harness = _ShortConvHarness(K, torch.randn(D, 1, K))
+    u = torch.randn(B, D, L)
+
+    full, _ = ShortConv._conv(harness, u)
+
+    tail, outs = None, []
+    for t in range(L):
+        y, tail = ShortConv._conv(harness, u[:, :, t:t + 1], tail)
         outs.append(y)
 
     torch.testing.assert_close(torch.cat(outs, dim=1), full, rtol=1e-5, atol=1e-5)
