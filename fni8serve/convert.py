@@ -18,7 +18,7 @@ import os
 
 import torch
 
-from fni8 import QTensor, save_fni8
+from fni8 import QTensor
 from fni8.quant.core import quantize_int8_rowwise
 from fni8.quant.lowbit import quantize_lowbit
 
@@ -168,17 +168,26 @@ def convert_hf_to_fni8(hf_dir: str, out_path: str, *, weight_bits: int = 8,
                     if k.endswith(scale_suffixes):
                         fp8_scales[k] = f.get_tensor(k)
 
-    qsd: dict[str, QTensor] = {}
-    for shard in shards:
-        sd = load_file(os.path.join(hf_dir, shard))
-        qsd.update(quantize_state_dict(sd, weight_bits=weight_bits, group_size=group_size,
-                                       fp8_scales=fp8_scales, fp8_block_size=fp8_block_size,
-                                       fp8_scale_fmt=fp8_scale_fmt))
-        del sd
-
     meta = {"arch": cfg.arch, "weight_bits": weight_bits, "fp8_source": is_fp8_src,
             "config": {k: v for k, v in vars(cfg).items() if not isinstance(v, dict)}}
-    save_fni8(out_path, qsd, meta=meta)
+
+    # Stream to disk one shard at a time: quantize a shard, write its tensors, free
+    # them, next shard. Peak RAM is a single shard (~a few GB), NOT the whole
+    # quantized model -- so 160GB+ models (DeepSeek-V4-Flash, MiniMax-M3) convert
+    # without OOM. (Accumulating the full `qsd` then save_fni8-ing it needed the
+    # entire model resident, which SIGKILL'd the converter on the 256GB flavor.)
+    from fni8.format import FQWriter
+
+    with FQWriter(out_path) as w:
+        for shard in shards:
+            sd = load_file(os.path.join(hf_dir, shard))
+            q = quantize_state_dict(sd, weight_bits=weight_bits, group_size=group_size,
+                                    fp8_scales=fp8_scales, fp8_block_size=fp8_block_size,
+                                    fp8_scale_fmt=fp8_scale_fmt)
+            for name, qt in q.items():
+                w.add(name, qt)
+            del sd, q
+        w.finalize(meta=meta)
     return cfg
 
 
