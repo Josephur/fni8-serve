@@ -11,6 +11,7 @@ serving loads with no dequant/repack (`fni8.format`).
 `quantize_state_dict` is the file-free core (tested directly). `convert_hf_to_fni8`
 wraps it with config.json + safetensors IO.
 """
+
 from __future__ import annotations
 
 import json
@@ -57,20 +58,30 @@ def quantize_weight_i8(w: torch.Tensor) -> QTensor:
 
 
 def quantize_weight_i4(w: torch.Tensor, group_size: int) -> QTensor:
-    codes, scale = quantize_lowbit(w, 4, dim=-1, group_size=group_size)   # [O,I], [O,I//g]
+    codes, scale = quantize_lowbit(w, 4, dim=-1, group_size=group_size)  # [O,I], [O,I//g]
     c = codes.to(torch.int64)
     packed = ((c[:, 0::2] & 0xF) | ((c[:, 1::2] & 0xF) << 4)).to(torch.uint8)
-    return QTensor(packed.contiguous(), scale.float().contiguous(), scheme="per_group_i4",
-                   group_size=group_size, codebook="int4")
+    return QTensor(
+        packed.contiguous(),
+        scale.float().contiguous(),
+        scheme="per_group_i4",
+        group_size=group_size,
+        codebook="int4",
+    )
 
 
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_inv", ".input_scale")
 
 
-def quantize_state_dict(sd: dict, *, weight_bits: int = 8, group_size: int = 128,
-                        fp8_scales: dict | None = None,
-                        fp8_block_size: list | None = None,
-                        fp8_scale_fmt: str | None = None) -> dict:
+def quantize_state_dict(
+    sd: dict,
+    *,
+    weight_bits: int = 8,
+    group_size: int = 128,
+    fp8_scales: dict | None = None,
+    fp8_block_size: list | None = None,
+    fp8_scale_fmt: str | None = None,
+) -> dict:
     """HF state dict (fp16/bf16/**fp8**) -> dict[name, QTensor]. Linears quantized
     from full precision; everything else stored raw fp16 (fp32 only if fp16 would
     overflow — see _raw_dtype).
@@ -92,21 +103,21 @@ def quantize_state_dict(sd: dict, *, weight_bits: int = 8, group_size: int = 128
     out: dict[str, QTensor] = {}
     for name, w in sd.items():
         if name.endswith(_SCALE_SUFFIXES):
-            continue                                    # consumed by its weight / activation scale
+            continue  # consumed by its weight / activation scale
         if fp8_scale_fmt is not None and name.endswith(MX_SCALE_SUFFIXES):
-            continue                                    # consumed MX/UE8M0 companion scale
-        w = w.detach().cpu()                            # keep NATIVE dtype (don't truncate bf16)
-        if is_fp8(w):                                   # reconstruct fp32 from fp8 * scale
+            continue  # consumed MX/UE8M0 companion scale
+        w = w.detach().cpu()  # keep NATIVE dtype (don't truncate bf16)
+        if is_fp8(w):  # reconstruct fp32 from fp8 * scale
             sname = fp8_scale_name(name, set(fp8_scales) | set(sd))
             sc = fp8_scales.get(sname) if sname else (sd.get(sname) if sname else None)
             if sc is None:
-                w = w.float()                           # no scale found -> best-effort raw upcast
+                w = w.float()  # no scale found -> best-effort raw upcast
             elif fp8_scale_fmt == "ue8m0":
                 w = dequantize_mxfp8(w, sc.detach().cpu(), block_size=fp8_block_size or (128, 128))
             else:
                 w = dequantize_fp8(w, sc.detach().cpu(), block_size=fp8_block_size)
         if is_quantizable_linear(name) and w.dim() == 2 and w.shape[-1] % 4 == 0:
-            wf = w.float()                              # quantize from full precision
+            wf = w.float()  # quantize from full precision
             if weight_bits == 4 and w.shape[-1] % group_size == 0:
                 out[name] = quantize_weight_i4(wf, group_size)
             else:
@@ -127,8 +138,14 @@ def _raw_dtype(w: torch.Tensor) -> torch.Tensor:
     return w16
 
 
-def convert_hf_to_fni8(hf_dir: str, out_path: str, *, weight_bits: int = 8,
-                       group_size: int = 128, arch: str | None = None) -> ModelConfig:
+def convert_hf_to_fni8(
+    hf_dir: str,
+    out_path: str,
+    *,
+    weight_bits: int = 8,
+    group_size: int = 128,
+    arch: str | None = None,
+) -> ModelConfig:
     """Read an HF model dir (config.json + *.safetensors) and write a `.fni8`.
     Returns the ModelConfig (also embedded in the file meta).
 
@@ -161,6 +178,7 @@ def convert_hf_to_fni8(hf_dir: str, out_path: str, *, weight_bits: int = 8,
     fp8_scales: dict = {}
     if is_fp8_src:
         from .fp8 import MX_SCALE_SUFFIXES
+
         scale_suffixes = _SCALE_SUFFIXES + MX_SCALE_SUFFIXES
         for shard in shards:
             with safe_open(os.path.join(hf_dir, shard), framework="pt") as f:
@@ -168,8 +186,12 @@ def convert_hf_to_fni8(hf_dir: str, out_path: str, *, weight_bits: int = 8,
                     if k.endswith(scale_suffixes):
                         fp8_scales[k] = f.get_tensor(k)
 
-    meta = {"arch": cfg.arch, "weight_bits": weight_bits, "fp8_source": is_fp8_src,
-            "config": {k: v for k, v in vars(cfg).items() if not isinstance(v, dict)}}
+    meta = {
+        "arch": cfg.arch,
+        "weight_bits": weight_bits,
+        "fp8_source": is_fp8_src,
+        "config": {k: v for k, v in vars(cfg).items() if not isinstance(v, dict)},
+    }
 
     # Stream to disk one shard at a time: quantize a shard, write its tensors, free
     # them, next shard. Peak RAM is a single shard (~a few GB), NOT the whole
@@ -180,13 +202,22 @@ def convert_hf_to_fni8(hf_dir: str, out_path: str, *, weight_bits: int = 8,
 
     with FQWriter(out_path) as w:
         for shard in shards:
-            sd = load_file(os.path.join(hf_dir, shard))
-            q = quantize_state_dict(sd, weight_bits=weight_bits, group_size=group_size,
-                                    fp8_scales=fp8_scales, fp8_block_size=fp8_block_size,
-                                    fp8_scale_fmt=fp8_scale_fmt)
-            for name, qt in q.items():
-                w.add(name, qt)
-            del sd, q
+            shard_path = os.path.join(hf_dir, shard)
+            try:
+                sd = load_file(shard_path)
+                q = quantize_state_dict(
+                    sd,
+                    weight_bits=weight_bits,
+                    group_size=group_size,
+                    fp8_scales=fp8_scales,
+                    fp8_block_size=fp8_block_size,
+                    fp8_scale_fmt=fp8_scale_fmt,
+                )
+                for name, qt in q.items():
+                    w.add(name, qt)
+                del sd, q
+            finally:
+                os.remove(shard_path)
         w.finalize(meta=meta)
     return cfg
 
@@ -202,8 +233,9 @@ def main():
     ap.add_argument("--group", type=int, default=128)
     ap.add_argument("--arch", default=None)
     a = ap.parse_args()
-    cfg = convert_hf_to_fni8(a.hf_dir, a.out_path, weight_bits=a.bits,
-                             group_size=a.group, arch=a.arch)
+    cfg = convert_hf_to_fni8(
+        a.hf_dir, a.out_path, weight_bits=a.bits, group_size=a.group, arch=a.arch
+    )
     print(f"wrote {a.out_path}  arch={cfg.arch}  bits={a.bits}  layers={cfg.num_hidden_layers}")
 
 

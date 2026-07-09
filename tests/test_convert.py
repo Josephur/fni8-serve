@@ -3,7 +3,9 @@
 the offline path is numerically identical to runtime quantization (per-row/per-group
 int8 scale depends only on its own row, so merge-then-quant == quant-then-merge).
 Needs CUDA for the forward."""
+
 import json
+import os
 
 import pytest
 import torch
@@ -18,18 +20,36 @@ CUDA = torch.cuda.is_available()
 
 
 def _cfg():
-    return ModelConfig(arch="qwen3", vocab_size=256, hidden_size=128, num_hidden_layers=2,
-                       num_attention_heads=4, num_key_value_heads=2, intermediate_size=256,
-                       max_position_embeddings=256, head_dim=32, qk_norm=True,
-                       tie_word_embeddings=False)
+    return ModelConfig(
+        arch="qwen3",
+        vocab_size=256,
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=256,
+        max_position_embeddings=256,
+        head_dim=32,
+        qk_norm=True,
+        tie_word_embeddings=False,
+    )
 
 
 def _sd(cfg):
     def r(*s):
         return torch.randn(*s, dtype=torch.float16) * 0.1
-    hd, nh, nkv, H = cfg.resolved_head_dim(), cfg.num_attention_heads, cfg.num_key_value_heads, cfg.hidden_size
-    sd = {"model.embed_tokens.weight": r(cfg.vocab_size, H), "model.norm.weight": r(H),
-          "lm_head.weight": r(cfg.vocab_size, H)}
+
+    hd, nh, nkv, H = (
+        cfg.resolved_head_dim(),
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+        cfg.hidden_size,
+    )
+    sd = {
+        "model.embed_tokens.weight": r(cfg.vocab_size, H),
+        "model.norm.weight": r(H),
+        "lm_head.weight": r(cfg.vocab_size, H),
+    }
     for i in range(cfg.num_hidden_layers):
         p = f"model.layers.{i}"
         sd[f"{p}.input_layernorm.weight"] = r(H)
@@ -50,7 +70,7 @@ def test_is_quantizable_linear_excludes_router_and_norms():
     assert is_quantizable_linear("model.layers.0.self_attn.q_proj.weight")
     assert is_quantizable_linear("model.layers.0.mlp.experts.3.down_proj.weight")
     assert is_quantizable_linear("lm_head.weight")
-    assert not is_quantizable_linear("model.layers.0.mlp.gate.weight")      # MoE router
+    assert not is_quantizable_linear("model.layers.0.mlp.gate.weight")  # MoE router
     assert not is_quantizable_linear("model.layers.0.input_layernorm.weight")
     assert not is_quantizable_linear("model.embed_tokens.weight")
     # Non-standard MLP names (LFM2 feed_forward.w1/2/3, Mistral-style) must be
@@ -77,11 +97,17 @@ def test_quantize_state_dict_schemes():
 
 def _to_cuda(qsd):
     from fni8 import QTensor
+
     out = {}
     for k, v in qsd.items():
         if isinstance(v, QTensor):
-            out[k] = QTensor(v.data.cuda(), v.scale.cuda() if v.scale is not None else None,
-                             scheme=v.scheme, group_size=v.group_size, codebook=v.codebook)
+            out[k] = QTensor(
+                v.data.cuda(),
+                v.scale.cuda() if v.scale is not None else None,
+                scheme=v.scheme,
+                group_size=v.group_size,
+                codebook=v.codebook,
+            )
         else:
             out[k] = v.cuda()
     return out
@@ -93,8 +119,9 @@ def test_fni8_roundtrip_is_exact(tmp_path):
     directly from the same quantized dict, bitwise (isolates the container round-trip
     from any CPU/GPU quant ULP)."""
     from fni8 import save_fni8
+
     cfg = _cfg()
-    qsd = quantize_state_dict(_sd(cfg), weight_bits=8)      # CPU QTensors
+    qsd = quantize_state_dict(_sd(cfg), weight_bits=8)  # CPU QTensors
 
     path = str(tmp_path / "m.fni8")
     save_fni8(path, qsd)
@@ -113,6 +140,7 @@ def test_fni8_roundtrip_is_exact(tmp_path):
 def test_fni8_model_close_to_runtime_quant(tmp_path):
     """Offline (.fni8, CPU-quant) vs runtime (GPU-quant) differ only by quant ULPs."""
     from fni8 import save_fni8
+
     cfg = _cfg()
     sd = _sd(cfg)
     path = str(tmp_path / "m.fni8")
@@ -128,10 +156,15 @@ def test_fni8_model_close_to_runtime_quant(tmp_path):
 
 def _hf_config_dict(cfg):
     return {
-        "model_type": cfg.arch, "vocab_size": cfg.vocab_size, "hidden_size": cfg.hidden_size,
-        "num_hidden_layers": cfg.num_hidden_layers, "num_attention_heads": cfg.num_attention_heads,
-        "num_key_value_heads": cfg.num_key_value_heads, "intermediate_size": cfg.intermediate_size,
-        "max_position_embeddings": cfg.max_position_embeddings, "head_dim": cfg.head_dim,
+        "model_type": cfg.arch,
+        "vocab_size": cfg.vocab_size,
+        "hidden_size": cfg.hidden_size,
+        "num_hidden_layers": cfg.num_hidden_layers,
+        "num_attention_heads": cfg.num_attention_heads,
+        "num_key_value_heads": cfg.num_key_value_heads,
+        "intermediate_size": cfg.intermediate_size,
+        "max_position_embeddings": cfg.max_position_embeddings,
+        "head_dim": cfg.head_dim,
     }
 
 
@@ -150,10 +183,8 @@ def test_convert_hf_to_fni8_streams_shards_one_at_a_time(tmp_path, monkeypatch):
     sd = _sd(cfg)
     keys = list(sd)
     mid = len(keys) // 2
-    save_file({k: sd[k] for k in keys[:mid]},
-              str(tmp_path / "model-00001-of-00002.safetensors"))
-    save_file({k: sd[k] for k in keys[mid:]},
-              str(tmp_path / "model-00002-of-00002.safetensors"))
+    save_file({k: sd[k] for k in keys[:mid]}, str(tmp_path / "model-00001-of-00002.safetensors"))
+    save_file({k: sd[k] for k in keys[mid:]}, str(tmp_path / "model-00002-of-00002.safetensors"))
     (tmp_path / "config.json").write_text(json.dumps(_hf_config_dict(cfg)))
 
     seen_shard_sizes = []
@@ -168,8 +199,56 @@ def test_convert_hf_to_fni8_streams_shards_one_at_a_time(tmp_path, monkeypatch):
     out = tmp_path / "m.fni8"
     convert_mod.convert_hf_to_fni8(str(tmp_path), str(out), weight_bits=8)
 
-    assert seen_shard_sizes == [mid, len(keys) - mid]   # one call per shard...
+    assert seen_shard_sizes == [mid, len(keys) - mid]  # one call per shard...
     assert all(n < len(keys) for n in seen_shard_sizes)  # ...never the full state dict
+    assert checkpoint_info(str(out))["num_tensors"] == len(keys)
+
+
+def test_convert_hf_to_fni8_deletes_source_shards_as_processed(tmp_path, monkeypatch):
+    """Regression for the 850GB+ disk-capacity failure (MiniMax-M3 / issue #69):
+    convert_hf_to_fni8 must delete each source safetensors shard immediately after its
+    tensors are quantized and written, so peak disk is max(source, consumed+output)
+    rather than source+output."""
+    pytest.importorskip("safetensors")
+    from safetensors.torch import save_file
+
+    import fni8serve.convert as convert_mod
+
+    cfg = _cfg()
+    sd = _sd(cfg)
+    keys = list(sd)
+    mid = len(keys) // 2
+    save_file({k: sd[k] for k in keys[:mid]}, str(tmp_path / "model-00001-of-00002.safetensors"))
+    save_file({k: sd[k] for k in keys[mid:]}, str(tmp_path / "model-00002-of-00002.safetensors"))
+    (tmp_path / "config.json").write_text(json.dumps(_hf_config_dict(cfg)))
+
+    # Track which safetensors files get deleted
+    removed_safetensors = []
+    orig_remove = os.remove
+
+    def spy_remove(path):
+        if path.endswith(".safetensors"):
+            removed_safetensors.append(path)
+        return orig_remove(path)
+
+    monkeypatch.setattr(os, "remove", spy_remove)
+
+    # Shards exist before conversion
+    assert (tmp_path / "model-00001-of-00002.safetensors").exists()
+    assert (tmp_path / "model-00002-of-00002.safetensors").exists()
+    shard_count_before = len(list(tmp_path.glob("*.safetensors")))
+
+    out = tmp_path / "m.fni8"
+    convert_mod.convert_hf_to_fni8(str(tmp_path), str(out), weight_bits=8)
+
+    # Every source shard was deleted via os.remove during conversion
+    assert len(removed_safetensors) == 2
+    assert shard_count_before == 2
+    assert not (tmp_path / "model-00001-of-00002.safetensors").exists()
+    assert not (tmp_path / "model-00002-of-00002.safetensors").exists()
+    # config.json and the output file must survive
+    assert (tmp_path / "config.json").exists()
+    assert (tmp_path / "m.fni8").exists()
     assert checkpoint_info(str(out))["num_tensors"] == len(keys)
 
 
