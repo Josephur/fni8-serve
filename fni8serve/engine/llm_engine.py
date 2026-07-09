@@ -6,6 +6,7 @@ weights dict (the `.fni8` loader output, or an HF state dict). Multi-GPU (PP +
 MoE-EP, never TP) is a later layer; KV storage is `PagedKVCache` -- int8
 quantize-on-write, block-table addressed, one batched decode launch per step.
 """
+
 from __future__ import annotations
 
 import itertools
@@ -22,10 +23,19 @@ from .sequence import SamplingParams, Sequence, Status
 
 
 class LLMEngine:
-    def __init__(self, cfg: ModelConfig, weights: dict, *, device="cuda",
-                 max_num_seqs: int = 16, max_len: int = 2048, max_batch_tokens: int = 8192,
-                 eos_id: int | None = None, enable_cuda_graph: bool | None = None,
-                 num_diffusion_steps: int = 8):
+    def __init__(
+        self,
+        cfg: ModelConfig,
+        weights: dict,
+        *,
+        device="cuda",
+        max_num_seqs: int = 16,
+        max_len: int = 2048,
+        max_batch_tokens: int = 8192,
+        eos_id: int | None = None,
+        enable_cuda_graph: bool | None = None,
+        num_diffusion_steps: int = 8,
+    ):
         self.cfg = cfg
         self.device = device
         self.eos_id = eos_id
@@ -35,21 +45,29 @@ class LLMEngine:
             if cfg.decode_strategy == "diffusion"
             else None
         )
-        graph_wanted = (cuda_graph_enabled_by_env() if enable_cuda_graph is None
-                       else enable_cuda_graph)
+        graph_wanted = (
+            cuda_graph_enabled_by_env() if enable_cuda_graph is None else enable_cuda_graph
+        )
         # `GraphedDecode` pins one extra, never-freed cache slot for its padding
         # rows (see kv_cache.py `_scratch`). Give it a dedicated slot beyond
         # `max_num_seqs` so real scheduling capacity -- what `max_num_seqs`
         # promises the caller -- isn't silently reduced by one; the scheduler
         # itself still never admits more than `max_num_seqs` running sequences.
         num_slots = max_num_seqs + 1 if graph_wanted else max_num_seqs
-        self.cache = PagedKVCache(cfg.num_hidden_layers, num_slots,
-                                  cfg.num_key_value_heads, max_len, cfg.resolved_head_dim(),
-                                  device=device)
-        self.scheduler = Scheduler(self.cache, max_num_seqs=max_num_seqs,
-                                   max_batch_tokens=max_batch_tokens, eos_id=eos_id)
-        self.runner = EngineRunner(self.model, self.cache, device=device,
-                                   enable_cuda_graph=enable_cuda_graph)
+        self.cache = PagedKVCache(
+            cfg.num_hidden_layers,
+            num_slots,
+            cfg.num_key_value_heads,
+            max_len,
+            cfg.resolved_head_dim(),
+            device=device,
+        )
+        self.scheduler = Scheduler(
+            self.cache, max_num_seqs=max_num_seqs, max_batch_tokens=max_batch_tokens, eos_id=eos_id
+        )
+        self.runner = EngineRunner(
+            self.model, self.cache, device=device, enable_cuda_graph=enable_cuda_graph
+        )
         self._ids = itertools.count()
         self._out: dict[int, Sequence] = {}
 
@@ -77,15 +95,19 @@ class LLMEngine:
                 total_len = seq.num_prompt + seq.params.max_tokens
                 self.cache.ensure_capacity([seq.slot], [total_len])
                 seq.length = total_len
-                ctx = ForwardContext(is_prefill=True, kv_cache=self.cache,
-                                     slots=[seq.slot])
+                ctx = ForwardContext(is_prefill=True, kv_cache=self.cache, slots=[seq.slot])
                 out_tokens = self._diffusion_strategy.generate(
-                    self.model, self.cache, self.device, seq, ctx)
+                    self.model, self.cache, self.device, seq, ctx
+                )
                 seq.output_ids.extend(out_tokens)
+                self.cache.store_prefix(seq.prompt_ids, seq.slot)
         else:
             toks = self.runner.prefill(batch) if is_prefill else self.runner.decode(batch)
             for seq, tok in zip(batch, toks):
                 seq.output_ids.append(int(tok))
+            if is_prefill:
+                for seq in batch:
+                    self.cache.store_prefix(seq.prompt_ids, seq.slot)
         self.scheduler.postprocess(batch, is_prefill)
 
     def encode(self, prompt_ids: list[int]) -> list[float]:
@@ -96,13 +118,15 @@ class LLMEngine:
             return []
         pooled = self.runner.encode(batch)
         for seq in batch:
+            self.cache.store_prefix(seq.prompt_ids, seq.slot)
             seq.status = Status.FINISHED
         self.scheduler.postprocess(batch, is_prefill)
         self.forget(seq_id)
         return pooled[0].cpu().tolist()
 
-    def generate(self, prompts: list[list[int]],
-                 params: SamplingParams | None = None) -> list[list[int]]:
+    def generate(
+        self, prompts: list[list[int]], params: SamplingParams | None = None
+    ) -> list[list[int]]:
         """Offline batched generation: returns the output token ids per prompt."""
         ids = [self.add_request(p, params) for p in prompts]
         while self.scheduler.has_work():

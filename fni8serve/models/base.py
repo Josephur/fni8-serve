@@ -7,6 +7,7 @@ vs diffusion iterative-denoising). A new model family implements `CausalLM.build
 and registers itself; a new *generation paradigm* implements `DecodeStrategy`.
 Weights arrive as a `dict[str, QTensor | Tensor]` from the `.fni8` loader.
 """
+
 from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
@@ -15,7 +16,7 @@ import torch
 
 from .config import ModelConfig
 
-Weights = dict[str, object]   # name -> QTensor (quantized) or torch.Tensor (raw)
+Weights = dict[str, object]  # name -> QTensor (quantized) or torch.Tensor (raw)
 
 
 @runtime_checkable
@@ -26,10 +27,10 @@ class CausalLM(Protocol):
 
     def forward(
         self,
-        input_ids: torch.Tensor,       # [num_tokens] (flattened batch, token-major)
-        positions: torch.Tensor,       # [num_tokens]
+        input_ids: torch.Tensor,  # [num_tokens] (flattened batch, token-major)
+        positions: torch.Tensor,  # [num_tokens]
         ctx: "ForwardContext",
-    ) -> torch.Tensor:                 # hidden states [num_tokens, hidden]
+    ) -> torch.Tensor:  # hidden states [num_tokens, hidden]
         ...
 
     def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -55,12 +56,13 @@ class ForwardContext:
         context_lens: torch.Tensor | None = None,
         max_context_len: int | None = None,
         attn_mask=None,
-        slots: list[int] | None = None,        # engine: which cache slot each batch row uses
+        slots: list[int] | None = None,  # engine: which cache slot each batch row uses
         slot_lengths: list[int] | None = None,  # engine: per-row KV length (ragged decode)
+        prefill_start: int = 0,  # prefix cache: first position to compute/write
     ):
         self.is_prefill = is_prefill
         self.kv_cache = kv_cache
-        self.lin_cache = lin_cache     # RecurrentStateCache for linear-attn layers
+        self.lin_cache = lin_cache  # RecurrentStateCache for linear-attn layers
         self.cu_seqlens = cu_seqlens
         self.seq_lens = seq_lens
         # `slot_mapping` / `block_tables` / `context_lens` / `max_context_len`: the
@@ -73,9 +75,10 @@ class ForwardContext:
         self.block_tables = block_tables
         self.context_lens = context_lens
         self.max_context_len = max_context_len
-        self.attn_mask = attn_mask     # e.g. bidirectional mask for diffusion
+        self.attn_mask = attn_mask  # e.g. bidirectional mask for diffusion
         self.slots = slots
         self.slot_lengths = slot_lengths
+        self.prefill_start = prefill_start
 
 
 class DecodeStrategy(Protocol):

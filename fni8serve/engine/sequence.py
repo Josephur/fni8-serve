@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Sequence + SamplingParams — a request's state through the engine."""
+
 from __future__ import annotations
 
 import enum
@@ -13,7 +14,7 @@ LogitsProcessor = Callable[[list[int], "torch.Tensor"], "torch.Tensor"]
 
 @dataclass
 class SamplingParams:
-    temperature: float = 0.0          # 0 => greedy
+    temperature: float = 0.0  # 0 => greedy
     top_p: float = 1.0
     max_tokens: int = 64
     ignore_eos: bool = False
@@ -34,7 +35,8 @@ class Sequence:
     status: Status = Status.WAITING
     slot: int = -1
     output_ids: list[int] = field(default_factory=list)
-    length: int = 0                   # KV positions committed for this seq
+    length: int = 0  # KV positions committed for this seq
+    prefix_matched_len: int = 0  # length of shared prefix found (0 = none)
 
     @property
     def num_prompt(self) -> int:
@@ -51,8 +53,12 @@ class Sequence:
     def finish_reason(self, eos_id: int | None) -> str | None:
         if len(self.output_ids) >= self.params.max_tokens:
             return "length"
-        if not self.params.ignore_eos and eos_id is not None and self.output_ids \
-                and self.output_ids[-1] == eos_id:
+        if (
+            not self.params.ignore_eos
+            and eos_id is not None
+            and self.output_ids
+            and self.output_ids[-1] == eos_id
+        ):
             return "stop"
         return None
 

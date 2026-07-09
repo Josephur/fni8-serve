@@ -8,6 +8,7 @@ memory-bound attention call reads the whole ragged batch in ONE paged-decode lau
 (`PagedKVCache.decode_attn`) instead of looping per slot. Sampling is batched via
 the Sampler.
 """
+
 from __future__ import annotations
 
 import torch
@@ -36,14 +37,18 @@ class EngineRunner:
         self.graphed = GraphedDecode(model, cache, device=device) if enable_cuda_graph else None
 
     def _sample(self, logits: torch.Tensor, batch: list[Sequence]) -> list[int]:
-        temps = torch.tensor([s.params.temperature for s in batch],
-                             device=self.device, dtype=torch.float32)
-        top_p = torch.tensor([s.params.top_p for s in batch],
-                             device=self.device, dtype=torch.float32)
+        temps = torch.tensor(
+            [s.params.temperature for s in batch], device=self.device, dtype=torch.float32
+        )
+        top_p = torch.tensor(
+            [s.params.top_p for s in batch], device=self.device, dtype=torch.float32
+        )
         procs = [s.params.logit_processors for s in batch]
         has_procs = any(procs)
         toks = self.sampler(
-            logits, temps, top_p=top_p,
+            logits,
+            temps,
+            top_p=top_p,
             logit_processors=procs if has_procs else None,
             input_ids=[s.all_token_ids for s in batch] if has_procs else None,
         )
@@ -56,7 +61,12 @@ class EngineRunner:
             ids = torch.tensor([seq.prompt_ids], device=self.device)
             pos = torch.arange(seq.num_prompt, device=self.device).unsqueeze(0)
             self.cache.ensure_capacity([seq.slot], [seq.num_prompt])
-            ctx = ForwardContext(is_prefill=True, kv_cache=self.cache, slots=[seq.slot])
+            ctx = ForwardContext(
+                is_prefill=True,
+                kv_cache=self.cache,
+                slots=[seq.slot],
+                prefill_start=seq.prefix_matched_len,
+            )
             hidden = self.model(ids, pos, ctx)
             pooled = hidden.mean(dim=1)
             hiddens.append(pooled)
@@ -66,10 +76,15 @@ class EngineRunner:
     def prefill(self, batch: list[Sequence]) -> list[int]:
         out = []
         for seq in batch:
-            ids = torch.tensor([seq.prompt_ids], device=self.device)     # [1, S]
+            ids = torch.tensor([seq.prompt_ids], device=self.device)  # [1, S]
             pos = torch.arange(seq.num_prompt, device=self.device).unsqueeze(0)
             self.cache.ensure_capacity([seq.slot], [seq.num_prompt])
-            ctx = ForwardContext(is_prefill=True, kv_cache=self.cache, slots=[seq.slot])
+            ctx = ForwardContext(
+                is_prefill=True,
+                kv_cache=self.cache,
+                slots=[seq.slot],
+                prefill_start=seq.prefix_matched_len,
+            )
             hidden = self.model(ids, pos, ctx)
             seq.length = seq.num_prompt
             logits = self.model.compute_logits(hidden[:, -1])
@@ -87,13 +102,14 @@ class EngineRunner:
 
     @torch.inference_mode()
     def _decode_eager(self, batch: list[Sequence]) -> list[int]:
-        ids = torch.tensor([[s.last_token] for s in batch], device=self.device)   # [B,1]
-        pos = torch.tensor([[s.length] for s in batch], device=self.device)       # [B,1]
+        ids = torch.tensor([[s.last_token] for s in batch], device=self.device)  # [B,1]
+        pos = torch.tensor([[s.length] for s in batch], device=self.device)  # [B,1]
         slots = [s.slot for s in batch]
         lengths = [s.length for s in batch]
         self.cache.ensure_capacity(slots, [n + 1 for n in lengths])
-        ctx = ForwardContext(is_prefill=False, kv_cache=self.cache,
-                             slots=slots, slot_lengths=lengths)
+        ctx = ForwardContext(
+            is_prefill=False, kv_cache=self.cache, slots=slots, slot_lengths=lengths
+        )
         hidden = self.model(ids, pos, ctx)
         for s in batch:
             s.length += 1

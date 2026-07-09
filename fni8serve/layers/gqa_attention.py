@@ -12,6 +12,7 @@ Config-driven so Qwen3, Qwen3-MoE, Gemma3, GLM, Hunyuan all reuse it unchanged:
 This is the `full`/`sliding` AttentionBackend. `linear` (DeltaNet) and `latent`
 (MLA) backends are separate — see layers/linear_attn.py and layers/mla_attn.py.
 """
+
 from __future__ import annotations
 
 import torch
@@ -63,7 +64,7 @@ class GQAAttention(nn.Module):
         q = q.view(B, S, self.nh, self.hd)
         k = k.view(B, S, self.nkv, self.hd)
         v = v.view(B, S, self.nkv, self.hd)
-        if self.q_norm is not None:                 # per-head RMSNorm, pre-RoPE
+        if self.q_norm is not None:  # per-head RMSNorm, pre-RoPE
             q = self.q_norm(q)
             k = self.k_norm(k)
         q, k = self.rope(positions, q, k)
@@ -74,14 +75,15 @@ class GQAAttention(nn.Module):
 
         if ctx.is_prefill:
             slot = ctx.slots[0] if ctx.slots is not None else None
-            ctx.kv_cache.write_prefill(layer_idx, k, v, slot=slot)
-            out = fni8.attn_int8_fwd(q, k, v, causal=self.causal, scale=self.scale,
-                                      window_left=self.window_left)
+            ctx.kv_cache.write_prefill(layer_idx, k, v, slot=slot, start=ctx.prefill_start)
+            out = fni8.attn_int8_fwd(
+                q, k, v, causal=self.causal, scale=self.scale, window_left=self.window_left
+            )
         elif ctx.slot_lengths is not None or ctx.slot_mapping is not None:
-            out = self._decode_batched(q, k, v, ctx, layer_idx)   # engine continuous batch
-                                                                    # (or CUDA-graph static path)
+            out = self._decode_batched(q, k, v, ctx, layer_idx)  # engine continuous batch
+            # (or CUDA-graph static path)
         else:
-            k_all, v_all = ctx.kv_cache.append_decode(layer_idx, k, v)   # [B,Hkv,N,D]
+            k_all, v_all = ctx.kv_cache.append_decode(layer_idx, k, v)  # [B,Hkv,N,D]
             k_all, v_all = self._window(k_all, v_all)
             out = fni8.attn_int8_decode(q, k_all, v_all, scale=self.scale)
 
@@ -90,8 +92,8 @@ class GQAAttention(nn.Module):
 
     def _window(self, k_all, v_all):
         if self.window_left >= 0 and k_all.shape[2] > self.window_left:
-            k_all = k_all[:, :, -self.window_left:].contiguous()
-            v_all = v_all[:, :, -self.window_left:].contiguous()
+            k_all = k_all[:, :, -self.window_left :].contiguous()
+            v_all = v_all[:, :, -self.window_left :].contiguous()
         return k_all, v_all
 
     def _decode_batched(self, q, k, v, ctx, layer_idx):
@@ -104,7 +106,7 @@ class GQAAttention(nn.Module):
         (no window parameter yet), so they fall back to a per-slot dequantized read
         + `attn_int8_decode`, same as before this PR."""
         cache = ctx.kv_cache
-        k_new, v_new = k[:, :, 0, :], v[:, :, 0, :]           # [B,Hkv,D]: the one new token
+        k_new, v_new = k[:, :, 0, :], v[:, :, 0, :]  # [B,Hkv,D]: the one new token
         if self.window_left < 0:
             if ctx.slot_mapping is not None:
                 # CUDA-graph decode (engine/cuda_graph.py): slot_mapping/block_tables/
@@ -113,13 +115,19 @@ class GQAAttention(nn.Module):
                 # no fresh per-layer tensor allocation and no `.item()` sync, so this
                 # whole call is capturable.
                 cache.write_decode_static(layer_idx, ctx.slot_mapping, k_new, v_new)
-                return cache.decode_attn_static(layer_idx, q, ctx.block_tables, ctx.context_lens,
-                                                ctx.max_context_len, scale=self.scale)
+                return cache.decode_attn_static(
+                    layer_idx,
+                    q,
+                    ctx.block_tables,
+                    ctx.context_lens,
+                    ctx.max_context_len,
+                    scale=self.scale,
+                )
             cache.write_decode(layer_idx, ctx.slots, ctx.slot_lengths, k_new, v_new)
             return cache.decode_attn(layer_idx, q, ctx.slots, ctx.slot_lengths, scale=self.scale)
         outs = []
         for b, (slot, n) in enumerate(zip(ctx.slots, ctx.slot_lengths)):
-            cache.write_decode(layer_idx, [slot], [n], k_new[b:b + 1], v_new[b:b + 1])
+            cache.write_decode(layer_idx, [slot], [n], k_new[b : b + 1], v_new[b : b + 1])
             kb, vb = cache.read_dense(layer_idx, slot, n + 1, window=self.window_left)
-            outs.append(fni8.attn_int8_decode(q[b:b + 1], kb, vb, scale=self.scale))
+            outs.append(fni8.attn_int8_decode(q[b : b + 1], kb, vb, scale=self.scale))
         return torch.cat(outs, dim=0)
