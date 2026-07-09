@@ -59,6 +59,7 @@ class ForwardContext:
         slots: list[int] | None = None,  # engine: which cache slot each batch row uses
         slot_lengths: list[int] | None = None,  # engine: per-row KV length (ragged decode)
         prefill_start: int = 0,  # prefix cache: first position to compute/write
+        pixel_values: torch.Tensor | None = None,  # VLM: [1, 3, H, W] image pixels
     ):
         self.is_prefill = is_prefill
         self.kv_cache = kv_cache
@@ -79,6 +80,7 @@ class ForwardContext:
         self.slots = slots
         self.slot_lengths = slot_lengths
         self.prefill_start = prefill_start
+        self.pixel_values: torch.Tensor | None = pixel_values  # VLM: image pixels for vision tower
 
 
 class DecodeStrategy(Protocol):

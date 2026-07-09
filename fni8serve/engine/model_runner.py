@@ -92,6 +92,7 @@ class EngineRunner:
                 lin_cache=self.lin_cache,
                 slots=[seq.slot],
                 prefill_start=seq.prefix_matched_len,
+                pixel_values=seq.pixel_values,
             )
             hidden = self.model(ids, pos, ctx)
             seq.length = seq.num_prompt

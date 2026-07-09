@@ -7,6 +7,8 @@ import enum
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+import torch
+
 # (this sequence's token ids so far, this step's logits row) -> logits row. Applied
 # before sampling -- the seam structured outputs / grammars (#39) plug into.
 LogitsProcessor = Callable[[list[int], "torch.Tensor"], "torch.Tensor"]
@@ -37,6 +39,7 @@ class Sequence:
     output_ids: list[int] = field(default_factory=list)
     length: int = 0  # KV positions committed for this seq
     prefix_matched_len: int = 0  # length of shared prefix found (0 = none)
+    pixel_values: torch.Tensor | None = None  # VLM: [1, 3, H, W] preprocessed image
 
     @property
     def num_prompt(self) -> int:

@@ -22,6 +22,7 @@ from . import hunyuan as _hunyuan  # noqa: E402,F401
 from . import minimax as _minimax  # noqa: E402,F401
 from . import diffusion_gemma as _diffusion_gemma  # noqa: E402,F401
 from . import gemma4 as _gemma4  # noqa: E402,F401
+from . import vlm as _vlm  # noqa: E402,F401
 
 __all__ = [
     "CausalLM",
