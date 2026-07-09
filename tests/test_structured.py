@@ -34,10 +34,11 @@ def _greedy_decode(processor: GrammarLogitsProcessor, vocab: list[str], eos_id: 
     """Simulates the engine's per-step call pattern (`model_runner.EngineRunner._sample`):
     the processor sees the full token history so far and returns masked logits; we
     pick greedy (argmax) and append, same as the sampler does at temperature 0."""
-    zeros = torch.zeros(len(vocab))
+    rng = torch.Generator().manual_seed(42)
     input_ids: list[int] = []
     for _ in range(max_steps):
-        masked = processor(input_ids, zeros)
+        logits = torch.rand(len(vocab), generator=rng) * 1e-6
+        masked = processor(input_ids, logits)
         token_id = int(masked.argmax())
         if token_id == eos_id:
             return "".join(vocab[t] for t in input_ids)
@@ -62,10 +63,6 @@ NESTED_SCHEMA = {
 }
 
 
-@pytest.mark.xfail(strict=False, reason="_greedy_decode uses zero logits, so argmax "
-                   "ties to token 0; for this schema that loops without reaching EOS. "
-                   "Real decode has real logits. Tracked separately — see the structured "
-                   "greedy-decode issue; do not treat as a product regression.")
 def test_json_schema_constrained_generation_parses_and_validates():
     """100%-parse guarantee: every token is masked to the compiled schema grammar, so
     the greedily-decoded output must be valid JSON that validates against the nested
@@ -78,7 +75,7 @@ def test_json_schema_constrained_generation_parses_and_validates():
     compiled = compiler.compile_json_schema(json.dumps(NESTED_SCHEMA))
     processor = GrammarLogitsProcessor(compiled)
 
-    text = _greedy_decode(processor, vocab, eos_id)
+    text = _greedy_decode(processor, vocab, eos_id, max_steps=2048)
 
     instance = json.loads(text)  # must parse -- not just "look like" JSON
     jsonschema.validate(instance, NESTED_SCHEMA)
