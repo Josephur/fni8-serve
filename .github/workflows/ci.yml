@@ -1,0 +1,41 @@
+name: CI
+
+# Required gate for fni8-serve PRs: build fni8 (serve imports its compiled kernels) and
+# run the serve suite on the self-hosted Volta runner. Branch protection makes the
+# `build-test` check mandatory to merge — so the backlog manager only merges green PRs.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: [self-hosted, volta-gpu]
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: serve
+
+      - name: Clone fni8 (kernel dependency)
+        run: git clone --depth 1 https://github.com/jajmangold/fni8 "$GITHUB_WORKSPACE/fni8"
+
+      - name: Build fni8 + run the serve suite
+        run: |
+          docker run --rm --gpus all \
+            -e WS="$GITHUB_WORKSPACE" \
+            -e PYTHONPATH="$GITHUB_WORKSPACE/fni8:$GITHUB_WORKSPACE/serve" \
+            -v "$GITHUB_WORKSPACE/fni8:$GITHUB_WORKSPACE/fni8" \
+            -v "$GITHUB_WORKSPACE/serve:$GITHUB_WORKSPACE/serve" \
+            -w "$GITHUB_WORKSPACE/serve" \
+            fni8-dev bash -lc '
+              set -e
+              cd "$WS/fni8"  && pip install -e . --no-build-isolation -q
+              cd "$WS/serve" && pip install -e ".[dev,convert,serve,structured]" -q
+              pytest -q
+            '
