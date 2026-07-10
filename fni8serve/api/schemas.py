@@ -56,6 +56,7 @@ class ImageURL(BaseModel):
     base64 data URI (``data:image/...;base64,...``)."""
 
     url: str
+    detail: str | None = None       # OpenAI compat ("auto"/"low"/"high"); accepted, unused
 
 
 class ContentPart(BaseModel):

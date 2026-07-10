@@ -11,7 +11,6 @@ import json
 import torch
 
 from ..engine.sequence import SamplingParams
-from ..multimodal import fetch_image, preprocess_qwen2_5_vl
 from ..structured import GrammarCompilerCache
 from ..tool_calls import get_tool_call_parser, parse_forced_tool_call
 from .schemas import ChatMessage, FunctionCall, NamedToolChoice, ResponseFormat, ToolCall
@@ -47,10 +46,25 @@ def extract_images_from_messages(
     ``type == "image_url"`` has its URL fetched (HTTP or base64 data URI) and
     preprocessed through ``preprocess_qwen2_5_vl``.
 
+    The multimodal backend (which needs torchvision) is imported LAZILY, and only when
+    an image is actually present — so text-only requests, and this whole module, import
+    cleanly even in a build without torchvision. (Salvaged from the superseded #151
+    vision attempt; the merged #154 imported it at module top, which broke
+    ``request_helpers`` import entirely when torchvision was absent.)
+
     Returns:
         A list of preprocessing result dicts (``pixel_values``, ``image_grid_thw``),
         one per image in message order.
     """
+    has_images = any(
+        isinstance(msg.content, list)
+        and any(p.type == "image_url" and p.image_url is not None for p in msg.content)
+        for msg in messages
+    )
+    if not has_images:
+        return []
+    from ..multimodal import fetch_image, preprocess_qwen2_5_vl
+
     results: list[dict[str, torch.Tensor]] = []
     for msg in messages:
         if isinstance(msg.content, list):
