@@ -269,6 +269,7 @@ def _qwen3_next_hybrid_cfg_sd():
             sd[f"{la}.dt_bias"] = r(nv).float()
             sd[f"{la}.beta_proj.weight"] = r(nv, H)
             sd[f"{la}.dt_proj.weight"] = r(nv, H)
+            sd[f"{la}.z_proj.weight"] = r(nv * vd, H)
             sd[f"{la}.norm.weight"] = r(nv * vd)
         for w, d in (("gate", cfg.num_experts),):
             sd[f"{p}.mlp.gate.weight"] = r(d, H)

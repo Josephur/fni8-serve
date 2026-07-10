@@ -12,7 +12,12 @@ import torch
 
 pytest.importorskip("fni8")
 
-from fni8serve.convert import convert_hf_to_fni8, is_quantizable_linear, quantize_state_dict
+from fni8serve.convert import (
+    _remap_qwen3_next,
+    convert_hf_to_fni8,
+    is_quantizable_linear,
+    quantize_state_dict,
+)
 from fni8serve.loader import checkpoint_info, load_fni8_state_dict
 from fni8serve.models import ModelConfig, ModelRunner, build_model
 
@@ -282,3 +287,137 @@ def test_convert_hf_to_fni8_multi_shard_output_matches_single_shard(tmp_path):
     # header "arch" is the hardware target (sm70); the model arch lives in meta.
     assert info_one["arch"] == info_many["arch"]
     assert info_one["meta"]["arch"] == info_many["meta"]["arch"] == cfg.arch
+
+
+def _qwen3_next_cfg():
+    return ModelConfig(
+        arch="qwen3_next",
+        vocab_size=64,
+        hidden_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=64,
+        max_position_embeddings=64,
+        head_dim=32,
+        qk_norm=True,
+        tie_word_embeddings=True,
+        num_experts=2,
+        num_experts_per_tok=2,
+        moe_intermediate_size=64,
+        linear_attention=True,
+        full_attention_interval=1,
+        extra=dict(
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=4,
+        ),
+    )
+
+
+def _hf_fused_sd(cfg):
+    """Qwen3-Next state dict using the fused HF tensor names."""
+    H, nk, nv, kd, vd = (
+        cfg.hidden_size,
+        cfg.extra["linear_num_key_heads"],
+        cfg.extra["linear_num_value_heads"],
+        cfg.extra["linear_key_head_dim"],
+        cfg.extra["linear_value_head_dim"],
+    )
+    qk = nk * kd
+    v_dim = nv * vd
+    sd = {
+        "model.embed_tokens.weight": torch.randn(cfg.vocab_size, H, dtype=torch.float16),
+        "model.norm.weight": torch.randn(H, dtype=torch.float16),
+    }
+    for i in range(cfg.num_hidden_layers):
+        p = f"model.layers.{i}"
+        sd[f"{p}.input_layernorm.weight"] = torch.randn(H, dtype=torch.float16)
+        sd[f"{p}.post_attention_layernorm.weight"] = torch.randn(H, dtype=torch.float16)
+        la = f"{p}.linear_attn"
+        # Fused HF names
+        sd[f"{la}.in_proj_qkvz.weight"] = torch.randn(
+            qk + qk + v_dim + v_dim, H, dtype=torch.float16
+        )
+        sd[f"{la}.in_proj_ba.weight"] = torch.randn(2 * nv, H, dtype=torch.float16)
+        sd[f"{la}.conv1d.weight"] = torch.randn(qk + qk + v_dim, 4, dtype=torch.float16)
+        sd[f"{la}.out_proj.weight"] = torch.randn(H, v_dim, dtype=torch.float16)
+        sd[f"{la}.A_log"] = torch.randn(nv).float()
+        sd[f"{la}.dt_bias"] = torch.randn(nv).float()
+        sd[f"{la}.norm.weight"] = torch.randn(v_dim, dtype=torch.float16)
+    return sd
+
+
+def test_qwen3_next_hf_fused_names_remap():
+    """_remap_qwen3_next must split fused HF names into the per-name tensors the
+    builder expects (qkv_proj, z_proj, beta_proj, dt_proj, conv_weight)."""
+    cfg = _qwen3_next_cfg()
+    hf_sd = _hf_fused_sd(cfg)
+    mapped = _remap_qwen3_next(hf_sd, cfg)
+
+    H = cfg.hidden_size
+    nk = cfg.extra["linear_num_key_heads"]
+    nv = cfg.extra["linear_num_value_heads"]
+    kd = cfg.extra["linear_key_head_dim"]
+    vd = cfg.extra["linear_value_head_dim"]
+    qk = nk * kd
+    v_dim = nv * vd
+
+    # Fused names must be gone
+    assert not any("in_proj_qkvz" in k for k in mapped)
+    assert not any("in_proj_ba" in k for k in mapped)
+    assert not any("conv1d" in k for k in mapped)
+
+    # Builder-expected names must exist
+    la = "model.layers.0.linear_attn"
+    assert f"{la}.qkv_proj.weight" in mapped
+    assert f"{la}.z_proj.weight" in mapped
+    assert f"{la}.beta_proj.weight" in mapped
+    assert f"{la}.dt_proj.weight" in mapped
+    assert f"{la}.conv_weight" in mapped
+
+    # Shape checks
+    assert mapped[f"{la}.qkv_proj.weight"].shape == (qk + qk + v_dim, H)
+    assert mapped[f"{la}.z_proj.weight"].shape == (v_dim, H)
+    assert mapped[f"{la}.beta_proj.weight"].shape == (nv, H)
+    assert mapped[f"{la}.dt_proj.weight"].shape == (nv, H)
+    assert mapped[f"{la}.conv_weight"].shape == (qk + qk + v_dim, 4)
+
+    # Non-linear-attn tensors pass through unchanged
+    assert "model.embed_tokens.weight" in mapped
+    assert "model.norm.weight" in mapped
+    assert "model.layers.0.input_layernorm.weight" in mapped
+
+
+def test_qwen3_next_conv1d_trim_4part():
+    """conv1d.weight with 4 parts (including Z rows) is trimmed to 3 parts."""
+    cfg = _qwen3_next_cfg()
+    hf_sd = _hf_fused_sd(cfg)
+    H = cfg.hidden_size
+    nk = cfg.extra["linear_num_key_heads"]
+    nv = cfg.extra["linear_num_value_heads"]
+    kd = cfg.extra["linear_key_head_dim"]
+    vd = cfg.extra["linear_value_head_dim"]
+    qk = nk * kd
+    v_dim = nv * vd
+    qkv_dim = qk + qk + v_dim
+    # Replace with 4-part conv weight
+    hf_sd["model.layers.0.linear_attn.conv1d.weight"] = torch.randn(
+        qkv_dim + v_dim, 4, dtype=torch.float16
+    )
+    mapped = _remap_qwen3_next(hf_sd, cfg)
+    conv_w = mapped["model.layers.0.linear_attn.conv_weight"]
+    assert conv_w.shape == (qkv_dim, 4), f"expected ({qkv_dim}, 4) got {conv_w.shape}"
+
+
+def test_qwen3_next_remap_skips_other_archs():
+    """_remap_qwen3_next is a no-op for non-qwen3_next architectures."""
+    cfg = _cfg()
+    sd = _sd(cfg)
+    mapped = _remap_qwen3_next(sd, cfg)
+    # same keys, same tensors
+    assert set(mapped.keys()) == set(sd.keys())
+    for k in sd:
+        assert mapped[k] is sd[k]

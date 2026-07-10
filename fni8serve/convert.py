@@ -41,7 +41,16 @@ from .models.config import ModelConfig
 #   - `norm`: layernorm/rmsnorm gains (tiny, load-bearing).
 #   - MoE `router`/`.gate.weight`/`.wg.weight`: routing logits are sensitive and
 #     tiny (NOT the MLP `gate_proj`, which stays quantizable).
-_QUANT_DENY_SUBSTR = ("norm", "embed", "wte", "wpe", "rotary", "router", "relative_attention")
+_QUANT_DENY_SUBSTR = (
+    "norm",
+    "embed",
+    "wte",
+    "wpe",
+    "rotary",
+    "router",
+    "relative_attention",
+    "conv_weight",
+)
 _QUANT_DENY_SUFFIX = (".gate.weight", ".router.weight", ".wg.weight")
 
 
@@ -138,6 +147,58 @@ def _raw_dtype(w: torch.Tensor) -> torch.Tensor:
     return w16
 
 
+def _remap_qwen3_next(sd: dict, cfg: ModelConfig) -> dict:
+    """Rename HF fused tensor names to the per-name tensors the builder expects
+    for the Qwen3-Next hybrid linear-attention layers.
+
+    HF stores:
+      * ``in_proj_qkvz.weight``  — fused [qk+qk+nv*vd+nv*vd, H]
+      * ``in_proj_ba.weight``     — fused [nv+nv, H]
+      * ``conv1d.weight``         — [Wc, K]
+
+    Builder expects:
+      * ``qkv_proj.weight``  — first 3/4 of in_proj_qkvz  (QKV fused)
+      * ``z_proj.weight``    — last 1/4 of in_proj_qkvz   (output gate)
+      * ``beta_proj.weight`` — first half of in_proj_ba
+      * ``dt_proj.weight``   — second half of in_proj_ba
+      * ``conv_weight``      — conv1d.weight unchanged
+    """
+    if cfg.arch not in ("qwen3_next", "qwen3next", "Qwen3NextForCausalLM"):
+        return sd
+
+    x = cfg.extra
+    nk = x.get("linear_num_key_heads", 0)
+    nv = x.get("linear_num_value_heads", 0)
+    kd = x.get("linear_key_head_dim", 0)
+    vd = x.get("linear_value_head_dim", 0)
+    if not (nk and nv and kd and vd):
+        return sd
+
+    qk = nk * kd
+    v_dim = nv * vd
+    out = {}
+    for name, w in sd.items():
+        if ".linear_attn.in_proj_qkvz.weight" in name:
+            prefix = name.replace(".linear_attn.in_proj_qkvz.weight", "")
+            # Weight layout: [q, k, v, z] stacked on row (output) dim
+            qkv_w = w[: qk + qk + v_dim]
+            z_w = w[qk + qk + v_dim :]
+            out[f"{prefix}.linear_attn.qkv_proj.weight"] = qkv_w
+            out[f"{prefix}.linear_attn.z_proj.weight"] = z_w
+        elif ".linear_attn.in_proj_ba.weight" in name:
+            prefix = name.replace(".linear_attn.in_proj_ba.weight", "")
+            out[f"{prefix}.linear_attn.beta_proj.weight"] = w[:nv]
+            out[f"{prefix}.linear_attn.dt_proj.weight"] = w[nv:]
+        elif ".linear_attn.conv1d.weight" in name:
+            prefix = name.replace(".linear_attn.conv1d.weight", "")
+            # Trim to match qkv output dim (builder conv applies only to QKV, not Z)
+            qkv_dim = qk + qk + v_dim
+            out[f"{prefix}.linear_attn.conv_weight"] = w[:qkv_dim]
+        else:
+            out[name] = w
+    return out
+
+
 def convert_hf_to_fni8(
     hf_dir: str,
     out_path: str,
@@ -205,6 +266,7 @@ def convert_hf_to_fni8(
             shard_path = os.path.join(hf_dir, shard)
             try:
                 sd = load_file(shard_path)
+                sd = _remap_qwen3_next(sd, cfg)
                 q = quantize_state_dict(
                     sd,
                     weight_bits=weight_bits,

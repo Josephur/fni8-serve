@@ -17,6 +17,7 @@ recurrence — unambiguous and exact. The chunked WY/UT parallel form + its int8
 dp4a acceleration are Track 2 (fni8 csrc/): the chunk form needs the log-space
 stabilization real kernels use, so it lives with that kernel, not here.
 """
+
 from __future__ import annotations
 
 import torch
@@ -41,20 +42,23 @@ def recurrent_gated_delta_rule(q, k, v, beta, g, state=None):
     so a caller can carry `S` across chunked/decode calls instead of losing it."""
     B, H, L, Dk = q.shape
     Dv = v.shape[-1]
-    S = state if state is not None else torch.zeros(B, H, Dv, Dk, dtype=torch.float32,
-                                                     device=q.device)
+    S = (
+        state
+        if state is not None
+        else torch.zeros(B, H, Dv, Dk, dtype=torch.float32, device=q.device)
+    )
     alpha = g.exp().float()
     qf, kf, vf, bf = q.float(), k.float(), v.float(), beta.float()
     out = torch.empty(B, H, L, Dv, dtype=torch.float32, device=q.device)
     for t in range(L):
-        kt, vt, qt = kf[:, :, t], vf[:, :, t], qf[:, :, t]        # [B,H,D]
-        at = alpha[:, :, t][..., None, None]                     # [B,H,1,1]
-        bt = bf[:, :, t][..., None]                              # [B,H,1]
-        Sk = torch.einsum("bhvk,bhk->bhv", S, kt)                # S_{t-1} k_t
+        kt, vt, qt = kf[:, :, t], vf[:, :, t], qf[:, :, t]  # [B,H,D]
+        at = alpha[:, :, t][..., None, None]  # [B,H,1,1]
+        bt = bf[:, :, t][..., None]  # [B,H,1]
+        Sk = torch.einsum("bhvk,bhk->bhv", S, kt)  # S_{t-1} k_t
         erase = at * (bt * Sk)[..., None] * kt[..., None, :]
         write = (bt * vt)[..., None] * kt[..., None, :]
         S = at * S - erase + write
-        out[:, :, t] = torch.einsum("bhvk,bhk->bhv", S, qt)      # o_t = S_t q_t
+        out[:, :, t] = torch.einsum("bhvk,bhk->bhv", S, qt)  # o_t = S_t q_t
     return out.to(v.dtype), S
 
 
@@ -66,10 +70,25 @@ class GatedDeltaNetAttention(nn.Module):
     conv weight [width, kernel], out_proj, and the gated output RMSNorm gain.
     """
 
-    def __init__(self, cfg, *, qkv_proj: QTensor, out_proj: QTensor,
-                 conv_weight, a_log, dt_bias, beta_proj, gate_proj,
-                 norm_gain, num_k_heads, num_v_heads, key_dim, value_dim,
-                 conv_kernel=4):
+    def __init__(
+        self,
+        cfg,
+        *,
+        qkv_proj: QTensor,
+        out_proj: QTensor,
+        conv_weight,
+        a_log,
+        dt_bias,
+        beta_proj,
+        gate_proj,
+        norm_gain,
+        num_k_heads,
+        num_v_heads,
+        key_dim,
+        value_dim,
+        conv_kernel=4,
+        z_proj: QTensor | None = None,
+    ):
         super().__init__()
         self.nk, self.nv = num_k_heads, num_v_heads
         self.kd, self.vd = key_dim, value_dim
@@ -78,7 +97,9 @@ class GatedDeltaNetAttention(nn.Module):
         self.out_proj = LinearW8A8(out_proj)
         self.beta_proj = LinearW8A8(beta_proj)
         self.gate_proj = LinearW8A8(gate_proj)
-        self.register_buffer("conv_weight", conv_weight, persistent=False)   # [Wc, K]
+        if z_proj is not None:
+            self.z_proj = LinearW8A8(z_proj)
+        self.register_buffer("conv_weight", conv_weight, persistent=False)  # [Wc, K]
         self.A_log = nn.Parameter(a_log)
         self.dt_bias = nn.Parameter(dt_bias)
         self.norm = RMSNorm(value_dim, cfg.rms_norm_eps, norm_gain)
@@ -92,8 +113,8 @@ class GatedDeltaNetAttention(nn.Module):
         K = self.conv_kernel
         if tail is None:
             tail = x.new_zeros(B, K - 1, W)
-        xt = torch.cat([tail, x], dim=1)                          # [B,K-1+L,Wc]
-        new_tail = xt[:, -(K - 1):] if K > 1 else x.new_zeros(B, 0, W)
+        xt = torch.cat([tail, x], dim=1)  # [B,K-1+L,Wc]
+        new_tail = xt[:, -(K - 1) :] if K > 1 else x.new_zeros(B, 0, W)
         xt = F.conv1d(xt.transpose(1, 2), self.conv_weight.unsqueeze(1), groups=W)
         return F.silu(xt.transpose(1, 2)), new_tail
 
@@ -113,16 +134,19 @@ class GatedDeltaNetAttention(nn.Module):
         rep = self.nv // self.nk
         q = q.repeat_interleave(rep, dim=1)
         k = k.repeat_interleave(rep, dim=1)
-        beta = torch.sigmoid(self.beta_proj(hidden)).transpose(1, 2)         # [B,nv,L]...
+        beta = torch.sigmoid(self.beta_proj(hidden)).transpose(1, 2)  # [B,nv,L]...
         beta = beta.reshape(B, self.nv, L) if beta.dim() == 3 else beta
         dt = self.gate_proj(hidden).transpose(1, 2)
         g = -F.softplus(dt.float() + self.dt_bias.view(1, -1, 1)) * self.A_log.exp().view(1, -1, 1)
         state = cache.get_state(layer_idx) if cache is not None else None
-        o, state = recurrent_gated_delta_rule(q, k, v, beta.reshape(B, self.nv, L),
-                                              g.reshape(B, self.nv, L), state=state)
+        o, state = recurrent_gated_delta_rule(
+            q, k, v, beta.reshape(B, self.nv, L), g.reshape(B, self.nv, L), state=state
+        )
         if cache is not None:
             cache.set_state(layer_idx, state)
         o = self.norm(o.transpose(1, 2).reshape(B, L, self.nv * self.vd))
+        if hasattr(self, "z_proj"):
+            o = F.silu(self.z_proj(hidden)) * o
         return self.out_proj(o)
 
 
@@ -134,13 +158,16 @@ def lightning_attention(q, k, v, slopes, state=None):
     decode); defaults to zero. Returns (o [B,H,L,Dv], state_final [B,H,Dv,Dk])."""
     B, H, L, Dk = q.shape
     Dv = v.shape[-1]
-    S = state if state is not None else torch.zeros(B, H, Dv, Dk, dtype=torch.float32,
-                                                     device=q.device)
+    S = (
+        state
+        if state is not None
+        else torch.zeros(B, H, Dv, Dk, dtype=torch.float32, device=q.device)
+    )
     ratio = torch.exp(-slopes.float()).view(1, H, 1, 1)
     qf, kf, vf = q.float(), k.float(), v.float()
     out = torch.empty(B, H, L, Dv, dtype=torch.float32, device=q.device)
     for t in range(L):
-        S = ratio * S + vf[:, :, t][..., :, None] * kf[:, :, t][..., None, :]   # k^T v outer
+        S = ratio * S + vf[:, :, t][..., :, None] * kf[:, :, t][..., None, :]  # k^T v outer
         out[:, :, t] = torch.einsum("bhvk,bhk->bhv", S, qf[:, :, t])
     return out.to(v.dtype), S
 
@@ -161,7 +188,7 @@ class ShortConv(nn.Module):
         self.kernel = kernel
         self.in_proj = LinearW8A8(in_proj)
         self.out_proj = LinearW8A8(out_proj)
-        self.register_buffer("conv_weight", conv_weight, persistent=False)   # [dim, 1, k]
+        self.register_buffer("conv_weight", conv_weight, persistent=False)  # [dim, 1, k]
 
     def _conv(self, u, tail=None):
         """Causal depthwise conv1d(k) over the last dimension of `u` [B,D,L]. `tail`:
@@ -172,16 +199,16 @@ class ShortConv(nn.Module):
         K = self.kernel
         if tail is None:
             tail = u.new_zeros(B, D, K - 1)
-        u_ext = torch.cat([tail, u], dim=-1)                      # [B,D,K-1+L]
-        new_tail = u_ext[:, :, -(K - 1):] if K > 1 else u.new_zeros(B, D, 0)
+        u_ext = torch.cat([tail, u], dim=-1)  # [B,D,K-1+L]
+        new_tail = u_ext[:, :, -(K - 1) :] if K > 1 else u.new_zeros(B, D, 0)
         y = F.conv1d(u_ext, self.conv_weight, groups=D).transpose(1, 2)
         return y, new_tail
 
     def forward(self, x, positions=None, ctx=None, layer_idx=0):
         B, L, _ = x.shape
-        bcx = self.in_proj(x)                                    # [B,L,3D]
+        bcx = self.in_proj(x)  # [B,L,3D]
         Bg, Cg, xg = bcx.chunk(3, dim=-1)
-        u = (Bg * xg).transpose(1, 2)                            # [B,D,L]
+        u = (Bg * xg).transpose(1, 2)  # [B,D,L]
         cache = ctx.lin_cache if ctx is not None else None
         tail = cache.get_conv_tail(layer_idx) if cache is not None else None
         y, new_tail = self._conv(u, tail)

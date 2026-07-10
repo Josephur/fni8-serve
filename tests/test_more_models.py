@@ -96,6 +96,7 @@ def _qwen3_next_hybrid_cfg_sd():
         else:  # linear (DeltaNet)
             la = f"{p}.linear_attn"
             sd[f"{la}.qkv_proj.weight"] = _r(qkv_lin, H)
+            sd[f"{la}.z_proj.weight"] = _r(nv * vd, H)
             sd[f"{la}.out_proj.weight"] = _r(H, nv * vd)
             sd[f"{la}.conv_weight"] = _r(qkv_lin, 4)
             sd[f"{la}.A_log"] = _r(nv).float()
