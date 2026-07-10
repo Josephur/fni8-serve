@@ -39,14 +39,42 @@ class EngineRunner:
         if enable_cuda_graph is None:
             enable_cuda_graph = cuda_graph_enabled_by_env()
         self.graphed = GraphedDecode(model, cache, device=device) if enable_cuda_graph else None
+        # Persistent host/device staging for the per-step sampling params (issue #183):
+        # `temps`/`top_p` used to be rebuilt every step with `torch.tensor(list,
+        # device=cuda)` -- a blocking pageable host->device copy per step. We keep a
+        # pinned host buffer filled in place + a non_blocking copy into a persistent
+        # device tensor instead. Grown lazily to the batch size actually seen.
+        self._pin = device != "cpu" and torch.cuda.is_available()
+        self._temps_host: torch.Tensor | None = None
+        self._top_p_host: torch.Tensor | None = None
+        self._temps_dev: torch.Tensor | None = None
+        self._top_p_dev: torch.Tensor | None = None
+
+    def _ensure_sample_buffers(self, n: int):
+        if self._temps_host is not None and self._temps_host.numel() >= n:
+            return
+        self._temps_host = torch.empty(n, dtype=torch.float32, pin_memory=self._pin)
+        self._top_p_host = torch.empty(n, dtype=torch.float32, pin_memory=self._pin)
+        self._temps_dev = torch.empty(n, dtype=torch.float32, device=self.device)
+        self._top_p_dev = torch.empty(n, dtype=torch.float32, device=self.device)
 
     def _sample(self, logits: torch.Tensor, batch: list[Sequence]) -> list[int]:
-        temps = torch.tensor(
-            [s.params.temperature for s in batch], device=self.device, dtype=torch.float32
-        )
-        top_p = torch.tensor(
-            [s.params.top_p for s in batch], device=self.device, dtype=torch.float32
-        )
+        n = len(batch)
+        self._ensure_sample_buffers(n)
+        temp_vals = [s.params.temperature for s in batch]
+        top_p_vals = [s.params.top_p for s in batch]
+        # Fill the pinned host slice in place, then async-copy the used slice to the
+        # persistent device tensor -- no per-step device allocation, no blocking H2D.
+        self._temps_host[:n].copy_(torch.tensor(temp_vals, dtype=torch.float32))
+        self._top_p_host[:n].copy_(torch.tensor(top_p_vals, dtype=torch.float32))
+        temps = self._temps_dev[:n]
+        top_p = self._top_p_dev[:n]
+        temps.copy_(self._temps_host[:n], non_blocking=self._pin)
+        top_p.copy_(self._top_p_host[:n], non_blocking=self._pin)
+        # Decide greedy / top-p short-circuits from the python params (no device sync)
+        # and hand the sampler the answer so its fast path stays sync-free.
+        all_greedy = all(t == 0.0 for t in temp_vals)
+        any_top_p = any(p < 1.0 for p in top_p_vals)
         procs = [s.params.logit_processors for s in batch]
         has_procs = any(procs)
         toks = self.sampler(
@@ -55,7 +83,11 @@ class EngineRunner:
             top_p=top_p,
             logit_processors=procs if has_procs else None,
             input_ids=[s.all_token_ids for s in batch] if has_procs else None,
+            all_greedy=all_greedy,
+            any_top_p=any_top_p,
         )
+        # The one necessary device->host readback: the caller (llm_engine) appends
+        # these as python ints. Sampling itself stays fully on-device above.
         return toks.tolist()
 
     @torch.inference_mode()

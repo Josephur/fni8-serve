@@ -36,6 +36,7 @@ cannot be represented in a CUDA graph. `_check_supported` detects this up
 front from the model config; unsupported models fall back to eager decode
 for every step (logged once).
 """
+
 from __future__ import annotations
 
 import logging
@@ -49,8 +50,8 @@ from .sequence import Sequence
 log = logging.getLogger(__name__)
 
 DEFAULT_BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
-DEFAULT_CONTEXT_BUCKET_SIZE = 128     # context-length bucket granularity (rounds up)
-DEFAULT_MAX_GRAPHS = 32               # cap the captured-graph set (each pins its own workspace)
+DEFAULT_CONTEXT_BUCKET_SIZE = 128  # context-length bucket granularity (rounds up)
+DEFAULT_MAX_GRAPHS = 32  # cap the captured-graph set (each pins its own workspace)
 _WARMUP_ITERS = 3
 
 
@@ -75,20 +76,54 @@ def _round_up(n: int, multiple: int) -> int:
 
 
 class _CapturedGraph:
-    __slots__ = ("graph", "ids", "pos", "slot_mapping", "block_table", "context_lens",
-                 "logits", "batch_bucket", "context_bucket")
+    __slots__ = (
+        "graph",
+        "ids",
+        "pos",
+        "slot_mapping",
+        "block_table",
+        "context_lens",
+        "logits",
+        "batch_bucket",
+        "context_bucket",
+        "ids_host",
+        "pos_host",
+        "context_lens_host",
+    )
 
-    def __init__(self, *, graph, ids, pos, slot_mapping, block_table, context_lens, logits,
-                 batch_bucket, context_bucket):
+    def __init__(
+        self,
+        *,
+        graph,
+        ids,
+        pos,
+        slot_mapping,
+        block_table,
+        context_lens,
+        logits,
+        batch_bucket,
+        context_bucket,
+        ids_host,
+        pos_host,
+        context_lens_host,
+    ):
         self.graph = graph
         self.ids = ids
         self.pos = pos
         self.slot_mapping = slot_mapping
         self.block_table = block_table
         self.context_lens = context_lens
-        self.logits = logits            # static output buffer -- read it before the next replay()
+        self.logits = logits  # static output buffer -- read it before the next replay()
         self.batch_bucket = batch_bucket
         self.context_bucket = context_bucket
+        # Pinned host staging (issue #183): the per-step ids/pos/context_lens refresh
+        # fills these in place then non_blocking-copies into the captured device
+        # buffers above, instead of rebuilding `torch.tensor(list, device=cuda)` (a
+        # blocking pageable H2D) every step. The device buffers keep the SAME pointer
+        # the graph captured -- we only ever mutate their contents in place.
+        self.ids_host = ids_host
+        self.pos_host = pos_host
+        self.context_lens_host = context_lens_host
 
 
 class GraphedDecode:
@@ -97,10 +132,16 @@ class GraphedDecode:
     eager `EngineRunner.decode`) on a miss: unsupported model, batch larger
     than the widest bucket, or the captured-graph cap already reached."""
 
-    def __init__(self, model, cache, *, device: str = "cuda",
-                 batch_buckets: tuple[int, ...] = DEFAULT_BATCH_BUCKETS,
-                 context_bucket_size: int = DEFAULT_CONTEXT_BUCKET_SIZE,
-                 max_graphs: int = DEFAULT_MAX_GRAPHS):
+    def __init__(
+        self,
+        model,
+        cache,
+        *,
+        device: str = "cuda",
+        batch_buckets: tuple[int, ...] = DEFAULT_BATCH_BUCKETS,
+        context_bucket_size: int = DEFAULT_CONTEXT_BUCKET_SIZE,
+        max_graphs: int = DEFAULT_MAX_GRAPHS,
+    ):
         self.model = model
         self.cache = cache
         self.device = device
@@ -128,8 +169,11 @@ class GraphedDecode:
             return False, "linear/latent-attention decode isn't wired for static capture"
         for i in range(cfg.num_hidden_layers):
             if cfg.attention_kind(i) != "full":
-                return False, f"layer {i} uses the '{cfg.attention_kind(i)}' attention backend " \
-                              "(sliding-window decode is a data-dependent python-loop fallback)"
+                return (
+                    False,
+                    f"layer {i} uses the '{cfg.attention_kind(i)}' attention backend "
+                    "(sliding-window decode is a data-dependent python-loop fallback)",
+                )
         return True, ""
 
     def _scratch(self) -> int:
@@ -152,8 +196,11 @@ class GraphedDecode:
         B = len(batch)
         batch_bucket = _next_bucket(self.batch_buckets, B)
         if batch_bucket is None:
-            log.info("cuda-graph decode miss: batch size %d exceeds largest bucket %d",
-                     B, self.batch_buckets[-1])
+            log.info(
+                "cuda-graph decode miss: batch size %d exceeds largest bucket %d",
+                B,
+                self.batch_buckets[-1],
+            )
             return None
         max_real_ctx = max(s.length for s in batch) + 1
         cap = self.cache.max_blocks_per_seq * self.cache.block_size
@@ -163,14 +210,22 @@ class GraphedDecode:
         g = self._graphs.get(key)
         if g is None:
             if len(self._graphs) >= self.max_graphs:
-                log.warning("cuda-graph decode miss: bucket cap (%d graphs) reached, "
-                            "not capturing batch=%d max_context=%d",
-                            self.max_graphs, batch_bucket, context_bucket)
+                log.warning(
+                    "cuda-graph decode miss: bucket cap (%d graphs) reached, "
+                    "not capturing batch=%d max_context=%d",
+                    self.max_graphs,
+                    batch_bucket,
+                    context_bucket,
+                )
                 return None
             g = self._capture(batch_bucket, context_bucket)
             self._graphs[key] = g
-            log.info("cuda-graph decode: captured bucket batch=%d max_context=%d "
-                     "(%d graphs total)", batch_bucket, context_bucket, len(self._graphs))
+            log.info(
+                "cuda-graph decode: captured bucket batch=%d max_context=%d (%d graphs total)",
+                batch_bucket,
+                context_bucket,
+                len(self._graphs),
+            )
 
         self._fill_inputs(g, batch)
         g.graph.replay()
@@ -187,9 +242,14 @@ class GraphedDecode:
         block_table = cache.block_table([scratch] * batch_bucket)
         context_lens = torch.ones(batch_bucket, dtype=torch.int32, device=self.device)
 
-        ctx = ForwardContext(is_prefill=False, kv_cache=cache, slot_mapping=slot_mapping,
-                             block_tables=block_table, context_lens=context_lens,
-                             max_context_len=context_bucket)
+        ctx = ForwardContext(
+            is_prefill=False,
+            kv_cache=cache,
+            slot_mapping=slot_mapping,
+            block_tables=block_table,
+            context_lens=context_lens,
+            max_context_len=context_bucket,
+        )
 
         # Standard two-phase capture (PyTorch CUDA-graph guidance): warm up a few
         # iterations on a side stream first so the caching allocator reaches a
@@ -211,9 +271,25 @@ class GraphedDecode:
             hidden = self.model(ids, pos, ctx)
             logits = self.model.compute_logits(hidden[:, -1])
 
-        return _CapturedGraph(graph=graph, ids=ids, pos=pos, slot_mapping=slot_mapping,
-                              block_table=block_table, context_lens=context_lens, logits=logits,
-                              batch_bucket=batch_bucket, context_bucket=context_bucket)
+        pin = self.device != "cpu" and torch.cuda.is_available()
+        ids_host = torch.empty(batch_bucket, 1, dtype=torch.long, pin_memory=pin)
+        pos_host = torch.empty(batch_bucket, 1, dtype=torch.long, pin_memory=pin)
+        context_lens_host = torch.empty(batch_bucket, dtype=torch.int32, pin_memory=pin)
+
+        return _CapturedGraph(
+            graph=graph,
+            ids=ids,
+            pos=pos,
+            slot_mapping=slot_mapping,
+            block_table=block_table,
+            context_lens=context_lens,
+            logits=logits,
+            batch_bucket=batch_bucket,
+            context_bucket=context_bucket,
+            ids_host=ids_host,
+            pos_host=pos_host,
+            context_lens_host=context_lens_host,
+        )
 
     # -- per-step input refresh (eager -- runs before replay(), not captured) ----
     def _fill_inputs(self, g: _CapturedGraph, batch: list[Sequence]):
@@ -228,12 +304,25 @@ class GraphedDecode:
 
         slots = real_slots + [scratch] * pad
         lengths = real_lengths + [0] * pad
-        ids_list = [[s.last_token] for s in batch] + [[0]] * pad
-        pos_list = [[s.length] for s in batch] + [[0]] * pad
 
-        g.ids.copy_(torch.tensor(ids_list, dtype=torch.long, device=self.device))
-        g.pos.copy_(torch.tensor(pos_list, dtype=torch.long, device=self.device))
-        g.slot_mapping.copy_(cache.slot_mapping_for(slots, lengths))
-        g.block_table.copy_(cache.block_table(slots))
-        g.context_lens.copy_(
-            torch.tensor([n + 1 for n in lengths], dtype=torch.int32, device=self.device))
+        # Fill the pinned host staging in place (CPU-only work, no GPU sync): real
+        # rows carry the sequence's next token / position / context length, pad rows
+        # are inert (id 0, pos 0, context_len 1 -- always point at the scratch slot).
+        pin = g.ids_host.is_pinned() if hasattr(g.ids_host, "is_pinned") else False
+        g.ids_host[:B, 0].copy_(torch.tensor([s.last_token for s in batch], dtype=torch.long))
+        g.pos_host[:B, 0].copy_(torch.tensor([s.length for s in batch], dtype=torch.long))
+        g.context_lens_host[:B].copy_(
+            torch.tensor([s.length + 1 for s in batch], dtype=torch.int32)
+        )
+        if pad:
+            g.ids_host[B:, 0].zero_()
+            g.pos_host[B:, 0].zero_()
+            g.context_lens_host[B:].fill_(1)
+
+        # One non_blocking H2D per buffer, into the SAME device tensor the graph
+        # captured (contents mutated in place -- pointer preserved for replay).
+        g.ids.copy_(g.ids_host, non_blocking=pin)
+        g.pos.copy_(g.pos_host, non_blocking=pin)
+        g.context_lens.copy_(g.context_lens_host, non_blocking=pin)
+        cache.fill_slot_mapping(g.slot_mapping, slots, lengths)
+        cache.fill_block_table(g.block_table, slots)

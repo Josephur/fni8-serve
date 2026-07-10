@@ -63,6 +63,15 @@ class PagedKVCache:
         self._slot_blocks: list[list[int]] = [[] for _ in range(num_slots)]
         self._block_refcount: dict[int, int] = {}
         self._prefix_trie: dict = {}
+        # Pinned host staging for the CUDA-graph decode hot path (issue #183): the
+        # per-step slot-mapping / block-table used to be rebuilt with
+        # `torch.tensor(list, device=cuda)` (a blocking pageable H2D) then D2D-copied
+        # into the captured graph buffers. `fill_slot_mapping` / `fill_block_table`
+        # fill these pinned buffers in place and issue ONE non_blocking copy into the
+        # caller's persistent device tensor. Allocated lazily / grown on demand.
+        self._pin = device != "cpu" and torch.cuda.is_available()
+        self._slot_map_host: torch.Tensor | None = None
+        self._block_table_host: torch.Tensor | None = None
 
     def alloc(self) -> int:
         if not self._free_slots:
@@ -168,6 +177,40 @@ class PagedKVCache:
     # step, reused across every layer) instead of going through `write_decode`.
     def slot_mapping_for(self, slots: list[int], positions: list[int]) -> torch.Tensor:
         return self._slot_mapping(slots, positions)
+
+    def _ensure_decode_staging(self, batch_size: int):
+        if self._slot_map_host is None or self._slot_map_host.numel() < batch_size:
+            self._slot_map_host = torch.empty(batch_size, dtype=torch.int32, pin_memory=self._pin)
+        if self._block_table_host is None or self._block_table_host.shape[0] < batch_size:
+            self._block_table_host = torch.zeros(
+                batch_size, self.max_blocks_per_seq, dtype=torch.int32, pin_memory=self._pin
+            )
+
+    def fill_slot_mapping(self, dst: torch.Tensor, slots: list[int], positions: list[int]):
+        """Refresh the CUDA-graph decode slot-mapping buffer `dst` in place (same
+        device pointer the graph captured) via a pinned host staging buffer + one
+        non_blocking copy -- no per-step device allocation, no blocking H2D."""
+        n = len(slots)
+        self._ensure_decode_staging(n)
+        bs = self.block_size
+        flat = [self._slot_blocks[s][p // bs] * bs + p % bs for s, p in zip(slots, positions)]
+        self._slot_map_host[:n].copy_(torch.tensor(flat, dtype=torch.int32))
+        dst.copy_(self._slot_map_host[:n], non_blocking=self._pin)
+
+    def fill_block_table(self, dst: torch.Tensor, slots: list[int]):
+        """Refresh the CUDA-graph decode block-table buffer `dst` in place via a
+        pinned host staging buffer + one non_blocking copy (companion to
+        `fill_slot_mapping`). Rows shorter than the widest sequence are zero-padded
+        (never read: the kernel gates every read by `context_lens`)."""
+        n = len(slots)
+        self._ensure_decode_staging(n)
+        host = self._block_table_host[:n]
+        host.zero_()
+        for i, s in enumerate(slots):
+            blocks = self._slot_blocks[s]
+            if blocks:
+                host[i, : len(blocks)] = torch.tensor(blocks, dtype=torch.int32)
+        dst.copy_(host, non_blocking=self._pin)
 
     def write_prefill(
         self, layer: int, k: torch.Tensor, v: torch.Tensor, *, slot: int, start: int = 0
