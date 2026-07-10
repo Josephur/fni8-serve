@@ -3,11 +3,15 @@
 (`app.py`) and the offline `/v1/batches` endpoint (`batches.py`), so a batch line
 builds its prompt / sampling-params / tool-call handling exactly the same way a
 live HTTP request does (issue #40's tools-aware chat formatting included)."""
+
 from __future__ import annotations
 
 import json
 
+import torch
+
 from ..engine.sequence import SamplingParams
+from ..multimodal import fetch_image, preprocess_qwen2_5_vl
 from ..structured import GrammarCompilerCache
 from ..tool_calls import get_tool_call_parser, parse_forced_tool_call
 from .schemas import ChatMessage, FunctionCall, NamedToolChoice, ResponseFormat, ToolCall
@@ -24,16 +28,45 @@ def message_dict(m: ChatMessage) -> dict:
             {
                 "id": tc.id,
                 "type": tc.type,
-                "function": {"name": tc.function.name,
-                             "arguments": json.loads(tc.function.arguments)},
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": json.loads(tc.function.arguments),
+                },
             }
             for tc in m.tool_calls
         ]
     return d
 
 
-def chat_prompt_ids(tokenizer, messages: list[ChatMessage], chat_template: str | None = None,
-                    tools: list[dict] | None = None) -> list[int]:
+def extract_images_from_messages(
+    messages: list[ChatMessage],
+) -> list[dict[str, torch.Tensor]]:
+    """Extract and preprocess ``image_url`` content parts from chat messages.
+
+    For each message whose ``content`` is a list of ``ContentPart``, any part with
+    ``type == "image_url"`` has its URL fetched (HTTP or base64 data URI) and
+    preprocessed through ``preprocess_qwen2_5_vl``.
+
+    Returns:
+        A list of preprocessing result dicts (``pixel_values``, ``image_grid_thw``),
+        one per image in message order.
+    """
+    results: list[dict[str, torch.Tensor]] = []
+    for msg in messages:
+        if isinstance(msg.content, list):
+            for part in msg.content:
+                if part.type == "image_url" and part.image_url is not None:
+                    pil = fetch_image(part.image_url.url)
+                    results.append(preprocess_qwen2_5_vl(pil))
+    return results
+
+
+def chat_prompt_ids(
+    tokenizer,
+    messages: list[ChatMessage],
+    chat_template: str | None = None,
+    tools: list[dict] | None = None,
+) -> list[int]:
     kwargs = {"tokenize": True, "add_generation_prompt": True}
     if chat_template is not None:
         kwargs["chat_template"] = chat_template
@@ -43,8 +76,10 @@ def chat_prompt_ids(tokenizer, messages: list[ChatMessage], chat_template: str |
 
 
 def build_logit_processors(
-    grammars: GrammarCompilerCache, tokenizer,
-    response_format: ResponseFormat | None, grammar: str | None,
+    grammars: GrammarCompilerCache,
+    tokenizer,
+    response_format: ResponseFormat | None,
+    grammar: str | None,
 ) -> list | None:
     """Builds a request's structured-output `LogitsProcessor` (issue #39), if any --
     `grammar` wins over `response_format` when both are given."""
@@ -59,10 +94,17 @@ def build_logit_processors(
 
 
 def sampling_params(
-    temperature: float, top_p: float, max_tokens: int | None, logit_processors: list | None = None,
+    temperature: float,
+    top_p: float,
+    max_tokens: int | None,
+    logit_processors: list | None = None,
 ) -> SamplingParams:
-    return SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens or 16,
-                          logit_processors=logit_processors)
+    return SamplingParams(
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens or 16,
+        logit_processors=logit_processors,
+    )
 
 
 def tool_choice_forced(tool_choice: str | NamedToolChoice | None) -> bool:

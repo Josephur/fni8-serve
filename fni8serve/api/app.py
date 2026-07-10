@@ -15,11 +15,13 @@ a custom template gets no more code-execution power than the model's own.
 `EngineWorker`, so offline batch traffic and live HTTP traffic share one
 continuous-batching loop instead of contending for the engine.
 """
+
 from __future__ import annotations
 
 import math
 from collections.abc import AsyncIterator
 
+import torch
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 
@@ -29,6 +31,7 @@ from .batches import register_batch_routes
 from .request_helpers import (
     build_logit_processors,
     chat_prompt_ids,
+    extract_images_from_messages,
     forced_tool_message,
     parsed_tool_message,
     sampling_params,
@@ -62,8 +65,14 @@ from .schemas import (
 )
 
 
-def create_app(engine, tokenizer, *, served_model_name: str,
-               chat_template: str | None = None, tool_parser: str = "hermes") -> FastAPI:
+def create_app(
+    engine,
+    tokenizer,
+    *,
+    served_model_name: str,
+    chat_template: str | None = None,
+    tool_parser: str = "hermes",
+) -> FastAPI:
     """`engine` needs `.add_request`, `.step`, `.sequence`, `.forget`, `.eos_id`
     (an `LLMEngine`, or a test double with the same seam). `tokenizer` needs
     `.apply_chat_template`, `.encode`, `.decode` (an HF `PreTrainedTokenizerBase`).
@@ -92,21 +101,30 @@ def create_app(engine, tokenizer, *, served_model_name: str,
         logit_processors = _logit_processors(req.response_format, req.grammar)
         forced = wants_tools and tool_choice_forced(req.tool_choice)
         if forced:
-            tool_choice = (req.tool_choice.model_dump()
-                          if isinstance(req.tool_choice, NamedToolChoice) else req.tool_choice)
+            tool_choice = (
+                req.tool_choice.model_dump()
+                if isinstance(req.tool_choice, NamedToolChoice)
+                else req.tool_choice
+            )
             _, schema = forced_tool_schema(tools_wire, tool_choice)
             logit_processors = [grammars.for_json_schema(tokenizer, schema)]
 
         prompt_ids = chat_prompt_ids(tokenizer, req.messages, chat_template, tools=tools_wire)
         params = sampling_params(req.temperature, req.top_p, req.max_tokens, logit_processors)
 
+        # Issue #151: extract and preprocess image_url content parts
+        image_results = extract_images_from_messages(req.messages)
+        pixel_values = image_results[0]["pixel_values"] if image_results else None
+
         if req.stream:
             return StreamingResponse(
-                _chat_stream(worker, tokenizer, prompt_ids, params, req.model),
+                _chat_stream(
+                    worker, tokenizer, prompt_ids, params, req.model, pixel_values=pixel_values
+                ),
                 media_type="text/event-stream",
             )
 
-        output_ids, reason = await _generate(worker, prompt_ids, params)
+        output_ids, reason = await _generate(worker, prompt_ids, params, pixel_values=pixel_values)
         text = tokenizer.decode(output_ids, skip_special_tokens=True)
 
         if forced:
@@ -119,16 +137,23 @@ def create_app(engine, tokenizer, *, served_model_name: str,
         return ChatCompletionResponse(
             model=req.model,
             choices=[ChatCompletionResponseChoice(message=message, finish_reason=reason)],
-            usage=UsageInfo(prompt_tokens=len(prompt_ids), completion_tokens=len(output_ids),
-                            total_tokens=len(prompt_ids) + len(output_ids)),
+            usage=UsageInfo(
+                prompt_tokens=len(prompt_ids),
+                completion_tokens=len(output_ids),
+                total_tokens=len(prompt_ids) + len(output_ids),
+            ),
         )
 
     @app.post("/v1/completions")
     async def completions(req: CompletionRequest):
         prompt = req.prompt if isinstance(req.prompt, str) else req.prompt[0]
         prompt_ids = tokenizer.encode(prompt)
-        params = sampling_params(req.temperature, req.top_p, req.max_tokens,
-                                 _logit_processors(req.response_format, req.grammar))
+        params = sampling_params(
+            req.temperature,
+            req.top_p,
+            req.max_tokens,
+            _logit_processors(req.response_format, req.grammar),
+        )
 
         if req.stream:
             return StreamingResponse(
@@ -141,8 +166,11 @@ def create_app(engine, tokenizer, *, served_model_name: str,
         return CompletionResponse(
             model=req.model,
             choices=[CompletionResponseChoice(text=text, finish_reason=reason)],
-            usage=UsageInfo(prompt_tokens=len(prompt_ids), completion_tokens=len(output_ids),
-                            total_tokens=len(prompt_ids) + len(output_ids)),
+            usage=UsageInfo(
+                prompt_tokens=len(prompt_ids),
+                completion_tokens=len(output_ids),
+                total_tokens=len(prompt_ids) + len(output_ids),
+            ),
         )
 
     @app.post("/v1/embeddings")
@@ -160,9 +188,9 @@ def create_app(engine, tokenizer, *, served_model_name: str,
         return EmbeddingResponse(
             model=req.model,
             data=all_data,
-            usage=UsageInfo(prompt_tokens=total_tokens,
-                            completion_tokens=0,
-                            total_tokens=total_tokens),
+            usage=UsageInfo(
+                prompt_tokens=total_tokens, completion_tokens=0, total_tokens=total_tokens
+            ),
         )
 
     @app.post("/v1/rerank")
@@ -174,32 +202,37 @@ def create_app(engine, tokenizer, *, served_model_name: str,
             prompt_ids = tokenizer.encode(text)
             embedding = worker.encode(prompt_ids)
             score = 1.0 / (1.0 + math.exp(-embedding[0]))
-            results.append(RerankResult(
-                index=i, relevance_score=score, document=RerankDocument(text=doc)))
+            results.append(
+                RerankResult(index=i, relevance_score=score, document=RerankDocument(text=doc))
+            )
             total_tokens += len(prompt_ids)
         results.sort(key=lambda r: r.relevance_score, reverse=True)
         if req.top_n is not None:
-            results = results[:req.top_n]
+            results = results[: req.top_n]
         return RerankResponse(
             model=req.model,
             data=results,
-            usage=UsageInfo(prompt_tokens=total_tokens,
-                            completion_tokens=0,
-                            total_tokens=total_tokens),
+            usage=UsageInfo(
+                prompt_tokens=total_tokens, completion_tokens=0, total_tokens=total_tokens
+            ),
         )
 
-    register_batch_routes(app, worker, tokenizer, grammars, chat_template=chat_template,
-                          tool_parser=tool_parser)
+    register_batch_routes(
+        app, worker, tokenizer, grammars, chat_template=chat_template, tool_parser=tool_parser
+    )
 
     return app
 
 
 async def _generate(
-    worker: EngineWorker, prompt_ids: list[int], params,
+    worker: EngineWorker,
+    prompt_ids: list[int],
+    params,
+    pixel_values: torch.Tensor | None = None,
 ) -> tuple[list[int], str]:
     ids: list[int] = []
     reason = "stop"
-    async for item in worker.stream(prompt_ids, params):
+    async for item in worker.stream(prompt_ids, params, pixel_values=pixel_values):
         if isinstance(item, Done):
             reason = item.reason
         else:
@@ -207,9 +240,11 @@ async def _generate(
     return ids, reason
 
 
-async def _chat_stream(worker, tokenizer, prompt_ids, params, model) -> AsyncIterator[str]:
+async def _chat_stream(
+    worker, tokenizer, prompt_ids, params, model, pixel_values: torch.Tensor | None = None
+) -> AsyncIterator[str]:
     first, prev_text, ids = True, "", []
-    async for item in worker.stream(prompt_ids, params):
+    async for item in worker.stream(prompt_ids, params, pixel_values=pixel_values):
         if isinstance(item, Done):
             choice = ChatCompletionChunkChoice(delta=DeltaMessage(), finish_reason=item.reason)
             chunk = ChatCompletionChunk(model=model, choices=[choice])
@@ -217,13 +252,16 @@ async def _chat_stream(worker, tokenizer, prompt_ids, params, model) -> AsyncIte
             break
         ids.append(item)
         text = tokenizer.decode(ids, skip_special_tokens=True)
-        delta = text[len(prev_text):]
+        delta = text[len(prev_text) :]
         prev_text = text
         if delta:
             chunk = ChatCompletionChunk(
                 model=model,
-                choices=[ChatCompletionChunkChoice(
-                    delta=DeltaMessage(role="assistant" if first else None, content=delta))],
+                choices=[
+                    ChatCompletionChunkChoice(
+                        delta=DeltaMessage(role="assistant" if first else None, content=delta)
+                    )
+                ],
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
             first = False
@@ -235,12 +273,13 @@ async def _completion_stream(worker, tokenizer, prompt_ids, params, model) -> As
     async for item in worker.stream(prompt_ids, params):
         if isinstance(item, Done):
             chunk = CompletionChunk(
-                model=model, choices=[CompletionChunkChoice(text="", finish_reason=item.reason)])
+                model=model, choices=[CompletionChunkChoice(text="", finish_reason=item.reason)]
+            )
             yield f"data: {chunk.model_dump_json()}\n\n"
             break
         ids.append(item)
         text = tokenizer.decode(ids, skip_special_tokens=True)
-        delta = text[len(prev_text):]
+        delta = text[len(prev_text) :]
         prev_text = text
         if delta:
             chunk = CompletionChunk(model=model, choices=[CompletionChunkChoice(text=delta)])

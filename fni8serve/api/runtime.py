@@ -8,6 +8,7 @@ engine's continuous-batching loop -- exactly what `LLMEngine.generate()` does fo
 list of prompts, just fed incrementally over time (as HTTP requests arrive) instead
 of all at once.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -16,12 +17,15 @@ import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
+import torch
+
 from ..engine.sequence import SamplingParams, Status
 
 
 @dataclass
 class Done:
     """Sentinel yielded (once, last) by `EngineWorker.stream` when a request finishes."""
+
     reason: str
 
 
@@ -29,6 +33,7 @@ class Done:
 class _PendingRequest:
     prompt_ids: list[int]
     params: SamplingParams
+    pixel_values: torch.Tensor | None = None
     out_queue: queue.Queue = field(default_factory=queue.Queue)
     seq_id: int | None = None
     sent: int = 0
@@ -41,10 +46,15 @@ class EngineWorker:
         self._pending: dict[int, _PendingRequest] = {}
         threading.Thread(target=self._run, daemon=True, name="fni8serve-engine").start()
 
-    def submit(self, prompt_ids: list[int], params: SamplingParams) -> queue.Queue:
+    def submit(
+        self,
+        prompt_ids: list[int],
+        params: SamplingParams,
+        pixel_values: torch.Tensor | None = None,
+    ) -> queue.Queue:
         """Enqueue a generation request; returns the queue it will be streamed onto
         (token ids, terminated by a single `Done`)."""
-        req = _PendingRequest(prompt_ids, params)
+        req = _PendingRequest(prompt_ids, params, pixel_values=pixel_values)
         self._inbox.put(req)
         return req.out_queue
 
@@ -53,9 +63,12 @@ class EngineWorker:
         return self.engine.encode(prompt_ids)
 
     async def stream(
-        self, prompt_ids: list[int], params: SamplingParams,
+        self,
+        prompt_ids: list[int],
+        params: SamplingParams,
+        pixel_values: torch.Tensor | None = None,
     ) -> AsyncIterator[int | Done]:
-        out_q = self.submit(prompt_ids, params)
+        out_q = self.submit(prompt_ids, params, pixel_values=pixel_values)
         loop = asyncio.get_running_loop()
         while True:
             item = await loop.run_in_executor(None, out_q.get)
@@ -66,7 +79,7 @@ class EngineWorker:
     def _run(self) -> None:
         while True:
             if not self._pending:
-                self._register(self._inbox.get())    # idle: block for the next request
+                self._register(self._inbox.get())  # idle: block for the next request
             while True:
                 try:
                     self._register(self._inbox.get_nowait())
@@ -77,6 +90,9 @@ class EngineWorker:
 
     def _register(self, req: _PendingRequest) -> None:
         req.seq_id = self.engine.add_request(req.prompt_ids, req.params)
+        seq = self.engine.sequence(req.seq_id)
+        if req.pixel_values is not None:
+            seq.pixel_values = req.pixel_values
         self._pending[req.seq_id] = req
 
     def _dispatch(self) -> None:

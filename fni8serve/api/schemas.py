@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Pydantic request/response models mirroring the OpenAI REST API shapes closely
 enough that the `openai` Python client works unmodified against `base_url`."""
+
 from __future__ import annotations
 
 import time
@@ -25,6 +26,7 @@ class ToolDefinition(BaseModel):
     `apply_chat_template(tools=...)` (issue #40) -- HF's own tools-aware templates
     (Qwen, etc.) already expect exactly this `{"type": "function", "function": {...}}`
     shape, so no reshaping is needed between the request and the template."""
+
     type: Literal["function"] = "function"
     function: FunctionDefinition
 
@@ -44,13 +46,30 @@ class NamedToolChoice(BaseModel):
     """`tool_choice={"type": "function", "function": {"name": ...}}` -- forces
     that one function via the structured-output backend rather than free-form
     generation (issue #40)."""
+
     type: Literal["function"] = "function"
     function: dict
 
 
+class ImageURL(BaseModel):
+    """OpenAI `image_url` content part (issue #151) — either an HTTP(S) URL or a
+    base64 data URI (``data:image/...;base64,...``)."""
+
+    url: str
+
+
+class ContentPart(BaseModel):
+    """OpenAI content part (issue #151): ``{"type": "text", "text": "..."}`` or
+    ``{"type": "image_url", "image_url": {"url": "..."}}``."""
+
+    type: Literal["text", "image_url"]
+    text: str | None = None
+    image_url: ImageURL | None = None
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
-    content: str | None = None
+    content: str | list[ContentPart] | None = None
     name: str | None = None
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None  # role="tool": which call this is the result of
@@ -69,6 +88,7 @@ class ResponseFormat(BaseModel):
     into a token-mask matcher and applied via the sampler's logit-processor hook
     (`fni8serve.structured`). `json_object` uses XGrammar's builtin JSON grammar
     (any valid JSON, unconstrained by a schema)."""
+
     type: Literal["text", "json_object", "json_schema"] = "text"
     json_schema: JSONSchemaSpec | None = None
 
@@ -184,6 +204,7 @@ class ModelList(BaseModel):
 
 class FileObject(BaseModel):
     """OpenAI `/v1/files` shape (issue #41): the input/output JSONL of a batch job."""
+
     id: str = Field(default_factory=lambda: _id("file"))
     object: Literal["file"] = "file"
     bytes: int
@@ -252,6 +273,7 @@ class Batch(BaseModel):
     """OpenAI `/v1/batches` shape (issue #41). This server has no background job
     queue, so `POST /v1/batches` runs the file to completion before returning --
     `status` is always `"completed"` by the time a `Batch` is handed back."""
+
     id: str = Field(default_factory=lambda: _id("batch"))
     object: Literal["batch"] = "batch"
     endpoint: str
