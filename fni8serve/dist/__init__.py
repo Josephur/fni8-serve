@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: MIT
+"""Engine-boundary transport: compress -> P2P -> decompress (issue #81).
+
+The pure-Python transport seam that ships activations between engine ranks on the
+PCIe-1.0-x1 fleet. Bandwidth is the constraint, so the wire always carries the
+*compressed* payload (int8/int4/nf4 codes + fp32 group scales), never fp16. The
+codec seam is kept clean: `send` compresses on the source device and copies the
+codes to the destination; `recv` decompresses on the destination. `accuracy_report`
+gates a round-trip against per-scheme SQNR / cosine bars.
+
+Compression is delegated to `fni8.compress_activation` / `fni8.decompress_activation`;
+this module only owns the transfer + accounting, not the quant math.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+import fni8
+from fni8 import Compressed
+
+# Modeled PCIe-1.0-x1 unidirectional bandwidth (bytes/s) used for the analytic
+# `theoretical_wire_ms`. Kept as a module constant so the wire model is explicit.
+_WIRE_BYTES_PER_S = 250e6
+
+# Per-scheme acceptance bars (SQNR in dB, cosine similarity). Measured minima over
+# Gaussian activations sit comfortably above these (int8 ~43 dB, int4/had ~18.5 dB,
+# nf4 ~20 dB); the bars are set below those so the accuracy gate flags genuine
+# regressions, not run-to-run noise. fp16 is lossless (bit-exact round-trip).
+_BARS: dict[str, tuple[float, float]] = {
+    "fp16": (float("inf"), 1.0),
+    "int8": (35.0, 0.999),
+    "int4": (14.0, 0.98),
+    "int4-had": (14.0, 0.98),
+    "nf4": (16.0, 0.985),
+}
+
+
+def accuracy_report(original: torch.Tensor, reconstructed: torch.Tensor, scheme: str) -> dict:
+    """SQNR (dB) and cosine similarity of a round-trip, gated against `scheme` bars.
+
+    Follows the repo numerics convention: compute the error in fp32 against the fp16
+    reference (`SQNR = 10*log10(signal_power / noise_power)`). A bit-exact round-trip
+    reports `sqnr_db == inf`. Returns a dict with the raw metrics, the bars, and the
+    pass/fail booleans the transport tests assert on.
+    """
+    x = original.detach().float().flatten()
+    xr = reconstructed.detach().float().flatten()
+
+    noise = x - xr
+    noise_power = noise.pow(2).sum()
+    if noise_power.item() == 0.0:
+        sqnr_db = float("inf")
+    else:
+        signal_power = x.pow(2).sum()
+        sqnr_db = float(10.0 * torch.log10(signal_power / noise_power))
+
+    cos = float(torch.nn.functional.cosine_similarity(x, xr, dim=0, eps=1e-12))
+
+    sqnr_bar, cos_bar = _BARS.get(scheme, _BARS["int8"])
+    return {
+        "scheme": scheme,
+        "sqnr_db": sqnr_db,
+        "sqnr_bar": sqnr_bar,
+        "sqnr_pass": sqnr_db >= sqnr_bar,
+        "cos": cos,
+        "cos_bar": cos_bar,
+        "cos_pass": cos >= cos_bar,
+    }
+
+
+@dataclass
+class TransferHandle:
+    """Everything the receiver needs to reconstruct a transferred activation.
+
+    `d_payload`/`d_scales` are the compressed codes as they land on the destination
+    device; the remaining fields carry the shape/scheme metadata for decompression and
+    the measured timings for the wire model. `decompress_elapsed_ms` is filled in by
+    `recv`.
+    """
+
+    src_device: int
+    dst_device: int
+    scheme: str
+    shape: torch.Size
+    dtype: torch.dtype
+    group_size: int | None
+    d_payload: torch.Tensor
+    d_scales: torch.Tensor
+    compress_elapsed_ms: float
+    p2p_elapsed_ms: float
+    decompress_elapsed_ms: float | None = None
+
+    @property
+    def on_wire_bytes(self) -> int:
+        """Bytes actually crossing the link: packed codes + fp32 group scales."""
+        payload_bytes = self.d_payload.numel() * self.d_payload.element_size()
+        scale_bytes = self.d_scales.numel() * self.d_scales.element_size()
+        return payload_bytes + scale_bytes
+
+    @property
+    def theoretical_wire_ms(self) -> float:
+        """Analytic transfer time on the modeled PCIe link (ms)."""
+        return self.on_wire_bytes / _WIRE_BYTES_PER_S * 1000.0
+
+
+def _elapsed_ms(fn):
+    """Run `fn` on the current CUDA device, returning (result, elapsed_ms)."""
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    result = fn()
+    end.record()
+    end.synchronize()
+    return result, start.elapsed_time(end)
+
+
+def send(x: torch.Tensor, dst: int, *, scheme: str = "int8", group_size: int | None = None) -> TransferHandle:
+    """Compress `x` on its device and copy the codes to device `dst`.
+
+    Returns a `TransferHandle` the receiver hands to `recv`. In-process here (the P2P
+    is the fleet's PCIe path); the codes are copied on dedicated streams so the payload
+    and scale transfers can overlap. `p2p_elapsed_ms` measures the code copy, not the
+    fp16 activation.
+    """
+    src = x.device.index if x.is_cuda else torch.cuda.current_device()
+
+    with torch.cuda.device(src):
+        c, compress_ms = _elapsed_ms(lambda: fni8.compress_activation(x, scheme=scheme, group_size=group_size))
+
+    # Copy the compressed codes src -> dst. Double-buffered: payload and scales ride
+    # separate streams so their transfers overlap. `copy=True` forces a real copy even
+    # when src == dst, so the timing reflects a genuine transfer.
+    with torch.cuda.device(dst):
+        payload_stream = torch.cuda.Stream()
+        scale_stream = torch.cuda.Stream()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        with torch.cuda.stream(payload_stream):
+            d_payload = c.payload.to(dst, copy=True, non_blocking=True)
+        with torch.cuda.stream(scale_stream):
+            d_scales = c.scales.to(dst, copy=True, non_blocking=True)
+        end.record(payload_stream)
+        end.synchronize()
+        payload_stream.synchronize()
+        scale_stream.synchronize()
+        p2p_ms = start.elapsed_time(end)
+
+    return TransferHandle(
+        src_device=src,
+        dst_device=dst,
+        scheme=scheme,
+        shape=c.shape,
+        dtype=c.dtype,
+        group_size=c.group_size,
+        d_payload=d_payload,
+        d_scales=d_scales,
+        compress_elapsed_ms=compress_ms,
+        p2p_elapsed_ms=p2p_ms,
+    )
+
+
+def recv(handle: TransferHandle) -> torch.Tensor:
+    """Decompress the transferred codes on the destination device.
+
+    Reconstructs the `fni8.Compressed` payload from the handle and runs the decoder,
+    returning the fp16 activation on `handle.dst_device`. Records
+    `handle.decompress_elapsed_ms` as a side effect.
+    """
+    c = Compressed(
+        scheme=handle.scheme,
+        shape=tuple(handle.shape),
+        dtype=handle.dtype,
+        group_size=handle.group_size,
+        payload=handle.d_payload,
+        scales=handle.d_scales,
+        d=handle.shape[-1],
+    )
+    with torch.cuda.device(handle.dst_device):
+        xr, decompress_ms = _elapsed_ms(lambda: fni8.decompress_activation(c))
+    handle.decompress_elapsed_ms = decompress_ms
+    return xr
