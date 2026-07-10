@@ -44,6 +44,7 @@ def _mla(cfg: ModelConfig, sd: dict, p: str) -> MLAAttention:
         v_head_dim=x["v_head_dim"],
         rope_theta=cfg.rope_theta,
         max_pos=cfg.max_position_embeddings,
+        use_int8_absorb=cfg.extra.get("use_int8_absorb", True),
     )
 
 

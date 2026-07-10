@@ -25,9 +25,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+import fni8
 from fni8 import QTensor
 
-from .linear import LinearW8A8
+from .linear import LinearW8A8, _dequant_weight
 from .norm import RMSNorm
 from .rotary import RotaryEmbedding
 
@@ -60,6 +61,7 @@ class MLAAttention(nn.Module):
         v_head_dim,
         rope_theta=1e4,
         max_pos=8192,
+        use_int8_absorb: bool = True,
     ):
         super().__init__()
         self.nh = num_heads
@@ -75,14 +77,38 @@ class MLAAttention(nn.Module):
         self.kv_b_proj = LinearW8A8(kv_b_proj)  # -> nh*(qk_nope + v)
         self.o_proj = LinearW8A8(o_proj)
         self.rope = RotaryEmbedding(qk_rope_head_dim, max_pos, base=rope_theta)
+        self.use_int8_absorb = use_int8_absorb
+        self._w_qabs: torch.Tensor | None = None
+        self._w_ovabs: torch.Tensor | None = None
+
+    def _absorb_weights(self):
+        if self._w_qabs is not None:
+            return
+        dev = self.kv_b_proj.weight.data.device
+        kv_w = _dequant_weight(self.kv_b_proj.weight).to(torch.float32).to(dev)
+        o_w = _dequant_weight(self.o_proj.weight).to(torch.float32).to(dev)
+
+        nh, qk_nope, kv_lora, vd = self.nh, self.qk_nope, self.kv_lora, self.vd
+        nope_total = nh * qk_nope
+        hidden = o_w.shape[0]
+
+        # w_qabs: W_UK^T, shape [nh, qk_nope, kv_lora] — absorbs nope query into latent space
+        self._w_qabs = kv_w[:nope_total].reshape(nh, qk_nope, kv_lora).contiguous()
+
+        # w_ovabs: W_UV @ W_O, shape [nh, kv_lora, hidden] — absorbs value + output projection
+        w_uv = kv_w[nope_total:].T.reshape(kv_lora, nh, vd).permute(1, 0, 2).contiguous()
+        w_o_head = o_w.T.reshape(nh, vd, hidden)
+        self._w_ovabs = torch.bmm(w_uv, w_o_head)
 
     def _up_kv(self, c_kv: torch.Tensor):
         """c_kv [B,N,kv_lora] -> k_nope [B,N,nh,qk_nope], v [B,N,nh,vd] (the up-project
         half of the decompress path; called on the whole cache every decode step since
         weights aren't absorbed here — see Track 2)."""
         B, N, _ = c_kv.shape
-        kv = self.kv_b_proj(c_kv).view(B, N, self.nh, self.qk_nope + self.vd)
-        return kv.split([self.qk_nope, self.vd], dim=-1)
+        kv = self.kv_b_proj(c_kv)  # [B,N, nh*qk_nope + nh*vd]  (head-major per group)
+        k_nope = kv[:, :, : self.nh * self.qk_nope].view(B, N, self.nh, self.qk_nope)
+        v = kv[:, :, self.nh * self.qk_nope :].view(B, N, self.nh, self.vd)
+        return k_nope, v
 
     def forward(self, hidden, positions, ctx, layer_idx):
         B, L, _ = hidden.shape
@@ -113,6 +139,19 @@ class MLAAttention(nn.Module):
                     layer_idx, latent, slots=ctx.slots
                 )  # [B,N,kv_lora+qk_rope]
                 c_kv_all, k_pe_all = latent_all.split([self.kv_lora, self.qk_rope], dim=-1)
+                if self.use_int8_absorb:
+                    self._absorb_weights()
+                    q_nope_f32 = q_nope.to(torch.float32).transpose(1, 2)  # [B,nh,1,qk_nope]
+                    q_rope_f32 = q_rope.to(torch.float32).transpose(1, 2)  # [B,nh,1,qk_rope]
+                    return fni8.mla_decode_absorb_int8(
+                        q_nope_f32,
+                        q_rope_f32,
+                        c_kv_all,
+                        k_pe_all,
+                        self._w_qabs,
+                        self._w_ovabs,
+                        scale=self.scale,
+                    )
                 N = latent_all.shape[1]
                 k_nope, v = self._up_kv(c_kv_all)
                 k_pe_all = k_pe_all.view(B, N, 1, self.qk_rope).expand(B, N, self.nh, self.qk_rope)
