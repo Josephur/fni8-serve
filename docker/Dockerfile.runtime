@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: MIT
+# ============================================================================
+# fni8-serve runtime image — LEAN OpenAI-compatible server for .fni8 checkpoints.
+#
+# FROM the prebuilt fni8-built:sm70 base (fni8 kernels already compiled + baked in at
+# /opt/fni8): NO nvcc, no CUDA recompile. We only layer the pure-Python serve runtime
+# on top, so this image builds in seconds and stays small.
+#
+# Build:
+#   docker build -f docker/Dockerfile.runtime -t ghcr.io/jajmangold/fni8-serve:latest .
+# Run (mount your own .fni8 + tokenizer):
+#   docker run --rm --gpus all -p 8000:8000 \
+#     -v /path/to/models:/models:ro \
+#     -e FNI8_MODEL=/models/your-model.fni8 \
+#     -e FNI8_TOKENIZER=/models/your-tokenizer \
+#     -e FNI8_SERVED_MODEL_NAME=my-model \
+#     ghcr.io/jajmangold/fni8-serve:latest
+# ============================================================================
+FROM fni8-built:sm70
+
+# Keep the image runtime-lean: no build/test tooling (pytest, ruff, etc. — those live in
+# the [dev] extra and are intentionally NOT installed here). Only the serve/convert/
+# structured runtime deps go in.
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    FNI8_HOST=0.0.0.0 \
+    FNI8_PORT=8000
+
+WORKDIR /opt/fni8serve
+
+# torchvision backs the VLM image path (HF AutoImageProcessor). It MUST be the +cu129
+# build that matches the sm_70 torch 2.10.0 already baked in the base — a plain-PyPI
+# torchvision==0.25.0 would drag a CPU/mismatched torch over it. --no-deps + the cu129
+# index pins exactly the right wheel (mirrors the live deploy). `==0.25.0` in the [serve]
+# extra is satisfied by 0.25.0+cu129, so the editable install below won't re-pull it.
+RUN python3 -m pip install --no-deps torchvision==0.25.0+cu129 \
+      --index-url https://download.pytorch.org/whl/cu129
+
+# The serve runtime: fastapi/uvicorn (API), transformers (tokenizer + chat template),
+# python-multipart + pillow (multipart / image inputs), xgrammar (structured outputs),
+# safetensors + huggingface-hub (the HF->.fni8 convert path). torch/torchvision are
+# already satisfied, so nothing heavy is rebuilt. --no-build-isolation reuses the base's
+# setuptools (offline build backend); fni8 itself stays the baked editable install.
+COPY . /opt/fni8serve
+RUN python3 -m pip install --no-build-isolation ".[serve,convert,structured]" \
+ && python3 -c "import fastapi, uvicorn, transformers, xgrammar, fni8serve.api.server; print('fni8-serve runtime OK')"
+
+# The OpenAI-compatible server. Model/tokenizer are supplied at runtime (mount a .fni8
+# and set FNI8_MODEL, or pass CLI flags) — the image ships no weights.
+EXPOSE 8000
+ENTRYPOINT ["/opt/fni8serve/docker/runtime-entrypoint.sh"]

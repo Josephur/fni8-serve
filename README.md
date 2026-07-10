@@ -110,6 +110,28 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
+### Run the server as a Docker image
+
+Released as `ghcr.io/jajmangold/fni8-serve` (a lean runtime image built on the
+prebuilt `fni8-built:sm70` base — fni8 kernels already baked in, no CUDA recompile).
+The image ships **no weights**: mount your own `.fni8` checkpoint + tokenizer and point
+`FNI8_MODEL`/`FNI8_TOKENIZER` at them (or pass the server's CLI flags directly).
+
+```bash
+docker run --rm --gpus all -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  -e FNI8_MODEL=/models/Qwen3-0.6B-fni8/Qwen__Qwen3-0.6B.b8.fni8 \
+  -e FNI8_TOKENIZER=/models/Qwen3-0.6B-tok \
+  -e FNI8_SERVED_MODEL_NAME=Qwen3-0.6B \
+  ghcr.io/jajmangold/fni8-serve:latest
+# equivalently, pass CLI flags after the image name (they override the env-var mode):
+#   docker run ... ghcr.io/jajmangold/fni8-serve:latest \
+#     --model /models/....fni8 --tokenizer /models/tok --served-model-name Qwen3-0.6B --port 8000
+```
+
+Then `curl http://localhost:8000/v1/models`. Build it locally with
+`docker build -f docker/Dockerfile.runtime -t fni8-serve:local .`.
+
 A per-step **logit-processor hook** sits in the sampler (`fni8serve.layers.sampler`,
 wired through `SamplingParams.logit_processors`): a list of
 `(input_ids, logits) -> logits` callables applied before sampling, per sequence.

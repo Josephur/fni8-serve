@@ -1,0 +1,62 @@
+name: Release image
+
+# Cut a runtime image: tag `v0.1.0` (or workflow_dispatch with a version) → build the
+# LEAN fni8-serve runtime image (docker/Dockerfile.runtime, FROM the prebuilt
+# fni8-built:sm70 — no nvcc) and push it to GHCR as
+#   ghcr.io/jajmangold/fni8-serve:<version>  AND  :latest
+# Tag/dispatch-only: it NEVER runs on a push to a branch. The GHCR push is validated on
+# the first real release (fni8's release-wheel is the reference: #90).
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'version, e.g. 0.1.0'
+        required: true
+
+permissions:
+  packages: write
+  contents: read
+
+concurrency:
+  group: release-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/jajmangold/fni8-serve
+
+jobs:
+  image:
+    runs-on: [self-hosted, volta-gpu]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: v
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          [ -z "$V" ] && V="${{ github.event.inputs.version }}"
+          if [ -z "$V" ]; then echo "no version resolved" >&2; exit 1; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build the lean runtime image
+        run: |
+          docker build -f docker/Dockerfile.runtime \
+            -t "${IMAGE}:${{ steps.v.outputs.version }}" \
+            -t "${IMAGE}:latest" \
+            .
+
+      - name: Push to GHCR
+        run: |
+          docker push "${IMAGE}:${{ steps.v.outputs.version }}"
+          docker push "${IMAGE}:latest"
