@@ -44,5 +44,10 @@ jobs:
             fni8-built:sm70 bash -lc '
               set -e
               pip install -e ".[dev,convert,serve,structured]" --no-build-isolation -q
+              # torchvision (VLM image path) must match the baked torch 2.10.0+cu129 ABI;
+              # --no-deps so it never disturbs the baked torch. PyPI torchvision would risk
+              # a cu-mismatch, so pull the exact cu129 build from the pytorch index.
+              pip install --no-deps torchvision==0.25.0+cu129 \
+                --index-url https://download.pytorch.org/whl/cu129 -q
               pytest -q
             '
