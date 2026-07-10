@@ -40,8 +40,12 @@ class _PendingRequest:
 
 
 class EngineWorker:
-    def __init__(self, engine) -> None:
+    def __init__(self, engine, *, stats=None) -> None:
         self.engine = engine
+        # Optional fni8serve.metrics.StatsCollector: the worker owns the per-request
+        # lifecycle (arrival -> first token -> finish), so it records TTFT / ITL /
+        # e2e-latency and the request counters here. All host-side timestamps.
+        self.stats = stats
         self._inbox: queue.Queue[_PendingRequest] = queue.Queue()
         self._pending: dict[int, _PendingRequest] = {}
         threading.Thread(target=self._run, daemon=True, name="fni8serve-engine").start()
@@ -94,16 +98,38 @@ class EngineWorker:
         if req.pixel_values is not None:
             seq.pixel_values = req.pixel_values
         self._pending[req.seq_id] = req
+        if self.stats is not None:
+            p = req.params
+            self.stats.record_request_start(
+                req.seq_id,
+                prompt_tokens=len(req.prompt_ids),
+                sampling={
+                    "temperature": p.temperature,
+                    "top_p": p.top_p,
+                    "max_tokens": p.max_tokens,
+                },
+            )
 
     def _dispatch(self) -> None:
         done_ids = []
         for seq_id, req in self._pending.items():
             seq = self.engine.sequence(seq_id)
+            if self.stats is not None and req.sent == 0 and seq.output_ids:
+                self.stats.record_first_token(seq_id)
             while req.sent < len(seq.output_ids):
                 req.out_queue.put(seq.output_ids[req.sent])
                 req.sent += 1
             if seq.status is Status.FINISHED:
-                req.out_queue.put(Done(seq.finish_reason(self.engine.eos_id) or "stop"))
+                reason = seq.finish_reason(self.engine.eos_id) or "stop"
+                # Record the finish BEFORE signalling Done so the metrics counters
+                # are updated by the time the HTTP handler (woken by Done on the
+                # queue) can observe them -- otherwise a fast client could GET
+                # /metrics before this worker thread bumps `finished_requests`.
+                if self.stats is not None:
+                    self.stats.record_request_finish(
+                        seq_id, output_tokens=len(seq.output_ids), finish_reason=reason
+                    )
+                req.out_queue.put(Done(reason))
                 done_ids.append(seq_id)
         for seq_id in done_ids:
             del self._pending[seq_id]

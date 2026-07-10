@@ -10,6 +10,7 @@ quantize-on-write, block-table addressed, one batched decode launch per step.
 from __future__ import annotations
 
 import itertools
+import time
 
 from ..models.base import ForwardContext
 from ..models.cache import MLALatentCache, RecurrentStateCache
@@ -85,6 +86,10 @@ class LLMEngine:
         )
         self._ids = itertools.count()
         self._out: dict[int, Sequence] = {}
+        # Optional telemetry sink (fni8serve.metrics.StatsCollector). The API layer
+        # sets this; offline `generate()` leaves it None. `step()` records only
+        # host-side ints + a perf_counter span into it -- never a GPU sync.
+        self.stats = None
 
     def add_request(self, prompt_ids: list[int], params: SamplingParams | None = None) -> int:
         seq = Sequence(next(self._ids), list(prompt_ids), params or SamplingParams())
@@ -105,6 +110,13 @@ class LLMEngine:
         batch, is_prefill = self.scheduler.schedule()
         if not batch:
             return
+        # Token count for this step from host-side ints we already hold: prefill
+        # processes every prompt token, decode emits exactly one token per row.
+        # (No `.item()`/`.cpu()` -- the existing `int(tok)` below already
+        # materialises decode tokens on host, so the perf_counter span honestly
+        # reflects real GPU time without any *added* sync.)
+        step_t0 = time.perf_counter() if self.stats is not None else 0.0
+        num_tokens = sum(seq.num_prompt for seq in batch) if is_prefill else len(batch)
         if self._diffusion_strategy is not None and is_prefill:
             for seq in batch:
                 total_len = seq.num_prompt + seq.params.max_tokens
@@ -126,6 +138,14 @@ class LLMEngine:
                 for seq in batch:
                     self.cache.store_prefix(seq.prompt_ids, seq.slot)
         self.scheduler.postprocess(batch, is_prefill)
+        if self.stats is not None:
+            self.stats.record_step(
+                is_prefill=is_prefill,
+                num_tokens=num_tokens,
+                running=len(self.scheduler.running),
+                waiting=len(self.scheduler.waiting),
+                dt=time.perf_counter() - step_t0,
+            )
 
     def encode(self, prompt_ids: list[int]) -> list[float]:
         seq_id = self.add_request(prompt_ids)

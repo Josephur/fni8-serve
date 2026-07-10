@@ -86,6 +86,13 @@ class PagedKVCache:
     def has_free_slot(self) -> bool:
         return bool(self._free_slots)
 
+    @property
+    def used_blocks(self) -> int:
+        """Physical blocks currently pinned (allocated) out of `num_blocks` --
+        drives the KV-cache usage % in the telemetry heartbeat / TUI. Host-side
+        int arithmetic only; no GPU sync."""
+        return self.num_blocks - len(self._free_blocks)
+
     def ensure_capacity(self, slots: list[int], lengths: list[int]):
         """Grow each slot's block table so it can hold `lengths[i]` tokens,
         pulling new physical blocks from the shared pool one at a time."""

@@ -72,6 +72,7 @@ def create_app(
     served_model_name: str,
     chat_template: str | None = None,
     tool_parser: str = "hermes",
+    stats=None,
 ) -> FastAPI:
     """`engine` needs `.add_request`, `.step`, `.sequence`, `.forget`, `.eos_id`
     (an `LLMEngine`, or a test double with the same seam). `tokenizer` needs
@@ -83,8 +84,24 @@ def create_app(
     (the default once `tools` is set) -- irrelevant for a forced `tool_choice`,
     which is schema-constrained instead (see `request_helpers.forced_tool_message`)."""
     app = FastAPI(title="fni8-serve", version="0.0.1")
-    worker = EngineWorker(engine)
+    # Telemetry (issue #182). Create a collector if the caller didn't supply one so
+    # `GET /metrics` always works; wire it to the engine (KV cache) and the worker
+    # (per-request TTFT / latency). Hot-loop recording is sync-free -- see metrics.py.
+    if stats is None:
+        from ..metrics import StatsCollector
+
+        stats = StatsCollector()
+    stats.attach_engine(engine)
+    engine.stats = stats
+    worker = EngineWorker(engine, stats=stats)
     grammars = GrammarCompilerCache()
+
+    @app.get("/metrics")
+    async def metrics() -> dict:
+        """Live serving telemetry as JSON: running/waiting, prefill/decode tok/s,
+        KV-cache usage %, VRAM/GPU, TTFT/ITL/p50/p99 latency, lifetime counters,
+        uptime, and the startup model/config banner. Consumed by `fni8serve-top`."""
+        return stats.snapshot()
 
     def _logit_processors(response_format, grammar):
         return build_logit_processors(grammars, tokenizer, response_format, grammar)

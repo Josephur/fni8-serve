@@ -37,11 +37,15 @@ convert = ["safetensors", "huggingface-hub"]
 # pillow + torchvision back the VLM image path (HF AutoImageProcessor needs torchvision).
 # torchvision must be the +cu129 build matching torch 2.10.0 — from the fni8 Docker base,
 # or: pip install torchvision==0.25.0+cu129 --index-url https://download.pytorch.org/whl/cu129
-serve = ["fastapi>=0.110", "uvicorn[standard]", "transformers", "python-multipart", "pillow", "torchvision==0.25.0"]
+serve = ["fastapi>=0.110", "uvicorn[standard]", "transformers", "python-multipart", "pillow", "torchvision==0.25.0", "rich>=13.0", "nvidia-ml-py"]
 # Structured outputs / grammars (fni8serve.structured, issue #39): `response_format=
 # {"type": "json_schema"}` and the `grammar` (GBNF/EBNF) extension. Pure-Python/CPU --
 # XGrammar's token-mask matcher needs no CUDA, just the sampler's logit-processor hook.
 structured = ["xgrammar"]
+
+[project.scripts]
+# Live terminal dashboard for a running server (issue #182). Polls GET /metrics.
+fni8serve-top = "fni8serve.tui:main"
 
 [tool.setuptools.packages.find]
 include = ["fni8serve*"]
