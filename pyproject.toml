@@ -7,12 +7,19 @@ name = "fni8-serve"
 version = "0.0.1"
 description = "W8A8 (INT8 dp4a) inference server for Volta / CMP 100-210, over the fni8 kernels"
 readme = "README.md"
-requires-python = ">=3.12"
+# == 3.12.* to match fni8 exactly: the Volta stack is the cp312 torch wheel, so
+# 3.13+ would resolve a wheel that can't target sm_70. Do not loosen.
+requires-python = "==3.12.*"
 license = { text = "MIT" }
 authors = [{ name = "fni8-serve authors" }]
 
 # Pinned to the last Volta-capable stack (matches fni8). NO flash-attn (fp16 path is
 # the gimped-tensor-core baseline we deliberately avoid on this fleet).
+# NOTE: torch MUST be the +cu129 build (sm_70). It comes from the fni8 Docker base;
+# for a bare install use the cu129 index:
+#   pip install torch==2.10.0+cu129 --index-url https://download.pytorch.org/whl/cu129
+# The bare `torch==2.10.0` below is intentional so `pip install` works from either the
+# cu129 index or the Docker base; it is NOT a plain-PyPI CPU/cu-mismatched torch.
 dependencies = [
   "torch==2.10.0",
   "numpy",
