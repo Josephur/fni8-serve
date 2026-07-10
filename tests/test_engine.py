@@ -199,13 +199,13 @@ def test_varlen_prefill_and_decode():
 
 
 def test_preempt_and_resume():
-    """When load exceeds max_num_seqs, the scheduler preempts running sequences
-    (evict/recompute) instead of blocking; every request completes with the
-    correct number of output tokens."""
+    """When load exceeds max_num_seqs, excess requests WAIT in FIFO and are admitted
+    as running sequences finish (no count-cap preemption / recompute thrash); every
+    request still completes with the correct number of output tokens."""
     torch.manual_seed(0)
     cfg = _cfg()
     eng = LLMEngine(cfg, _sd(cfg), device="cuda", max_num_seqs=2, max_len=64)
-    # 5 prompts with max_num_seqs=2 -> slot pressure forces preemption
+    # 5 prompts with max_num_seqs=2 -> slot pressure; the extra 3 queue and drain
     prompts = [[1, 2, 3], [4, 5, 6, 7, 8], [9], [10, 11], [12, 13, 14]]
     outs = eng.generate(prompts, SamplingParams(temperature=0.0, max_tokens=8))
     assert len(outs) == 5

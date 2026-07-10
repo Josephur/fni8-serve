@@ -86,6 +86,12 @@ class PagedKVCache:
     def has_free_slot(self) -> bool:
         return bool(self._free_slots)
 
+    def has_free_block(self) -> bool:
+        """Whether the shared block pool has at least one free physical block. The
+        scheduler uses this to distinguish genuine KV-memory pressure (dry pool)
+        from a mere count/slot cap: only the former justifies preemption."""
+        return bool(self._free_blocks)
+
     @property
     def used_blocks(self) -> int:
         """Physical blocks currently pinned (allocated) out of `num_blocks` --

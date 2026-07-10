@@ -3,14 +3,22 @@
 
 Each `schedule()` returns either a batch of WAITING sequences to prefill (a slot is
 allocated per sequence) or the full RUNNING set to decode one step. Prefill is
-preferred while slots and the batch-token budget allow, so new requests join
-quickly; otherwise the running set decodes. Finished sequences free their slot.
+preferred while slots, KV blocks, and the batch-token budget allow, so new requests
+join quickly; otherwise the running set decodes. Finished sequences free their slot.
 
-When the slot pool is full and sequences are waiting, the scheduler preempts the
-lowest-priority running sequence (fewest generated tokens) to free a slot rather
-than blocking indefinitely — the preempted sequence is returned to the waiting
-queue and its full context (prompt + previously generated tokens) is recomputed
-when it is re-admitted.
+Admission is capped at `max_num_seqs` RUNNING sequences. Requests beyond that cap —
+or beyond the KV-block pool's capacity — WAIT in FIFO and are admitted only as
+running sequences FINISH and free their slot/blocks. A mere count cap is NOT memory
+pressure and NEVER triggers preemption: preempting a running sequence just to admit a
+waiter forces a full-context recompute of the evicted sequence, and under sustained
+oversubscription that degenerates into per-step evict→recompute→evict thrash that
+collapses aggregate throughput (the running set never gets to decode).
+
+Preemption is retained only as a bounded LAST RESORT for genuine KV-block-pool
+exhaustion (an over-subscribed pool with fewer blocks than the running set needs):
+the lowest-priority running sequence (fewest generated tokens) is evicted to reclaim
+its blocks, its full context is recomputed on re-admission, and the number of
+evictions per `schedule()` call is capped so it can never livelock.
 """
 
 from __future__ import annotations
@@ -64,15 +72,24 @@ class Scheduler:
         preempted.status = Status.WAITING
         self.waiting.append(preempted)
 
+    def _has_free_block(self) -> bool:
+        """Whether the KV-block pool can back another sequence. Caches that
+        pre-allocate a fixed per-slot region (no shared block pool) always report
+        True — for them slot availability alone bounds admission."""
+        probe = getattr(self.cache, "has_free_block", None)
+        return probe() if probe is not None else True
+
     def schedule(self) -> tuple[list[Sequence], bool]:
         """Returns (batch, is_prefill)."""
-        # Prefill newly-waiting sequences while we have slots + token budget.
+        # Prefill newly-waiting sequences while we have slots + KV blocks + token budget.
         batch, tokens = [], 0
+        preempted = 0
         while True:
             while (
                 self.waiting
                 and len(self.running) + len(batch) < self.max_num_seqs
                 and self.cache.has_free_slot()
+                and self._has_free_block()
             ):
                 seq = self.waiting[0]
                 if batch and tokens + seq.num_prompt > self.max_batch_tokens:
@@ -89,11 +106,22 @@ class Scheduler:
                 batch.append(seq)
             if batch:
                 return batch, True
-            # No room — preempt a running sequence to free a slot for waiters.
-            if self.waiting and (
-                len(self.running) >= self.max_num_seqs or not self.cache.has_free_slot()
-            ):
+            # Nothing admitted. A count/slot cap is NOT memory pressure — excess
+            # requests WAIT in FIFO and are admitted only as running sequences
+            # finish; preempting here would thrash. Preempt ONLY under genuine
+            # KV-block-pool exhaustion: a slot is free but the shared block pool is
+            # dry (an over-subscribed pool), so a running sequence's blocks must be
+            # reclaimed before any waiter can prefill. Bounded per call so it can
+            # never livelock.
+            block_pressure = (
+                self.waiting
+                and self.running
+                and self.cache.has_free_slot()
+                and not self._has_free_block()
+            )
+            if block_pressure and preempted < self.max_num_seqs:
                 self._preempt_one()
+                preempted += 1
                 continue
             return list(self.running), False
 

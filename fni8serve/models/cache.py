@@ -111,6 +111,11 @@ class MLALatentCache:
     def has_free_slot(self) -> bool:
         return len(self._free_slots) > 0
 
+    def has_free_block(self) -> bool:
+        # Pre-allocated fixed per-slot region — no shared block pool, so slot
+        # availability alone bounds admission; blocks are never the scarce resource.
+        return True
+
     def ensure_capacity(self, slots: list[int], lengths: list[int]):
         pass  # MLALatentCache is pre-allocated; capacity is fixed.
 
