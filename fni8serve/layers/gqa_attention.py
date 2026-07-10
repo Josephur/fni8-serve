@@ -68,18 +68,20 @@ class GQAAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
         q, k = self.rope(positions, q, k)
-        # -> [B, H, S, D] for the fni8 kernels
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
+        # q, k, v are [B, S, H, D] here. The transpose to the kernels' [B, H, S, D]
+        # layout is now done ONLY in the two branches that genuinely need it
+        # (non-varlen prefill, simple decode). The varlen-prefill and decode-batched
+        # hot paths take token-major [total_tok, H, D], which is a zero-copy reshape
+        # of [B, S, H, D] (Decode Lever 2: no more transpose().contiguous() churn).
 
         if ctx.is_prefill:
             if ctx.cu_seqlens is not None:
-                # Varlen batched prefill: q,k,v [1, H, total_tokens, D] -> [total_tokens, H, D]
-                # (token-major, heads interleaved — the flash_attn_varlen convention).
-                q_v = q.squeeze(0).transpose(0, 1).contiguous()  # [total_tok, H, D]
-                k_v = k.squeeze(0).transpose(0, 1).contiguous()  # [total_tok, Hkv, D]
-                v_v = v.squeeze(0).transpose(0, 1).contiguous()  # [total_tok, Hkv, D]
+                # Varlen batched prefill: [1, S, H, D] -> [total_tok, H, D] via reshape
+                # (B == 1 for the packed varlen layout; token-major, heads interleaved,
+                # the flash_attn_varlen convention). No transpose, no contiguous copy.
+                q_v = q.reshape(B * S, self.nh, self.hd)  # [total_tok, H, D]
+                k_v = k.reshape(B * S, self.nkv, self.hd)  # [total_tok, Hkv, D]
+                v_v = v.reshape(B * S, self.nkv, self.hd)  # [total_tok, Hkv, D]
                 ctx.kv_cache.write_prefill_varlen(layer_idx, ctx.slot_mapping, k_v, v_v)
                 max_seqlen = int((ctx.cu_seqlens[1:] - ctx.cu_seqlens[:-1]).max().item())
                 out_v = fni8.attn_int8_varlen(
@@ -93,17 +95,28 @@ class GQAAttention(nn.Module):
                     causal=self.causal,
                     scale=self.scale,
                 )
-                out = out_v.transpose(0, 1).unsqueeze(0)  # back to [1, H, total_tok, D]
+                # out_v is [total_tok, H, D] == [B, S, H, D] (B==1) -> merge heads by reshape.
+                out = out_v.reshape(B, S, self.nh * self.hd)
+                return self.o_proj(out)
             else:
+                # Non-varlen prefill genuinely needs [B, H, S, D].
+                q = q.transpose(1, 2).contiguous()
+                k = k.transpose(1, 2).contiguous()
+                v = v.transpose(1, 2).contiguous()
                 slot = ctx.slots[0] if ctx.slots is not None else None
                 ctx.kv_cache.write_prefill(layer_idx, k, v, slot=slot, start=ctx.prefill_start)
                 out = fni8.attn_int8_fwd(
                     q, k, v, causal=self.causal, scale=self.scale, window_left=self.window_left
                 )
         elif ctx.slot_lengths is not None or ctx.slot_mapping is not None:
+            # Decode-batched hot path: takes [B, S=1, H, D] directly (no transpose here).
             out = self._decode_batched(q, k, v, ctx, layer_idx)  # engine continuous batch
             # (or CUDA-graph static path)
         else:
+            # Simple decode genuinely needs [B, H, S, D].
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
+            v = v.transpose(1, 2).contiguous()
             k_all, v_all = ctx.kv_cache.append_decode(layer_idx, k, v)  # [B,Hkv,N,D]
             k_all, v_all = self._window(k_all, v_all)
             out = fni8.attn_int8_decode(q, k_all, v_all, scale=self.scale)
@@ -125,9 +138,15 @@ class GQAAttention(nn.Module):
 
         Sliding-window layers are the one gap the paged-decode kernel doesn't cover
         (no window parameter yet), so they fall back to a per-slot dequantized read
-        + `attn_int8_decode`, same as before this PR."""
+        + `attn_int8_decode`, same as before this PR.
+
+        Inputs q, k, v are [B, S=1, H, D] (token-major, as they leave RoPE). The one
+        new token's K/V is sliced with a zero-copy index; q is transposed to the
+        kernels' [B, H_q, 1, D] here (a size-1 permute — the write/attn kernels make
+        their inputs contiguous internally)."""
         cache = ctx.kv_cache
-        k_new, v_new = k[:, :, 0, :], v[:, :, 0, :]  # [B,Hkv,D]: the one new token
+        k_new, v_new = k[:, 0, :, :], v[:, 0, :, :]  # [B,Hkv,D]: the one new token
+        q = q.transpose(1, 2)  # [B,S=1,H,D] -> [B,H,1,D] for the decode kernels
         if self.window_left < 0:
             if ctx.slot_mapping is not None:
                 # CUDA-graph decode (engine/cuda_graph.py): slot_mapping/block_tables/
