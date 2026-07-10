@@ -26,8 +26,21 @@ def load_engine(model_path: str, *, device: str = "cuda", max_num_seqs: int = 16
                 max_len: int = 2048, eos_id: int | None = None) -> LLMEngine:
     """Architecture is auto-detected from the checkpoint; see the README Quickstart."""
     info = checkpoint_info(model_path)
-    cfg = ModelConfig.from_hf(info["meta"]["config"])
+    meta_cfg = info["meta"]["config"]
+    # Honor the arch stored at conversion time. The meta config is a ModelConfig dump
+    # (carries `arch`, e.g. "qwen3_5_text") but often lacks HF `model_type`/`architectures`,
+    # so from_hf's derivation alone would fall through to "unknown". Prefer the stored arch.
+    cfg = ModelConfig.from_hf(meta_cfg, arch=meta_cfg.get("arch") or None)
     weights = load_fni8_state_dict(model_path, device=device)
+    # Trust the weights over the recorded config: some converted Qwen3-family checkpoints
+    # recorded qk_norm=False yet DO carry per-head q_norm/k_norm weights. Qwen3's QK-norm
+    # is load-bearing (skipping it feeds un-normalized Q/K into RoPE -> garbage output).
+    if not getattr(cfg, "qk_norm", False) and any(".q_norm.weight" in n for n in weights):
+        try:
+            cfg.qk_norm = True
+        except Exception:  # frozen dataclass
+            import dataclasses
+            cfg = dataclasses.replace(cfg, qk_norm=True)
     return LLMEngine(cfg, weights, device=device, max_num_seqs=max_num_seqs,
                      max_len=max_len, eos_id=eos_id)
 

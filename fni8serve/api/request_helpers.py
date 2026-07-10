@@ -86,7 +86,15 @@ def chat_prompt_ids(
         kwargs["chat_template"] = chat_template
     if tools:
         kwargs["tools"] = tools
-    return tokenizer.apply_chat_template([message_dict(m) for m in messages], **kwargs)
+    out = tokenizer.apply_chat_template([message_dict(m) for m in messages], **kwargs)
+    # transformers >=5 returns a BatchEncoding (dict with "input_ids") from
+    # apply_chat_template(tokenize=True); older versions returned a flat list[int].
+    # Normalize to a flat list[int] either way.
+    if hasattr(out, "input_ids") or isinstance(out, dict):
+        out = out["input_ids"]
+    if out and isinstance(out[0], list):  # some versions nest per-conversation
+        out = out[0]
+    return out
 
 
 def build_logit_processors(
