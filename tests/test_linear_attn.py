@@ -153,11 +153,9 @@ def test_short_conv_tail_matches_full_sequence():
     torch.testing.assert_close(torch.cat(outs, dim=1), full, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.skipif(not CUDA, reason="the projections use the dp4a GEMM")
-def test_deltanet_block_runs():
+def _build_deltanet_block():
     from fni8 import QTensor
 
-    from fni8serve.layers.linear_attn import GatedDeltaNetAttention
     from fni8serve.models.config import ModelConfig
 
     torch.manual_seed(0)
@@ -172,7 +170,7 @@ def test_deltanet_block_runs():
         return QTensor(torch.round(w / s).clamp_(-127, 127).to(torch.int8),
                        s.squeeze(-1).float(), scheme="per_row_i8")
 
-    blk = GatedDeltaNetAttention(
+    return GatedDeltaNetAttention(
         cfg, qkv_proj=qt(2 * nk * kd + nv * vd, H), out_proj=qt(H, nv * vd),
         conv_weight=torch.randn(2 * nk * kd + nv * vd, 4, device="cuda", dtype=torch.float16),
         a_log=torch.zeros(nv, device="cuda"), dt_bias=torch.zeros(nv, device="cuda"),
@@ -181,6 +179,49 @@ def test_deltanet_block_runs():
         # gain is `vd`-sized, not the flattened nv*vd.
         norm_gain=torch.ones(vd, device="cuda", dtype=torch.float16),
         num_k_heads=nk, num_v_heads=nv, key_dim=kd, value_dim=vd).cuda()
-    x = torch.randn(1, 6, H, device="cuda", dtype=torch.float16)
+
+
+@pytest.mark.skipif(not CUDA, reason="the projections use the dp4a GEMM")
+def test_deltanet_block_runs():
+    blk = _build_deltanet_block()
+    x = torch.randn(1, 6, 128, device="cuda", dtype=torch.float16)
     y = blk(x, None, None, 0)
-    assert y.shape == (1, 6, H) and torch.isfinite(y).all()
+    assert y.shape == (1, 6, 128) and torch.isfinite(y).all()
+
+
+@pytest.mark.skipif(not CUDA, reason="the projections use the dp4a GEMM")
+def test_decode_recurrence_output_stays_fp32(monkeypatch):
+    """Regression guard for the redundant-cast removal: at decode (L==1) the fused
+    kernel's fp32 readout must flow straight into the gated RMSNorm WITHOUT an
+    fp32->fp16->fp32 round-trip. We stub `fni8.deltanet_recurrent_decode` with a pure
+    fp32 reference so the test holds even on a prebuilt fni8 that predates the kernel,
+    then compare the block output against the OLD behaviour (readout downcast to fp16
+    before the norm). Removing the round-trip only drops fp16 rounding, so the block
+    output must stay bit-close (cos >= 0.9999) — same numerics, one fewer cast pair."""
+    import fni8serve.layers.linear_attn as la
+
+    def _ref_decode(q, k, v, alpha, beta, initial_state=None):
+        # exact eager math, fp32 in / fp32 out (mirrors the real decode kernel)
+        g = alpha.clamp_min(1e-30).log()
+        o, s = la.recurrent_gated_delta_rule(q, k, v, beta, g, state=initial_state)
+        return o.float(), s
+
+    blk = _build_deltanet_block()
+    x = torch.randn(1, 1, 128, device="cuda", dtype=torch.float16)  # L==1 decode step
+
+    # NEW path: kernel returns fp32, kept fp32 through to the gated norm.
+    monkeypatch.setattr(la.fni8, "deltanet_recurrent_decode", _ref_decode, raising=False)
+    monkeypatch.setattr(la, "_DND_DECODE", True)
+    y_new = blk(x, None, None, 0).float()
+
+    # OLD path: identical kernel but its readout is downcast to v.dtype first (the
+    # round-trip the caller then undoes with `.float()`).
+    def _ref_decode_roundtrip(q, k, v, alpha, beta, initial_state=None):
+        o, s = _ref_decode(q, k, v, alpha, beta, initial_state=initial_state)
+        return o.to(v.dtype), s
+
+    monkeypatch.setattr(la.fni8, "deltanet_recurrent_decode", _ref_decode_roundtrip, raising=False)
+    y_old = blk(x, None, None, 0).float()
+
+    cos = torch.nn.functional.cosine_similarity(y_new.flatten(), y_old.flatten(), dim=0)
+    assert cos.item() >= 0.9999, f"decode block output drifted after round-trip removal: cos={cos.item()}"

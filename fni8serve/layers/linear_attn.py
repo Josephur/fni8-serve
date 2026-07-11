@@ -80,12 +80,19 @@ def _gated_delta_rule(q, k, v, beta, g, state, L):
     (register state, no cudaFuncSetAttribute), so it replays inside the engine's
     graphed decode instead of forcing an eager fallback. Eager reference otherwise
     (prefill L>1, CPU, head dims > 128, or FNI8_DND_DECODE=0). The kernel takes
-    alpha=exp(g)."""
+    alpha=exp(g).
+
+    Decode returns the readout `o` in fp32 (the kernel's native accumulate dtype).
+    The gated RMSNorm in the caller upcasts to fp32 anyway, so downcasting to v.dtype
+    here would only be re-upcast one op later — a wasted fp32->fp16->fp32 round-trip
+    (nsys: `direct_copy_kernel_cuda` + `float16_copy`, both redundant). Keeping it fp32
+    is also strictly more accurate (no fp16 rounding before the norm). The eager branch
+    still returns v.dtype; the caller's `.float()` normalizes both to fp32."""
     if _DND_DECODE and L == 1 and q.is_cuda and q.shape[-1] <= 128 and v.shape[-1] <= 128:
         o, state = fni8.deltanet_recurrent_decode(
             q.float(), k.float(), v.float(), g.exp().float(), beta.float(), initial_state=state
         )
-        return o.to(v.dtype), state
+        return o, state
     return recurrent_gated_delta_rule(q, k, v, beta, g, state=state)
 
 
@@ -182,7 +189,9 @@ class GatedDeltaNetAttention(nn.Module):
         # then the per-head gain, THEN the z gate (silu) — in that order. Done in fp32
         # (the gated norm is numerically load-bearing, never quantized). The gain is
         # per-head (length vd), so normalize over the last (vd) axis, not nv*vd.
-        o = o.transpose(1, 2).float()  # [B, L, nv, vd]
+        # [B, L, nv, vd] in fp32. `.float()` is a no-op (free) when the fused decode
+        # kernel already returned fp32; it upcasts only the eager (prefill) fp16 output.
+        o = o.transpose(1, 2).float()
         o = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + self.norm.eps)
         o = o * self.norm.weight.float()
         if hasattr(self, "z_proj"):
