@@ -156,8 +156,14 @@ class LowRankCodec:
         xf = x.float()
         x_centered = xf - mean
 
-        latent_fp32 = x_centered @ U
-        qlatent, scale = _int8_scale(latent_fp32)
+        latent_fp32 = x_centered @ U  # (..., r)
+        # Per-channel int8 quant on the r latent dims: a single per-tensor scale
+        # was dominated by outlier latent dims, capping recon SQNR (~16 dB) and
+        # making the rank irrelevant. One scale per latent dim (like per-row
+        # weight quant) lets each dim use its full int8 range.
+        amax = latent_fp32.abs().reshape(-1, latent_fp32.shape[-1]).amax(0)  # (r,)
+        scale = (amax / 127.0).clamp_min(1e-12)  # (r,) fp32
+        qlatent = torch.clamp(torch.round(latent_fp32 / scale), -128, 127).to(torch.int8)
 
         raw_values = xf[..., basis.raw_indices].contiguous()
 
@@ -173,7 +179,10 @@ class LowRankCodec:
         """Decompress *codes* → fp16 reconstruction."""
         basis = self.basis
 
-        latent_fp32 = _int8_dequant(codes["latent"], codes["scale"])
+        q = codes["latent"]
+        scale = codes["scale"]
+        scale = scale.to(q.device) if torch.is_tensor(scale) else scale
+        latent_fp32 = q.float() * scale  # per-channel (r,) broadcast over leading dims
         device = latent_fp32.device
 
         U = basis.U.to(device, dtype=torch.float32)

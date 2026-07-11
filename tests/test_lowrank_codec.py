@@ -146,8 +146,10 @@ class TestLowRankCodec:
         assert codes["raw_values"].dtype == torch.float16
         assert codes["latent"].shape[-1] == basis.r
         assert codes["raw_values"].shape[-1] == len(basis.raw_indices)
-        assert codes["scale"] >= 0.0
-        assert isinstance(codes["scale"], float)
+        # scale is now a per-channel (r,) tensor, one int8 scale per latent dim
+        assert torch.is_tensor(codes["scale"])
+        assert codes["scale"].shape[-1] == basis.r
+        assert (codes["scale"] >= 0.0).all()
 
     def test_deterministic_encode(self):
         """Same input → bit-identical codes ×3."""
@@ -160,7 +162,7 @@ class TestLowRankCodec:
         for key in ("latent", "raw_values"):
             assert torch.equal(c1[key], c2[key]), f"{key} differs on 2nd encode"
             assert torch.equal(c1[key], c3[key]), f"{key} differs on 3rd encode"
-        assert c1["scale"] == c2["scale"] == c3["scale"]
+        assert torch.equal(c1["scale"], c2["scale"]) and torch.equal(c2["scale"], c3["scale"])
 
     def test_different_seed_different_basis(self):
         """Different calibration data → different codes."""
