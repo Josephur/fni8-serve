@@ -17,7 +17,6 @@ import math
 import numpy as np
 import torch
 from PIL import Image
-from torchvision.transforms.v2 import functional as tvF
 
 
 # ---------------------------------------------------------------------------
@@ -57,9 +56,21 @@ def load_image(
     raise TypeError(f"Unsupported image type: {type(image)}")
 
 
+def _tvf():
+    """Lazy torchvision handle. Keeps ``import fni8serve`` torchvision-free for
+    text-only deploys: the VLM path is eagerly imported by the model registry, so
+    a top-level ``torchvision`` import would hard-require it even to serve a text
+    model — and the deploy installs torchvision with ``|| true``, so a failed
+    install would silently kill the server on restart. Import only when an image
+    is actually preprocessed."""
+    from torchvision.transforms.v2 import functional as tvF
+
+    return tvF
+
+
 def _pil_to_tensor(image: Image.Image) -> torch.Tensor:
     """PIL Image -> ``[C, H, W]`` uint8 tensor."""
-    return tvF.pil_to_tensor(image)  # uint8 [C, H, W]
+    return _tvf().pil_to_tensor(image)  # uint8 [C, H, W]
 
 
 # ---------------------------------------------------------------------------
@@ -105,9 +116,12 @@ def smart_resize(
 def resize_image(
     image: torch.Tensor,
     size: tuple[int, int],
-    interpolation: tvF.InterpolationMode = tvF.InterpolationMode.BICUBIC,
+    interpolation=None,  # torchvision InterpolationMode; resolved lazily (default BICUBIC)
 ) -> torch.Tensor:
     """Resize a ``[C, H, W]`` tensor to ``(height, width)``."""
+    tvF = _tvf()
+    if interpolation is None:
+        interpolation = tvF.InterpolationMode.BICUBIC
     return tvF.resize(image, size, interpolation=interpolation, antialias=True)
 
 
