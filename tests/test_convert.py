@@ -250,10 +250,11 @@ def test_convert_hf_to_fni8_streams_shards_one_at_a_time(tmp_path, monkeypatch):
 
 
 def test_convert_hf_to_fni8_deletes_source_shards_as_processed(tmp_path, monkeypatch):
-    """Regression for the 850GB+ disk-capacity failure (MiniMax-M3 / issue #69):
-    convert_hf_to_fni8 must delete each source safetensors shard immediately after its
-    tensors are quantized and written, so peak disk is max(source, consumed+output)
-    rather than source+output."""
+    """Regression for the 850GB+ disk-capacity failure (MiniMax-M3 / issue #69): with
+    `delete_source=True`, convert_hf_to_fni8 deletes each source safetensors shard
+    immediately after its tensors are quantized and written, so peak disk is
+    max(source, consumed+output) rather than source+output. (This is opt-in — the
+    default preserves the input; see the preserve-by-default test below for #200.)"""
     pytest.importorskip("safetensors")
     from safetensors.torch import save_file
 
@@ -284,7 +285,9 @@ def test_convert_hf_to_fni8_deletes_source_shards_as_processed(tmp_path, monkeyp
     shard_count_before = len(list(tmp_path.glob("*.safetensors")))
 
     out = tmp_path / "m.fni8"
-    convert_mod.convert_hf_to_fni8(str(tmp_path), str(out), weight_bits=8)
+    convert_mod.convert_hf_to_fni8(
+        str(tmp_path), str(out), weight_bits=8, delete_source=True
+    )
 
     # Every source shard was deleted via os.remove during conversion
     assert len(removed_safetensors) == 2
@@ -294,6 +297,37 @@ def test_convert_hf_to_fni8_deletes_source_shards_as_processed(tmp_path, monkeyp
     # config.json and the output file must survive
     assert (tmp_path / "config.json").exists()
     assert (tmp_path / "m.fni8").exists()
+    assert checkpoint_info(str(out))["num_tensors"] == len(keys)
+
+
+def test_convert_hf_to_fni8_preserves_source_by_default(tmp_path):
+    """Regression for issue #200 (data-loss footgun): with no delete_source flag,
+    convert_hf_to_fni8 must NOT touch the input checkpoint. The documented CLI points
+    at a user's own model dir (`python -m fni8serve.convert /path/to/Qwen3-8B out.fni8`)
+    — a converter that silently deletes its input is unacceptable. Destruction is
+    strictly opt-in (delete_source=True / --free-source-shards), used only by the
+    disposable-staging forge pipeline for 850GB+ models (#69)."""
+    pytest.importorskip("safetensors")
+    from safetensors.torch import save_file
+
+    cfg = _cfg()
+    sd = _sd(cfg)
+    keys = list(sd)
+    mid = len(keys) // 2
+    s1 = tmp_path / "model-00001-of-00002.safetensors"
+    s2 = tmp_path / "model-00002-of-00002.safetensors"
+    save_file({k: sd[k] for k in keys[:mid]}, str(s1))
+    save_file({k: sd[k] for k in keys[mid:]}, str(s2))
+    (tmp_path / "config.json").write_text(json.dumps(_hf_config_dict(cfg)))
+
+    out = tmp_path / "m.fni8"
+    convert_hf_to_fni8(str(tmp_path), str(out), weight_bits=8)  # default: no delete
+
+    # Input checkpoint is fully intact...
+    assert s1.exists() and s2.exists()
+    assert len(list(tmp_path.glob("*.safetensors"))) == 2
+    # ...and the conversion still produced a complete output.
+    assert out.exists()
     assert checkpoint_info(str(out))["num_tensors"] == len(keys)
 
 

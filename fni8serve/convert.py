@@ -206,16 +206,27 @@ def convert_hf_to_fni8(
     weight_bits: int = 8,
     group_size: int = 128,
     arch: str | None = None,
+    delete_source: bool = False,
 ) -> ModelConfig:
     """Read an HF model dir (config.json + *.safetensors) and write a `.fni8`.
     Returns the ModelConfig (also embedded in the file meta).
 
-    Shards are streamed one at a time — load, quantize, drop the raw shard, next —
-    so peak RAM is the quantized-so-far dict plus a single raw shard, never the full
-    fp16/bf16 model (the 220GB-model-in-RAM OOM that killed GLM-4.5-Air mid-batch).
-    Each HF tensor lives wholly in one shard, and q/k/v & gate/up stay unmerged on
-    disk (the model builders merge them at load time, see fni8serve/models/weights.py),
-    so per-shard quantization needs no cross-shard state."""
+    Shards are streamed one at a time — load, quantize, free the raw shard's RAM,
+    next — so peak RAM is the quantized-so-far dict plus a single raw shard, never
+    the full fp16/bf16 model (the 220GB-model-in-RAM OOM that killed GLM-4.5-Air
+    mid-batch). Each HF tensor lives wholly in one shard, and q/k/v & gate/up stay
+    unmerged on disk (the model builders merge them at load time, see
+    fni8serve/models/weights.py), so per-shard quantization needs no cross-shard state.
+
+    `delete_source` (default False) — when True, each source `.safetensors` shard is
+    `os.remove`d from `hf_dir` the moment its tensors are quantized and written, so
+    peak *disk* is max(source, consumed+output) rather than source+output. Required to
+    fit 850GB+ models (MiniMax-M3, issue #69) on a disk that can't hold source+output
+    at once, so the automated pipeline (`tools/forge.py`, which downloads to a
+    disposable staging dir) passes it. It defaults to False because it DESTROYS the
+    input checkpoint: the documented CLI points at a user's own model dir (issue #200),
+    and a converter must never delete its input unless explicitly told to
+    (`--free-source-shards`)."""
     from safetensors import safe_open
     from safetensors.torch import load_file
 
@@ -288,7 +299,8 @@ def convert_hf_to_fni8(
                     w.add(name, qt)
                 del sd, q
             finally:
-                os.remove(shard_path)
+                if delete_source:
+                    os.remove(shard_path)
         w.finalize(meta=meta)
     return cfg
 
@@ -303,9 +315,22 @@ def main():
     ap.add_argument("--bits", type=int, default=8, choices=(4, 8))
     ap.add_argument("--group", type=int, default=128)
     ap.add_argument("--arch", default=None)
+    ap.add_argument(
+        "--free-source-shards",
+        action="store_true",
+        help="DESTRUCTIVE: delete each source .safetensors shard from hf_dir as it is "
+        "converted, so peak disk is max(source, output) not source+output. Needed to "
+        "fit 850GB+ models that can't hold source+output at once. Off by default — the "
+        "input checkpoint is preserved unless you pass this.",
+    )
     a = ap.parse_args()
     cfg = convert_hf_to_fni8(
-        a.hf_dir, a.out_path, weight_bits=a.bits, group_size=a.group, arch=a.arch
+        a.hf_dir,
+        a.out_path,
+        weight_bits=a.bits,
+        group_size=a.group,
+        arch=a.arch,
+        delete_source=a.free_source_shards,
     )
     print(f"wrote {a.out_path}  arch={cfg.arch}  bits={a.bits}  layers={cfg.num_hidden_layers}")
 

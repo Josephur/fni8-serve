@@ -103,6 +103,9 @@ Convert an HF checkpoint, then serve it:
 ```bash
 # 1. Convert to .fni8 (int8 or 4-bit weights, resident dp4a layout)
 python -m fni8serve.convert  /path/to/Qwen3-8B  qwen3-8b.fni8  --bits 8
+# The input checkpoint is preserved. For 850GB+ models that can't fit source+output
+# on disk at once, add --free-source-shards to delete each source shard as it is
+# converted (DESTRUCTIVE — only for a disposable/re-downloadable copy).
 ```
 
 ```python

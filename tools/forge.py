@@ -87,7 +87,11 @@ def quant_llm(repo: str, bits: int, group: int) -> Path:
     name = _name(repo)
     stage, out = STAGING / name, WEIGHTS / f"{name}.b{bits}.fni8"
     _download(repo, stage, ["*.safetensors", "config.json", "*.model", "tokenizer*", "*.txt"])
-    convert_hf_to_fni8(str(stage), str(out), weight_bits=bits, group_size=group)
+    # `stage` is a disposable download we own; free each shard as it's consumed so
+    # peak disk stays ~max(source, output) — required to forge 850GB+ models (#69).
+    convert_hf_to_fni8(
+        str(stage), str(out), weight_bits=bits, group_size=group, delete_source=True
+    )
     return out
 
 
