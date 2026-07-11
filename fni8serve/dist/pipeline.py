@@ -4,8 +4,9 @@
 Splits a model's layer stack into 2 stages: stage 0 owns the embedding + first
 half of layers; stage 1 owns the second half + final norm + lm_head. The hidden
 state (and the pre-norm residual stream) crosses the PP boundary through the
-existing transport `send`/`recv` seam (issue #81/D9), compressed to int8 so the
-~250 MB/s PCIe-1.0-x1 link stays viable.
+existing transport ``send``/``recv`` seam (issue #81/D9). The wire codec is
+selected per-boundary by :func:`select_wire_scheme`: int4 when its fidelity
+clears the accuracy-gate bar, int8 otherwise (issue #186).
 
 Micro-batched decode overlaps the transfer with compute: while stage 0 forwards
 micro-batch k+1, stage 1 receives and forwards micro-batch k, keeping both GPUs
@@ -27,6 +28,7 @@ from ..models.cache import MLALatentCache, RecurrentStateCache
 from ..models.config import ModelConfig
 from ..models.registry import build_model
 from . import recv, send
+from .codec_quality import select_wire_scheme
 
 # Monkey-patch fni8's hadamard_matrix so its LRU cache key includes the concrete
 # GPU device index, not just the device type.  Without this, the matrix created
@@ -364,6 +366,7 @@ class PipelineEngine:
         max_len: int = 2048,
         max_batch_tokens: int = 8192,
         eos_id: int | None = None,
+        wire_scheme: str | None = None,
     ):
         self.stage0 = stage0
         self.stage1 = stage1
@@ -372,6 +375,7 @@ class PipelineEngine:
         self.hidden_size = cfg.hidden_size
         self._ids = itertools.count()
         self._out: dict[int, Sequence] = {}
+        self._wire_scheme = wire_scheme
 
         from ..engine.scheduler import Scheduler
 
@@ -493,7 +497,8 @@ class PipelineEngine:
                 h_s0, residual = layer(h_s0, pos0, stage0_ctx, residual)
 
             boundary_packed = _pack_boundary(h_s0.contiguous(), residual)
-            handle = send(boundary_packed, dst=dev1, scheme="int8")
+            scheme = self._wire_scheme if self._wire_scheme is not None else select_wire_scheme(boundary_packed)
+            handle = send(boundary_packed, dst=dev1, scheme=scheme)
 
         # --- Stage 1 forward ---
         with torch.cuda.device(dev1):
@@ -603,7 +608,8 @@ class PipelineEngine:
                     h_emb, residual = layer(h_emb, pos_tok, stage0_ctx, residual)
 
                 mb_packed = _pack_boundary(h_emb.contiguous(), residual)
-                handle = send(mb_packed, dst=dev1, scheme="int8")
+                scheme = self._wire_scheme if self._wire_scheme is not None else select_wire_scheme(mb_packed)
+                handle = send(mb_packed, dst=dev1, scheme=scheme)
 
             # --- Stage 1 ---
             with torch.cuda.device(dev1):

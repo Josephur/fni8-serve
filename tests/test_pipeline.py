@@ -147,9 +147,9 @@ class TestPipelineOutputMatchesSingleGpu:
         eng_ref = LLMEngine(cfg, sd0, device="cuda:0", max_num_seqs=4, max_len=64)
         ref_out = eng_ref.generate([prompt], params)[0]
 
-        # 2-stage PP
+        # 2-stage PP (wire_scheme="int8" isolates pipeline logic from codec noise)
         s0, s1 = make_pipeline(cfg, sd, devices=(0, 1), max_num_seqs=4, max_len=64)
-        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=4, max_len=64)
+        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=4, max_len=64, wire_scheme="int8")
         pp_out = eng_pp.generate([prompt], params)[0]
 
         assert pp_out == ref_out, f"PP {pp_out} != ref {ref_out}"
@@ -169,7 +169,7 @@ class TestPipelineOutputMatchesSingleGpu:
         ref_outs = eng_ref.generate(prompts, params)
 
         s0, s1 = make_pipeline(cfg, sd, devices=(0, 1), max_num_seqs=8, max_len=64)
-        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=8, max_len=64)
+        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=8, max_len=64, wire_scheme="int8")
         pp_outs = eng_pp.generate(prompts, params)
 
         for i, (pp, ref) in enumerate(zip(pp_outs, ref_outs)):
@@ -190,7 +190,7 @@ class TestPipelineOutputMatchesSingleGpu:
         ref_out = eng_ref.generate([prompt], params)[0]
 
         s0, s1 = make_pipeline(cfg, sd, devices=(0, 1), max_num_seqs=4, max_len=64)
-        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=4, max_len=64)
+        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=4, max_len=64, wire_scheme="int8")
         pp_out = eng_pp.generate([prompt], params)[0]
 
         assert pp_out == ref_out, f"4-layer PP {pp_out} != ref {ref_out}"
@@ -217,7 +217,7 @@ class TestPipelineOutputMatchesSingleGpu:
         ref_out = eng_ref.generate([prompt], params)[0]
 
         s0, s1 = make_pipeline(cfg, sd, devices=(0, 1), max_num_seqs=4, max_len=64)
-        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=4, max_len=64)
+        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=4, max_len=64, wire_scheme="int8")
         pp_out = eng_pp.generate([prompt], params)[0]
 
         assert ref_out == [7, 7, 7]
@@ -237,7 +237,7 @@ class TestPipelineOutputMatchesSingleGpu:
         ref_out = eng_ref.generate([prompt], params)[0]
 
         s0, s1 = make_pipeline(cfg, sd, devices=(0, 1), max_num_seqs=4, max_len=64)
-        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=4, max_len=64)
+        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=4, max_len=64, wire_scheme="int8")
         pp_out = eng_pp.generate([prompt], params)[0]
 
         assert len(pp_out) == len(ref_out)
@@ -285,7 +285,7 @@ class TestMicrobatching:
         ref_outs = eng_ref.generate(prompts, params)
 
         s0, s1 = make_pipeline(cfg, sd, devices=(0, 1), max_num_seqs=8, max_len=64)
-        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=8, max_len=64)
+        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=8, max_len=64, wire_scheme="int8")
         pp_outs = eng_pp.generate(prompts, params)
 
         for i, (pp, ref) in enumerate(zip(pp_outs, ref_outs)):
@@ -306,7 +306,7 @@ class TestMicrobatching:
         ref_out = eng_ref.generate([prompt], params)[0]
 
         s0, s1 = make_pipeline(cfg, sd, devices=(0, 1), max_num_seqs=4, max_len=64)
-        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=4, max_len=64)
+        eng_pp = PipelineEngine(s0, s1, cfg, max_num_seqs=4, max_len=64, wire_scheme="int8")
         pp_out = eng_pp.generate([prompt], params)[0]
 
         assert pp_out == ref_out, f"batch=1 PP {pp_out} != ref {ref_out}"

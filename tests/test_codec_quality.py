@@ -14,7 +14,7 @@ import torch
 
 pytest.importorskip("fni8")
 
-from fni8serve.dist.codec_quality import verify_boundary_fidelity
+from fni8serve.dist.codec_quality import select_wire_scheme, verify_boundary_fidelity
 
 CUDA = torch.cuda.is_available()
 cuda_only = pytest.mark.skipif(not CUDA, reason="codec quality needs CUDA + fni8")
@@ -105,3 +105,41 @@ class TestVerifyBoundaryFidelity:
         assert len(result) == 2
         assert isinstance(result[0], float)
         assert isinstance(result[1], float)
+
+
+class TestSelectWireScheme:
+    """select_wire_scheme: accuracy-gated codec selection (issue #186)."""
+
+    @cuda_only
+    def test_int4_selected_when_gate_passes(self):
+        """Gaussian activations should clear the int4 bar → scheme = int4."""
+        x = _activation((4, 64, 256))
+        scheme = select_wire_scheme(x)
+        assert scheme == "int4", f"expected int4, got {scheme}"
+
+    @cuda_only
+    def test_int4_selected_for_alternating_extremes(self):
+        """Alternating extreme channels still clear the int4 gate → scheme = int4.
+        The 1000-valued channels dominate the per-group scale and quantise with
+        negligible error; the 1e-4-valued channels round to zero.  SQNR >> 14 dB.
+        """
+        x = torch.empty(4, 64, 256, device="cuda", dtype=torch.float16)
+        x[:, :, ::2] = 1000.0
+        x[:, :, 1::2] = 1e-4
+        scheme = select_wire_scheme(x)
+        assert scheme == "int4", f"expected int4, got {scheme}"
+
+    @cuda_only
+    def test_roundtrip_with_selected_scheme(self):
+        """send/recv with the selected scheme passes accuracy_report bars."""
+        from fni8serve.dist import accuracy_report, recv, send
+
+        x = _activation((4, 64, 256))
+        scheme = select_wire_scheme(x)
+        handle = send(x, dst=torch.cuda.current_device(), scheme=scheme)
+        xr = recv(handle)
+        rep = accuracy_report(x, xr, scheme)
+        assert rep["sqnr_pass"], (
+            f"{scheme} SQNR {rep['sqnr_db']:.1f} < {rep['sqnr_bar']:.1f}"
+        )
+        assert rep["cos_pass"], f"{scheme} cos {rep['cos']:.6f} < {rep['cos_bar']:.6f}"

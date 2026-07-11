@@ -26,7 +26,8 @@ def verify_boundary_fidelity(
         fp16 activation tensor on the CUDA device.
     compressor:
         Wire-codec scheme name (e.g. ``"int8"``, ``"int4"``, ``"int4-had"``,
-        ``"nf4"``, ``"fp16"``) matching ``fni8.compress_activation``.
+        ``"nf4"``, ``"fp16"``) matching ``fni8.compress_activation``.  Call
+        :func:`select_wire_scheme` to let the accuracy gate choose the scheme.
     group_size:
         Group size for per-group quantization schemes. Defaults to ``128`` for
         int4-compatible schemes, ``None`` for per-tensor.
@@ -62,3 +63,31 @@ def verify_boundary_fidelity(
     cos = float(torch.nn.functional.cosine_similarity(x, xr, dim=0, eps=1e-12))
 
     return sqnr_db, cos
+
+
+def select_wire_scheme(
+    activation: torch.Tensor,
+    group_size: int | None = None,
+) -> str:
+    """Select wire-codec scheme by gating int4 fidelity on *activation*.
+
+    Compresses and decompresses *activation* with int4, then checks SQNR and
+    cosine against the acceptance bars (14 dB / 0.98).  Returns ``"int4"`` when
+    both metrics clear the bar and ``"int8"`` otherwise, so the PP boundary
+    always uses the densest codec that the data tolerates.
+
+    Parameters
+    ----------
+    activation:
+        fp16 activation tensor on the CUDA device (same as
+        :func:`verify_boundary_fidelity`).
+    group_size:
+        Group size forwarded to :func:`verify_boundary_fidelity`.  ``None``
+        uses the scheme default (128 for int4).
+
+    Returns
+    -------
+    ``"int4"`` or ``"int8"``.
+    """
+    sqnr, cos = verify_boundary_fidelity(activation, "int4", group_size=group_size)
+    return "int4" if sqnr >= 14.0 and cos >= 0.98 else "int8"
