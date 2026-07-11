@@ -283,9 +283,27 @@ class TestEstimateThroughput:
         est = estimate_throughput(s, dense_cfg, seq_len=512, batch_size=4)
         bw = est["on_wire_bytes_per_token"]
         assert bw >= 0
-        # A single hidden state (128 * 2 bytes fp16 = 256 bytes) per PP boundary
-        # times 1-2 steps per token = upper bound of ~1KB/tok
+        # A single hidden state (128 * 1 byte int8 = 128 bytes) per PP boundary
+        # times 1-2 steps per token = upper bound of ~512 B/tok
         assert bw < 4096, f"on_wire bytes/token {bw} too high for shallow PP"
+
+    def test_codec_aware_bytes_per_token(self, dense_cfg):
+        """On-wire bytes/token must reflect the active codec's bits-per-element."""
+        s = plan_parallelism(dense_cfg, num_gpus=4)
+        hidden = dense_cfg.hidden_size
+        pp_b = s.pp_size - 1  # PP boundaries = pp - 1
+
+        est_fp16 = estimate_throughput(s, dense_cfg, codec="fp16")
+        est_int8 = estimate_throughput(s, dense_cfg, codec="int8")
+        est_int4 = estimate_throughput(s, dense_cfg, codec="int4")
+
+        assert est_fp16["activation_bytes_per_boundary"] == hidden * 2
+        assert est_int8["activation_bytes_per_boundary"] == hidden * 1
+        assert est_int4["activation_bytes_per_boundary"] == hidden * 0.5
+
+        assert est_fp16["on_wire_bytes_per_token"] == hidden * 2 * pp_b
+        assert est_int8["on_wire_bytes_per_token"] == hidden * 1 * pp_b
+        assert est_int4["on_wire_bytes_per_token"] == hidden * 0.5 * pp_b
 
     def test_moe_ep_reduces_bytes_vs_deep_pp(self, moe_cfg):
         """On MoE models, stage-local EP keeps expert traffic local, so bytes/token

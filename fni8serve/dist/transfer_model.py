@@ -73,6 +73,11 @@ _DECOMPRESS_PER_ELEMENT_US: dict[str, float] = {
 _WIRE_FIXED_LATENCY_US = 5.0
 
 
+def bytes_per_element(scheme: str) -> float:
+    """Bytes per element on the wire for *scheme* (code payload, no group scales)."""
+    return _BYTES_PER_ELEMENT.get(scheme, _BYTES_PER_ELEMENT["int8"])
+
+
 def _numel(shape) -> int:
     return int(torch.Size(shape).numel())
 

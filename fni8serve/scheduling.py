@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .dist.transfer_model import bytes_per_element
 from .models.config import ModelConfig
 
 # ── Fleet-constant wire budget ─────────────────────────────────────────────
@@ -36,10 +37,10 @@ _BW_RATIO = _HBM_BW_BYTES / _PCIE_BW_BYTES
 _MAX_PP_DEPTH = 4
 
 
-# Per-token hidden-state bytes over one PP boundary (fp16 activation).
-def _activation_bytes_per_token(hidden_size: int) -> int:
-    """Bytes of one fp16 hidden vector crossing a single PP boundary."""
-    return hidden_size * 2  # fp16 = 2 bytes per element
+# Per-token hidden-state bytes over one PP boundary, codec-aware.
+def _activation_bytes_per_token(hidden_size: int, codec: str = "int8") -> int:
+    """Bytes of one hidden vector crossing a single PP boundary under *codec*."""
+    return int(hidden_size * bytes_per_element(codec))
 
 
 # ── Strategy planning ──────────────────────────────────────────────────────
@@ -214,6 +215,7 @@ def estimate_throughput(
     *,
     seq_len: int = 512,
     batch_size: int = 4,
+    codec: str = "int8",
 ) -> dict:
     """Topology-agnostic throughput and latency estimate for a given strategy.
 
@@ -234,7 +236,7 @@ def estimate_throughput(
     pp = strategy.pp_size
     n_replicas = strategy.num_replicas
 
-    act_bytes_per_boundary = _activation_bytes_per_token(hidden)
+    act_bytes_per_boundary = _activation_bytes_per_token(hidden, codec=codec)
     pp_boundaries = max(0, pp - 1)
 
     on_wire_bytes = act_bytes_per_boundary * pp_boundaries
