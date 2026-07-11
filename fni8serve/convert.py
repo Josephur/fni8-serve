@@ -258,22 +258,6 @@ def convert_hf_to_fni8(
                     if k.endswith(scale_suffixes):
                         fp8_scales[k] = f.get_tensor(k)
 
-    # `extra` (a dict) carries every divergent family's hybrid layer metadata —
-    # LFM2 `layer_types`/`conv_L_cache`, MiniMax `attn_type_list`, Qwen3-Next linear
-    # head dims, DeepSeek MLA `kv_lora_rank`, etc. It MUST survive into the file or a
-    # real checkpoint can't be rebuilt (the model builders read cfg.extra[...]). The
-    # old dump dropped every dict field, silently losing it; keep `extra` nested so
-    # both load paths round-trip it: `ModelConfig(**cfg)` sees it as the native
-    # `extra` field, and `ModelConfig.from_hf(cfg)` merges it back (see from_hf).
-    cfg_dump = {k: v for k, v in vars(cfg).items() if not isinstance(v, dict)}
-    cfg_dump["extra"] = dict(cfg.extra)
-    meta = {
-        "arch": cfg.arch,
-        "weight_bits": weight_bits,
-        "fp8_source": is_fp8_src,
-        "config": cfg_dump,
-    }
-
     # Stream to disk one shard at a time: quantize a shard, write its tensors, free
     # them, next shard. Peak RAM is a single shard (~a few GB), NOT the whole
     # quantized model -- so 160GB+ models (DeepSeek-V4-Flash, MiniMax-M3) convert
@@ -287,6 +271,15 @@ def convert_hf_to_fni8(
             try:
                 sd = load_file(shard_path)
                 sd = _remap_qwen3_next(sd, cfg)
+                # Detect q_norm/k_norm weights in the state dict and promote
+                # qk_norm — some HF configs (e.g. Qwen3 family) don't carry an
+                # explicit qk_norm field, but the checkpoint DOES have per-head
+                # QK-norm weights. Without this, the persisted ModelConfig
+                # metadata silently records qk_norm=False (issue #171).
+                if not cfg.qk_norm and any(
+                    ".q_norm.weight" in k or ".k_norm.weight" in k for k in sd
+                ):
+                    cfg.qk_norm = True
                 q = quantize_state_dict(
                     sd,
                     weight_bits=weight_bits,
@@ -301,6 +294,18 @@ def convert_hf_to_fni8(
             finally:
                 if delete_source:
                     os.remove(shard_path)
+
+        # Build meta AFTER the shard loop so any fields promoted from weights
+        # (e.g. qk_norm detected via q_norm/k_norm tensors, issue #171) are
+        # reflected in the persisted cfg_dump.
+        cfg_dump = {k: v for k, v in vars(cfg).items() if not isinstance(v, dict)}
+        cfg_dump["extra"] = dict(cfg.extra)
+        meta = {
+            "arch": cfg.arch,
+            "weight_bits": weight_bits,
+            "fp8_source": is_fp8_src,
+            "config": cfg_dump,
+        }
         w.finalize(meta=meta)
     return cfg
 

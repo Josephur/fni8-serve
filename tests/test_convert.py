@@ -495,3 +495,55 @@ def test_qwen3_next_remap_skips_other_archs():
     assert set(mapped.keys()) == set(sd.keys())
     for k in sd:
         assert mapped[k] is sd[k]
+
+
+def test_convert_detects_qk_norm_from_weights(tmp_path):
+    """A Qwen3 checkpoint WITH q_norm/k_norm weights must round-trip qk_norm=True
+    in the .fni8 metadata, even when the HF config.json lacks an explicit qk_norm
+    field (issue #171)."""
+    pytest.importorskip("safetensors")
+    from safetensors.torch import save_file
+
+    import fni8serve.convert as convert_mod
+
+    cfg = _cfg()
+    cfg.qk_norm = False  # simulate the bug: converter must detect from weights
+    sd = _sd(cfg)  # includes q_norm/k_norm weights
+    save_file(sd, str(tmp_path / "model.safetensors"))
+    hf = _hf_config_dict(cfg)  # no qk_norm key
+    (tmp_path / "config.json").write_text(json.dumps(hf))
+
+    out = tmp_path / "m.fni8"
+    convert_mod.convert_hf_to_fni8(str(tmp_path), str(out), weight_bits=8)
+
+    meta_cfg = checkpoint_info(str(out))["meta"]["config"]
+    assert meta_cfg["qk_norm"] is True, (
+        "Qwen3 checkpoint with q_norm/k_norm weights must record qk_norm=True"
+    )
+    assert checkpoint_info(str(out))["num_tensors"] == len(sd)
+
+
+def test_convert_qk_norm_stays_false_without_norm_weights(tmp_path):
+    """A checkpoint WITHOUT q_norm/k_norm weights must keep qk_norm=False."""
+    pytest.importorskip("safetensors")
+    from safetensors.torch import save_file
+
+    cfg = _cfg()
+    cfg.qk_norm = False
+    sd = _sd(cfg)
+    # Strip q_norm/k_norm weights
+    for k in list(sd):
+        if ".q_norm." in k or ".k_norm." in k:
+            del sd[k]
+    save_file(sd, str(tmp_path / "model.safetensors"))
+    hf = _hf_config_dict(cfg)
+    (tmp_path / "config.json").write_text(json.dumps(hf))
+
+    out = tmp_path / "m.fni8"
+    convert_hf_to_fni8(str(tmp_path), str(out), weight_bits=8)
+
+    meta_cfg = checkpoint_info(str(out))["meta"]["config"]
+    assert meta_cfg["qk_norm"] is False, (
+        "Checkpoint without q_norm/k_norm weights must keep qk_norm=False"
+    )
+    assert checkpoint_info(str(out))["num_tensors"] == len(sd)
