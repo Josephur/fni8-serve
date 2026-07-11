@@ -28,6 +28,14 @@ class EngineRunner:
         self.cache = cache
         self.device = device
         self.lin_cache = lin_cache or RecurrentStateCache()
+        # Families with recurrent (DeltaNet / lightning / short-conv) layers carry
+        # per-slot decode state through `lin_cache`. Two consequences for the engine:
+        # (1) each such layer's state is keyed per slot, so prefill must clear+bind
+        # its slot and decode must bind the whole batch's slots; (2) the recurrence
+        # is order-dependent, so multiple sequences can't be packed into one varlen
+        # forward (that would run the scan across sequence boundaries) — they prefill
+        # one at a time instead. Detected by a marker on the mixer modules.
+        self.has_recurrent = any(getattr(m, "is_recurrent", False) for m in model.modules())
         self.sampler = Sampler()
         # Decode is dispatch-bound (~3,200 cudaLaunchKernel/step on a 28-layer
         # 0.6B model for ~18ms of real GPU work -- issue #42): `GraphedDecode`
@@ -94,7 +102,8 @@ class EngineRunner:
     def encode(self, batch: list[Sequence]) -> torch.Tensor:
         hiddens = []
         for seq in batch:
-            self.lin_cache.reset()
+            self.lin_cache.clear_slot(seq.slot)
+            self.lin_cache.bind([seq.slot])
             ids = torch.tensor([seq.prompt_ids], device=self.device)
             pos = torch.arange(seq.num_prompt, device=self.device).unsqueeze(0)
             self.cache.ensure_capacity([seq.slot], [seq.num_prompt])
@@ -114,11 +123,14 @@ class EngineRunner:
     def prefill(self, batch: list[Sequence]) -> list[int]:
         from .kv_cache import PagedKVCache
 
-        if len(batch) > 1 and isinstance(self.cache, PagedKVCache):
+        if len(batch) > 1 and isinstance(self.cache, PagedKVCache) and not self.has_recurrent:
             return self._prefill_varlen(batch)
         out = []
         for seq in batch:
-            self.lin_cache.reset()
+            # Fresh slot for this sequence's recurrent state; bind so the mixer
+            # layers read/write only this slot (not other running sequences').
+            self.lin_cache.clear_slot(seq.slot)
+            self.lin_cache.bind([seq.slot])
             ids = torch.tensor([seq.prompt_ids], device=self.device)  # [1, S]
             pos = torch.arange(seq.num_prompt, device=self.device).unsqueeze(0)
             self.cache.ensure_capacity([seq.slot], [seq.num_prompt])
@@ -203,6 +215,9 @@ class EngineRunner:
         slots = [s.slot for s in batch]
         lengths = [s.length for s in batch]
         self.cache.ensure_capacity(slots, [n + 1 for n in lengths])
+        # Bind this batch's slots so each recurrent layer gathers/scatters its
+        # per-slot state aligned to the batch rows (no-op for non-recurrent models).
+        self.lin_cache.bind(slots)
         ctx = ForwardContext(
             is_prefill=False,
             kv_cache=self.cache,

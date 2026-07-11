@@ -240,11 +240,18 @@ class ModelConfig:
             is_multimodal=vision_cfg is not None,
             vision_config=vision_cfg,
             image_token_id=vision_cfg.image_token_id if vision_cfg else None,
-            extra={k: v for k, v in c.items() if k not in _KNOWN_HF_KEYS},
+            # arch-specific overflow = every unknown HF key, PLUS a nested `extra`
+            # dict if this config is a round-tripped `.fni8` dump (convert.py stores
+            # cfg.extra nested so it survives; merge it back, authoritative).
+            extra={
+                **{k: v for k, v in c.items() if k not in _KNOWN_HF_KEYS and k != "extra"},
+                **(c.get("extra") or {}),
+            },
         )
 
 
 _KNOWN_HF_KEYS = {
+    "extra",  # nested arch-overflow from a round-tripped .fni8 dump (merged separately)
     "text_config",
     "architectures",
     "model_type",

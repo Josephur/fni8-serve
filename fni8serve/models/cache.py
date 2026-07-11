@@ -50,33 +50,74 @@ class KVCache:
 
 
 class RecurrentStateCache:
-    """Per-layer decode-time state for linear-attention layers (Gated DeltaNet,
-    lightning attention): the recurrent state `S` and, for DeltaNet's causal
-    depthwise conv, the trailing `kernel-1` raw window feeding it. Keyed by layer
-    index; only linear-attention layers touch this (full/sliding/latent layers use
-    `KVCache` instead). Prefill starts each layer from scratch (`get_*` returns None);
-    decode carries the previous call's state back in so the recurrence doesn't reset
-    every step."""
+    """Per-**slot** decode-time state for linear-attention layers (Gated DeltaNet,
+    lightning attention, LFM2 short-conv): the recurrent state `S` and, for the
+    causal depthwise conv, the trailing `kernel-1` raw window feeding it. Only
+    linear/conv/lightning layers touch this (full/sliding/latent layers use
+    `KVCache` instead). Prefill starts each layer from scratch (`get_*` returns
+    None); decode carries the previous call's state back in so the recurrence
+    doesn't reset every step.
+
+    **Continuous batching**: a single global (layer-keyed) state cannot serve more
+    than one concurrent sequence — the engine batches every running sequence into
+    one `[B, 1, H]` decode call, so a batch-1 state cached from one sequence would
+    either collide with or (for the conv tail) shape-mismatch the batch-B decode
+    input. State is therefore keyed by ``(slot, layer)``: the runner calls
+    ``bind(slots)`` with the ordered slot of each batch row before a forward, and
+    ``get_*`` gathers those slots' rows into a ``[B, ...]`` tensor while ``set_*``
+    scatters the updated ``[B, ...]`` back per slot. The single-batch
+    ``ModelRunner`` never binds, so it transparently uses one implicit slot 0."""
 
     def __init__(self):
-        self._state: dict[int, torch.Tensor] = {}
-        self._conv_tail: dict[int, torch.Tensor] = {}
+        self._state: dict[tuple[int, int], torch.Tensor] = {}
+        self._conv_tail: dict[tuple[int, int], torch.Tensor] = {}
+        self._slots: list[int] | None = None
+
+    def bind(self, slots: list[int] | None) -> None:
+        """Set the ordered slot list for the next forward — row ``i`` of every
+        get/set maps to ``slots[i]``. ``None`` (the default) selects the
+        single-batch path (one implicit slot 0)."""
+        self._slots = list(slots) if slots is not None else None
+
+    def _active(self) -> list[int]:
+        return self._slots if self._slots is not None else [0]
+
+    def clear_slot(self, slot: int) -> None:
+        """Drop every layer's state/tail for one slot — called when a slot is
+        (re)allocated to a fresh sequence so leftover state can never leak in."""
+        for store in (self._state, self._conv_tail):
+            for key in [k for k in store if k[0] == slot]:
+                del store[key]
+
+    def _gather(self, store, layer_idx):
+        rows = [store.get((s, layer_idx)) for s in self._active()]
+        present = next((r for r in rows if r is not None), None)
+        if present is None:
+            return None  # fresh (prefill / first decode) — recurrence starts at zero
+        rows = [r if r is not None else torch.zeros_like(present) for r in rows]
+        return torch.cat(rows, dim=0)
+
+    def _scatter(self, store, layer_idx, value):
+        slots = self._active()
+        for i, s in enumerate(slots):
+            store[(s, layer_idx)] = value[i : i + 1]
 
     def get_state(self, layer_idx: int) -> torch.Tensor | None:
-        return self._state.get(layer_idx)
+        return self._gather(self._state, layer_idx)
 
     def set_state(self, layer_idx: int, state: torch.Tensor):
-        self._state[layer_idx] = state
+        self._scatter(self._state, layer_idx, state)
 
     def get_conv_tail(self, layer_idx: int) -> torch.Tensor | None:
-        return self._conv_tail.get(layer_idx)
+        return self._gather(self._conv_tail, layer_idx)
 
     def set_conv_tail(self, layer_idx: int, tail: torch.Tensor):
-        self._conv_tail[layer_idx] = tail
+        self._scatter(self._conv_tail, layer_idx, tail)
 
     def reset(self):
         self._state.clear()
         self._conv_tail.clear()
+        self._slots = None
 
 
 class MLALatentCache:

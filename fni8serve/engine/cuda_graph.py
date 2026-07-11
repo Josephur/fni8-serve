@@ -167,6 +167,13 @@ class GraphedDecode:
             return False, "MoE routing is data-dependent (mask.nonzero()), not graph-capturable"
         if cfg.linear_attention or cfg.latent_attention:
             return False, "linear/latent-attention decode isn't wired for static capture"
+        # Recurrent mixers (LFM2 short-conv, MiniMax lightning) don't set the
+        # `linear_attention` cfg flag, but their per-slot decode state (a dynamic
+        # python dict of freshly-allocated tensors, mutated every step) is not
+        # graph-capturable either. Detect them structurally and stay eager.
+        _modules = getattr(self.model, "modules", None)
+        if callable(_modules) and any(getattr(m, "is_recurrent", False) for m in _modules()):
+            return False, "recurrent (short-conv/lightning) decode state isn't graph-capturable"
         for i in range(cfg.num_hidden_layers):
             if cfg.attention_kind(i) != "full":
                 return (

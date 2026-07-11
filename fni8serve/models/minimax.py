@@ -25,6 +25,8 @@ from .weights import merge_qtensor, to_qtensor
 
 
 class LightningAttention(nn.Module):
+    is_recurrent = True  # carries per-slot decode state via ctx.lin_cache
+
     def __init__(self, cfg, *, qkv_proj, out_proj, output_gate, norm_gain, num_heads, head_dim, slopes):
         super().__init__()
         self.nh, self.hd = num_heads, head_dim

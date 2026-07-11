@@ -70,6 +70,8 @@ class GatedDeltaNetAttention(nn.Module):
     conv weight [width, kernel], out_proj, and the gated output RMSNorm gain.
     """
 
+    is_recurrent = True  # carries per-slot decode state via ctx.lin_cache
+
     def __init__(
         self,
         cfg,
@@ -181,6 +183,8 @@ def lightning_slopes(num_heads: int, device="cpu") -> torch.Tensor:
 class ShortConv(nn.Module):
     """LFM2 double-gated causal depthwise short conv (LIV): out = out_proj(C * conv(B*x)),
     with (B,C,x) = in_proj(h).chunk(3). in_proj/out_proj on dp4a; conv is depthwise k=3."""
+
+    is_recurrent = True  # carries per-slot decode conv-tail via ctx.lin_cache
 
     def __init__(self, dim: int, *, in_proj: QTensor, out_proj: QTensor, conv_weight, kernel=3):
         super().__init__()

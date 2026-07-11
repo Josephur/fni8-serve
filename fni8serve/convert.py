@@ -247,11 +247,20 @@ def convert_hf_to_fni8(
                     if k.endswith(scale_suffixes):
                         fp8_scales[k] = f.get_tensor(k)
 
+    # `extra` (a dict) carries every divergent family's hybrid layer metadata —
+    # LFM2 `layer_types`/`conv_L_cache`, MiniMax `attn_type_list`, Qwen3-Next linear
+    # head dims, DeepSeek MLA `kv_lora_rank`, etc. It MUST survive into the file or a
+    # real checkpoint can't be rebuilt (the model builders read cfg.extra[...]). The
+    # old dump dropped every dict field, silently losing it; keep `extra` nested so
+    # both load paths round-trip it: `ModelConfig(**cfg)` sees it as the native
+    # `extra` field, and `ModelConfig.from_hf(cfg)` merges it back (see from_hf).
+    cfg_dump = {k: v for k, v in vars(cfg).items() if not isinstance(v, dict)}
+    cfg_dump["extra"] = dict(cfg.extra)
     meta = {
         "arch": cfg.arch,
         "weight_bits": weight_bits,
         "fp8_source": is_fp8_src,
-        "config": {k: v for k, v in vars(cfg).items() if not isinstance(v, dict)},
+        "config": cfg_dump,
     }
 
     # Stream to disk one shard at a time: quantize a shard, write its tensors, free

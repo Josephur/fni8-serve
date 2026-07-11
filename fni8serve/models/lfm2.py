@@ -115,7 +115,13 @@ class Lfm2ForCausalLM(nn.Module):
     def __init__(self, cfg: ModelConfig, sd: dict):
         super().__init__()
         self.config = cfg
-        attn_idxs = set(cfg.extra.get("full_attn_idxs", []))
+        # Which layers are full attention vs short-conv. Older LFM2 configs list the
+        # indices directly (`full_attn_idxs`); current HF configs (LFM2.5, LFM2-2.6B)
+        # instead carry `layer_types` = ["conv"|"full_attention", ...] per layer.
+        # Support both so a real HF checkpoint loads without a hand-authored config.
+        attn_idxs = set(cfg.extra.get("full_attn_idxs") or [])
+        if not attn_idxs and cfg.extra.get("layer_types"):
+            attn_idxs = {i for i, t in enumerate(cfg.extra["layer_types"]) if t == "full_attention"}
         self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"])
         rope = RotaryEmbedding(
             cfg.resolved_head_dim(), cfg.max_position_embeddings, base=cfg.rope_theta
@@ -130,7 +136,11 @@ class Lfm2ForCausalLM(nn.Module):
             if "model.embedding_norm.weight" in sd
             else sd["model.norm.weight"],
         )
-        lm_w = sd["model.embed_tokens.weight"] if cfg.tie_word_embeddings else sd["lm_head.weight"]
+        # LFM2 ties the LM head to the embedding and names the flag `tie_embedding`
+        # (not the HF-standard `tie_word_embeddings`), so `cfg.tie_word_embeddings`
+        # can read False even though no separate `lm_head.weight` exists. Fall back to
+        # the embedding whenever an untied head isn't actually present in the weights.
+        lm_w = sd["lm_head.weight"] if "lm_head.weight" in sd else sd["model.embed_tokens.weight"]
         self.lm_head = LMHead(to_qtensor(lm_w))
 
     def forward(self, input_ids, positions, ctx: ForwardContext):

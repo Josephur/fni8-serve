@@ -303,3 +303,27 @@ def test_engine_qwen3_next_hybrid_matches_runner():
     assert eng_out[0] == ref[0], f"first token mismatch: {eng_out} vs {ref}"
     agree = sum(1 for a, b in zip(eng_out, ref) if a == b) / len(ref)
     assert agree >= 0.8, f"engine vs runner hybrid decode diverged too much: {eng_out} vs {ref}"
+
+
+def test_engine_qwen3_next_concurrent_recurrent_decode():
+    """Continuous batching for a recurrent (hybrid DeltaNet) family: two sequences
+    decoded CONCURRENTLY through one engine must produce exactly what each produces
+    when run alone. Before per-slot recurrent state this crashed outright — the
+    conv-tail cached from the last prefilled sequence (batch 1) was `torch.cat`-ed
+    against a batch-2 decode input — and, absent the crash, the two sequences shared
+    one global recurrent state and corrupted each other. This is the property that
+    makes divergent families actually SERVE (not just single-request generate)."""
+    torch.manual_seed(42)
+    cfg, sd = _qwen3_next_hybrid_cfg_sd()
+    pA = [3, 1, 4, 1, 5, 9, 2, 6]
+    pB = [7, 2, 7, 1, 8, 2, 8]  # different length on purpose (ragged batch)
+    params = SamplingParams(temperature=0.0, max_tokens=6)
+
+    eng = LLMEngine(cfg, sd, device="cuda", max_num_seqs=4, max_len=64)
+    both = eng.generate([pA, pB], params)
+
+    solo_a = LLMEngine(cfg, sd, device="cuda", max_num_seqs=4, max_len=64).generate([pA], params)[0]
+    solo_b = LLMEngine(cfg, sd, device="cuda", max_num_seqs=4, max_len=64).generate([pB], params)[0]
+
+    assert both[0] == solo_a, f"seq A corrupted by concurrent decode: {both[0]} vs {solo_a}"
+    assert both[1] == solo_b, f"seq B corrupted by concurrent decode: {both[1]} vs {solo_b}"

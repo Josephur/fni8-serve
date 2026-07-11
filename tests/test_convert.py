@@ -173,6 +173,46 @@ def _hf_config_dict(cfg):
     }
 
 
+def test_convert_persists_extra_for_divergent_families(tmp_path):
+    """A `.fni8` must carry the `extra` dict — every divergent family's hybrid layer
+    metadata (LFM2 `layer_types`, MiniMax `attn_type_list`, Qwen3-Next linear head
+    dims, DeepSeek `kv_lora_rank`) lives there and the model builders read it. The
+    old meta dump dropped every dict field, so a real divergent checkpoint converted
+    fine but could not be rebuilt (arch silently lost). Both load paths must recover
+    it: `ModelConfig.from_hf(meta_cfg)` (api server) and `ModelConfig(**meta_cfg)`
+    (bench). Uses a plain qwen3 checkpoint with extra HF keys injected — the metadata
+    round-trip is arch-independent."""
+    pytest.importorskip("safetensors")
+    from safetensors.torch import save_file
+
+    import fni8serve.convert as convert_mod
+
+    cfg = _cfg()
+    sd = _sd(cfg)
+    save_file(sd, str(tmp_path / "model.safetensors"))
+    hf = _hf_config_dict(cfg)
+    # Divergent-family-style keys that from_hf funnels into cfg.extra:
+    hf["layer_types"] = ["conv", "full_attention"]
+    hf["conv_L_cache"] = 3
+    hf["linear_num_key_heads"] = 2
+    (tmp_path / "config.json").write_text(json.dumps(hf))
+
+    out = tmp_path / "m.fni8"
+    convert_mod.convert_hf_to_fni8(str(tmp_path), str(out), weight_bits=8)
+
+    meta_cfg = checkpoint_info(str(out))["meta"]["config"]
+    assert "extra" in meta_cfg and meta_cfg["extra"].get("conv_L_cache") == 3
+
+    from fni8serve.models.config import ModelConfig
+
+    via_from_hf = ModelConfig.from_hf(meta_cfg, arch=meta_cfg.get("arch"))
+    assert via_from_hf.extra.get("layer_types") == ["conv", "full_attention"]
+    assert via_from_hf.extra.get("linear_num_key_heads") == 2
+
+    via_ctor = ModelConfig(**meta_cfg)
+    assert via_ctor.extra.get("conv_L_cache") == 3
+
+
 def test_convert_hf_to_fni8_streams_shards_one_at_a_time(tmp_path, monkeypatch):
     """Regression for the 220GB-in-RAM OOM (GLM-4.5-Air): convert_hf_to_fni8 must
     quantize each safetensors shard as it's loaded rather than merging the whole

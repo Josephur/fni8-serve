@@ -31,15 +31,30 @@ released-✅ as "supported for generation."
 | **DiffusionGemma** | ✅ (post-cutoff) | **bidirectional** over canvas | GeGLU MoE | 🟡 | `attn_int8_fwd(causal=False)`; needs DiffusionDecodeStrategy |
 | **Gemma4 / gemma3n** | ✅ | GQA + AltUp/LAuReL/PLE/MatFormer | GeGLU | 🟧 | residual-mixing + per-layer-embeddings are new modules |
 
-**Registered & prefill-tested this round** (`tests/test_more_models.py`,
-`test_deepseek.py`): LFM2, GLM, Hunyuan, MiniMax, Qwen3-Next — all build through the
-registry and run a prefill forward on the fni8 dp4a kernels. DeepSeek additionally
-runs full autoregressive decode (`ModelRunner.generate_greedy`) through
-`MLALatentCache` — the compressed `c_KV + k_pe` per token, up-projected via
-`kv_b_proj` each decode step (no weight absorption yet, so it's O(N) extra GEMM work
-per step; the Track-2 absorb kernel removes that). Full autoregressive decode for the
-remaining linear/conv/lightning families still needs recurrent-state caching
-(Track 1.5; the Track-2 int8 kernels provide it naturally).
+**Registered + full autoregressive decode** (`tests/test_more_models.py`,
+`test_engine.py`, `test_deepseek.py`): LFM2, GLM, Hunyuan, MiniMax, Qwen3-Next all
+build through the registry, prefill on the fni8 dp4a kernels, AND decode token-by-token
+through the `RecurrentStateCache` (Gated-DeltaNet / lightning recurrent state + the
+short-conv trailing window carried across steps). Decode is validated two ways: the
+stepwise output matches a single teacher-forced forward over prompt+generated
+(`test_*_decode_matches_teacher_forced`), and the same tokens come out through the
+continuous-batching engine (`test_engine_qwen3_next_hybrid_matches_runner`). The
+recurrent state is keyed **per slot**, so several divergent-family sequences decode
+**concurrently** through one engine without corrupting each other's scan
+(`test_engine_qwen3_next_concurrent_recurrent_decode`) — that's what makes them serve,
+not just single-request generate. DeepSeek decodes through `MLALatentCache`, and its
+decode step runs the Track-2 int8 **absorb** kernel (`fni8.mla_decode_absorb_int8`),
+which folds `W_UK`/`W_UV` so the O(N) per-step up-projection GEMM disappears.
+
+Real divergent-family **checkpoints** now load end-to-end: the converter persists the
+`extra` dict (each family's hybrid layer map — LFM2 `layer_types`, MiniMax
+`attn_type_list`, Qwen3-Next linear head dims, DeepSeek `kv_lora_rank`) into the
+`.fni8` meta, which the old dump silently dropped. LFM2 is verified from a real HF
+checkpoint (convert → int8 `.fni8` → tokenize → 32-token decode). Qwen3-Next / MiniMax
+real-checkpoint loading additionally needs `from_hf` to derive the
+`linear_attention` / `full_attention_interval` scalar flags from the HF config (the
+synthetic-config tests set them by hand) — a small `from_hf` follow-up, tracked
+separately; the decode path and cache are complete.
 Generative multimodal (Z-Image, Qwen-Image, LTX, Wan, Qwen3-TTS) → see the
 diffusion-pipeline plan; the DiT backbone reuses these kernels, the pipeline is new.
 
