@@ -72,19 +72,77 @@ class RecurrentStateCache:
         self._state: dict[tuple[int, int], torch.Tensor] = {}
         self._conv_tail: dict[tuple[int, int], torch.Tensor] = {}
         self._slots: list[int] | None = None
+        # -- static (CUDA-graph-capturable) mode --------------------------------
+        # When enabled, per-slot state lives in FIXED-ADDRESS pre-allocated buffers
+        # `[num_slots, *row_shape]` (one per layer, lazily sized from the first
+        # write) instead of a python dict of freshly-allocated tensors. get/set
+        # gather/scatter into those buffers IN PLACE, so the recurrent decode step
+        # reads/writes the SAME memory every step and can be captured into a CUDA
+        # graph (engine/cuda_graph.py). Eager callers (prefill, eager-decode
+        # fallback) index the buffers by the python slot list; the graphed decode
+        # replay indexes them by a persistent device tensor (`bind_graph`) that maps
+        # each batch row to its slot -- refreshed in place before every replay, the
+        # way the paged-KV path refreshes its slot_mapping. Both share ONE store, so
+        # prefill state is visible to graphed decode with no cross-buffer copy.
+        self._static = False
+        self._num_slots = 0
+        self._state_buf: dict[int, torch.Tensor] = {}
+        self._conv_buf: dict[int, torch.Tensor] = {}
+        self._row_idx: torch.Tensor | None = None  # device Long[B] row->slot, or None
+
+    def enable_static_buffers(self, num_slots: int) -> None:
+        """Switch to fixed-address per-slot buffers (graph-capturable). Must be
+        called BEFORE the first prefill so prefill and graphed decode share one
+        store. Idempotent."""
+        self._static = True
+        self._num_slots = num_slots
 
     def bind(self, slots: list[int] | None) -> None:
-        """Set the ordered slot list for the next forward — row ``i`` of every
-        get/set maps to ``slots[i]``. ``None`` (the default) selects the
-        single-batch path (one implicit slot 0)."""
+        """Set the ordered slot list for the next (eager) forward — row ``i`` of
+        every get/set maps to ``slots[i]``. ``None`` (the default) selects the
+        single-batch path (one implicit slot 0). Clears any graph row-index so the
+        eager python-list path is used."""
         self._slots = list(slots) if slots is not None else None
+        self._row_idx = None
+
+    def bind_graph(self, row_idx: torch.Tensor) -> None:
+        """Static mode only: bind the persistent device row->slot index tensor the
+        captured graph gathers/scatters through. `row_idx[i]` is the cache slot of
+        batch row `i` (pad rows point at the scratch slot). The SAME tensor object
+        must be reused across replays (its contents are refreshed in place)."""
+        self._row_idx = row_idx
 
     def _active(self) -> list[int]:
         return self._slots if self._slots is not None else [0]
 
+    def _sget(self, buf: dict[int, torch.Tensor], layer_idx: int) -> torch.Tensor | None:
+        t = buf.get(layer_idx)
+        if t is None:
+            return None  # not yet written this run -> recurrence starts at zero
+        if self._row_idx is not None:
+            return t.index_select(0, self._row_idx)  # graph: gather by device index
+        return t[self._active()]  # eager: gather by python slot list (a copy)
+
+    def _sset(self, buf: dict[int, torch.Tensor], layer_idx: int, value: torch.Tensor) -> None:
+        t = buf.get(layer_idx)
+        if t is None:
+            # Lazy alloc, sized from the per-row shape. Only ever happens EAGERLY
+            # (prefill / capture warmup), never inside a captured graph region.
+            t = value.new_zeros((self._num_slots, *value.shape[1:]))
+            buf[layer_idx] = t
+        if self._row_idx is not None:
+            t.index_copy_(0, self._row_idx, value)  # graph: scatter in place
+        else:
+            t[self._active()] = value  # eager: scatter in place
+
     def clear_slot(self, slot: int) -> None:
         """Drop every layer's state/tail for one slot — called when a slot is
         (re)allocated to a fresh sequence so leftover state can never leak in."""
+        if self._static:
+            for buf in (self._state_buf, self._conv_buf):
+                for t in buf.values():
+                    t[slot].zero_()
+            return
         for store in (self._state, self._conv_tail):
             for key in [k for k in store if k[0] == slot]:
                 del store[key]
@@ -103,21 +161,34 @@ class RecurrentStateCache:
             store[(s, layer_idx)] = value[i : i + 1]
 
     def get_state(self, layer_idx: int) -> torch.Tensor | None:
+        if self._static:
+            return self._sget(self._state_buf, layer_idx)
         return self._gather(self._state, layer_idx)
 
     def set_state(self, layer_idx: int, state: torch.Tensor):
+        if self._static:
+            return self._sset(self._state_buf, layer_idx, state)
         self._scatter(self._state, layer_idx, state)
 
     def get_conv_tail(self, layer_idx: int) -> torch.Tensor | None:
+        if self._static:
+            return self._sget(self._conv_buf, layer_idx)
         return self._gather(self._conv_tail, layer_idx)
 
     def set_conv_tail(self, layer_idx: int, tail: torch.Tensor):
+        if self._static:
+            return self._sset(self._conv_buf, layer_idx, tail)
         self._scatter(self._conv_tail, layer_idx, tail)
 
     def reset(self):
         self._state.clear()
         self._conv_tail.clear()
         self._slots = None
+        self._row_idx = None
+        if self._static:
+            for buf in (self._state_buf, self._conv_buf):
+                for t in buf.values():
+                    t.zero_()
 
 
 class MLALatentCache:

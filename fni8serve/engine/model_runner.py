@@ -46,7 +46,11 @@ class EngineRunner:
         # back per-step whenever the graph can't serve a batch).
         if enable_cuda_graph is None:
             enable_cuda_graph = cuda_graph_enabled_by_env()
-        self.graphed = GraphedDecode(model, cache, device=device) if enable_cuda_graph else None
+        self.graphed = (
+            GraphedDecode(model, cache, device=device, lin_cache=self.lin_cache)
+            if enable_cuda_graph
+            else None
+        )
         # Persistent host/device staging for the per-step sampling params (issue #183):
         # `temps`/`top_p` used to be rebuilt every step with `torch.tensor(list,
         # device=cuda)` -- a blocking pageable host->device copy per step. We keep a

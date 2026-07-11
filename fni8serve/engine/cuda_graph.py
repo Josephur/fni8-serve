@@ -89,6 +89,8 @@ class _CapturedGraph:
         "ids_host",
         "pos_host",
         "context_lens_host",
+        "slot_idx",
+        "slot_idx_host",
     )
 
     def __init__(
@@ -106,6 +108,8 @@ class _CapturedGraph:
         ids_host,
         pos_host,
         context_lens_host,
+        slot_idx=None,
+        slot_idx_host=None,
     ):
         self.graph = graph
         self.ids = ids
@@ -124,6 +128,12 @@ class _CapturedGraph:
         self.ids_host = ids_host
         self.pos_host = pos_host
         self.context_lens_host = context_lens_host
+        # Recurrent decode only (None otherwise): persistent device row->slot index
+        # the captured recurrent-state gather/scatter reads, plus its pinned host
+        # staging. Refreshed in place each step before replay -- same pointer the
+        # graph captured (models/cache.py `bind_graph`).
+        self.slot_idx = slot_idx
+        self.slot_idx_host = slot_idx_host
 
 
 class GraphedDecode:
@@ -138,12 +148,14 @@ class GraphedDecode:
         cache,
         *,
         device: str = "cuda",
+        lin_cache=None,
         batch_buckets: tuple[int, ...] = DEFAULT_BATCH_BUCKETS,
         context_bucket_size: int = DEFAULT_CONTEXT_BUCKET_SIZE,
         max_graphs: int = DEFAULT_MAX_GRAPHS,
     ):
         self.model = model
         self.cache = cache
+        self.lin_cache = lin_cache
         self.device = device
         # Never bucket past what the engine could ever schedule (`cache.num_slots`
         # == `max_num_seqs`) -- a bigger bucket would just never be hit.
@@ -152,9 +164,21 @@ class GraphedDecode:
         self.max_graphs = max_graphs
         self._graphs: dict[tuple[int, int], _CapturedGraph] = {}
         self._scratch_slot: int | None = None
+        # Recurrent (short-conv / DeltaNet / lightning) mixers carry per-slot decode
+        # state through `lin_cache`. When present AND capturable, we switch that cache
+        # to fixed-address per-slot buffers so the recurrent update is static and can
+        # be captured with the rest of the step (see models/cache.py).
+        _modules = getattr(self.model, "modules", None)
+        self.has_recurrent = callable(_modules) and any(
+            getattr(m, "is_recurrent", False) for m in _modules()
+        )
         self.supported, self._unsupported_reason = self._check_supported()
         if not self.supported:
             log.warning("cuda-graph decode disabled: %s", self._unsupported_reason)
+        elif self.has_recurrent and self.lin_cache is not None:
+            # Enable BEFORE the first prefill so prefill state lands in the same
+            # fixed buffers the graphed decode replays against.
+            self.lin_cache.enable_static_buffers(cache.num_slots)
 
     # -- capability check ------------------------------------------------
     def _check_supported(self) -> tuple[bool, str]:
@@ -165,20 +189,23 @@ class GraphedDecode:
         cfg = self.model.config
         if cfg.is_moe():
             return False, "MoE routing is data-dependent (mask.nonzero()), not graph-capturable"
-        if cfg.linear_attention or cfg.latent_attention:
-            return False, "linear/latent-attention decode isn't wired for static capture"
-        # Recurrent mixers (LFM2 short-conv, MiniMax lightning) don't set the
-        # `linear_attention` cfg flag, but their per-slot decode state (a dynamic
-        # python dict of freshly-allocated tensors, mutated every step) is not
-        # graph-capturable either. Detect them structurally and stay eager.
-        _modules = getattr(self.model, "modules", None)
-        if callable(_modules) and any(getattr(m, "is_recurrent", False) for m in _modules()):
-            return False, "recurrent (short-conv/lightning) decode state isn't graph-capturable"
+        # Latent attention (MLA / DeepSeek) decode reads a per-step-growing latent
+        # slice out of MLALatentCache -- not yet expressible as a fixed-address
+        # static buffer, so keep declining it (a separate optimization).
+        if cfg.latent_attention:
+            return False, "latent (MLA) decode reads a growing latent slice, not yet static"
+        # Recurrent mixers (LFM2 short-conv, Qwen3-Next DeltaNet, MiniMax lightning)
+        # ARE capturable now: their per-slot decode state lives in fixed-address
+        # buffers (models/cache.py `enable_static_buffers`), gathered/scattered in
+        # place through a persistent device row->slot index. So 'linear' layers are
+        # accepted alongside 'full'; only 'sliding' (a data-dependent python-loop
+        # fallback) and 'latent' remain uncapturable.
         for i in range(cfg.num_hidden_layers):
-            if cfg.attention_kind(i) != "full":
+            kind = cfg.attention_kind(i)
+            if kind not in ("full", "linear"):
                 return (
                     False,
-                    f"layer {i} uses the '{cfg.attention_kind(i)}' attention backend "
+                    f"layer {i} uses the '{kind}' attention backend "
                     "(sliding-window decode is a data-dependent python-loop fallback)",
                 )
         return True, ""
@@ -249,9 +276,21 @@ class GraphedDecode:
         block_table = cache.block_table([scratch] * batch_bucket)
         context_lens = torch.ones(batch_bucket, dtype=torch.int32, device=self.device)
 
+        # Recurrent models: a persistent device row->slot index the captured
+        # recurrent-state gather/scatter reads. Seed every row at the scratch slot
+        # (warmup/capture must never touch a real sequence's state); _fill_inputs
+        # refreshes it to the batch's real slots before each replay.
+        slot_idx = slot_idx_host = None
+        if self.has_recurrent and self.lin_cache is not None:
+            slot_idx = torch.full((batch_bucket,), scratch, dtype=torch.long, device=self.device)
+            pin = self.device != "cpu" and torch.cuda.is_available()
+            slot_idx_host = torch.empty(batch_bucket, dtype=torch.long, pin_memory=pin)
+            self.lin_cache.bind_graph(slot_idx)
+
         ctx = ForwardContext(
             is_prefill=False,
             kv_cache=cache,
+            lin_cache=self.lin_cache if self.has_recurrent else None,
             slot_mapping=slot_mapping,
             block_tables=block_table,
             context_lens=context_lens,
@@ -296,6 +335,8 @@ class GraphedDecode:
             ids_host=ids_host,
             pos_host=pos_host,
             context_lens_host=context_lens_host,
+            slot_idx=slot_idx,
+            slot_idx_host=slot_idx_host,
         )
 
     # -- per-step input refresh (eager -- runs before replay(), not captured) ----
@@ -333,3 +374,13 @@ class GraphedDecode:
         g.context_lens.copy_(g.context_lens_host, non_blocking=pin)
         cache.fill_slot_mapping(g.slot_mapping, slots, lengths)
         cache.fill_block_table(g.block_table, slots)
+
+        # Recurrent models: refresh the persistent row->slot index in place (real
+        # rows -> their slot, pad rows -> scratch) so the captured recurrent-state
+        # gather/scatter reads/writes each live sequence's own fixed buffer row.
+        # Re-bind every step: an intervening eager step (prefill / fallback) clears
+        # the graph index, so the graphed path must reinstate its own before replay.
+        if g.slot_idx is not None:
+            g.slot_idx_host.copy_(torch.tensor(slots, dtype=torch.long))
+            g.slot_idx.copy_(g.slot_idx_host, non_blocking=pin)
+            self.lin_cache.bind_graph(g.slot_idx)

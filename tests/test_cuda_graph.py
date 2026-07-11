@@ -135,11 +135,111 @@ def test_graphed_decode_does_not_shrink_real_concurrency():
     assert eng.cache.num_slots == max_num_seqs + 1
 
 
+# -- recurrent (LFM2 short-conv) graphed decode ---------------------------------
+def _lfm2_cfg(**overrides):
+    base = dict(arch="lfm2", vocab_size=256, hidden_size=128, num_hidden_layers=3,
+                num_attention_heads=4, num_key_value_heads=2, intermediate_size=256,
+                max_position_embeddings=512, head_dim=32, qk_norm=True,
+                tie_word_embeddings=True, rms_norm_eps=1e-5,
+                extra=dict(full_attn_idxs=[1], conv_L_cache=3))
+    base.update(overrides)
+    return ModelConfig(**base)
+
+
+def _lfm2_sd(cfg):
+    def r(*s):
+        return torch.randn(*s, device="cuda", dtype=torch.float16) * 0.05
+    H = cfg.hidden_size
+    sd = {"model.embed_tokens.weight": r(cfg.vocab_size, H), "model.norm.weight": r(H)}
+    hd, nh, nkv = cfg.resolved_head_dim(), cfg.num_attention_heads, cfg.num_key_value_heads
+    attn_idxs = set(cfg.extra["full_attn_idxs"])
+    for i in range(cfg.num_hidden_layers):
+        p = f"model.layers.{i}"
+        sd[f"{p}.operator_norm.weight"] = r(H)
+        sd[f"{p}.ffn_norm.weight"] = r(H)
+        for w, d in (("w1", cfg.intermediate_size), ("w3", cfg.intermediate_size), ("w2", H)):
+            sd[f"{p}.feed_forward.{w}.weight"] = r(d, H if w != "w2" else cfg.intermediate_size)
+        if i in attn_idxs:
+            a = f"{p}.self_attn"
+            sd[f"{a}.q_proj.weight"] = r(nh * hd, H)
+            sd[f"{a}.k_proj.weight"] = r(nkv * hd, H)
+            sd[f"{a}.v_proj.weight"] = r(nkv * hd, H)
+            sd[f"{a}.out_proj.weight"] = r(H, nh * hd)
+            sd[f"{a}.q_layernorm.weight"] = r(hd)
+            sd[f"{a}.k_layernorm.weight"] = r(hd)
+        else:
+            c = f"{p}.conv"
+            sd[f"{c}.in_proj.weight"] = r(3 * H, H)
+            sd[f"{c}.out_proj.weight"] = r(H, H)
+            sd[f"{c}.conv.weight"] = r(H, 1, 3)
+    return sd
+
+
+def _run_lfm2(num_seqs, *, enable_cuda_graph, seed=0, max_tokens=6, max_num_seqs=16, max_len=64):
+    torch.manual_seed(seed)
+    cfg = _lfm2_cfg()
+    sd = _lfm2_sd(cfg)
+    eng = LLMEngine(cfg, sd, device="cuda", max_num_seqs=max_num_seqs, max_len=max_len,
+                    enable_cuda_graph=enable_cuda_graph)
+    outs = eng.generate(_prompts(num_seqs),
+                        SamplingParams(temperature=0.0, max_tokens=max_tokens, ignore_eos=True))
+    return outs, eng
+
+
+def test_graphed_decode_accepts_recurrent_lfm2():
+    """A recurrent (LFM2 short-conv) model must now capture: with fixed-address
+    per-slot recurrent-state buffers the decode step is static, so GraphedDecode
+    should report supported instead of declining 'recurrent ... not capturable'."""
+    from fni8serve.models import build_model
+    cfg = _lfm2_cfg()
+    model = build_model(cfg, _lfm2_sd(cfg)).cuda().eval()
+    cache = PagedKVCache(cfg.num_hidden_layers, 4, cfg.num_key_value_heads, 64,
+                         cfg.resolved_head_dim(), device="cuda")
+    g = GraphedDecode(model, cache, device="cuda")
+    assert g.supported, g._unsupported_reason
+
+
+@pytest.mark.parametrize("num_seqs", [1, 3, 8])
+def test_graphed_matches_eager_lfm2(num_seqs):
+    """Recurrent graphed decode must produce BIT-IDENTICAL token ids to eager."""
+    eager, _ = _run_lfm2(num_seqs, enable_cuda_graph=False)
+    graphed, eng = _run_lfm2(num_seqs, enable_cuda_graph=True)
+    assert eng.runner.graphed is not None and eng.runner.graphed.supported
+    assert graphed == eager
+
+
+@pytest.mark.parametrize("num_seqs", [1, 8])
+def test_graphed_recurrent_decode_is_deterministic(num_seqs):
+    runs = [_run_lfm2(num_seqs, enable_cuda_graph=True)[0] for _ in range(3)]
+    assert runs[0] == runs[1] == runs[2]
+
+
+def test_graphed_recurrent_concurrent_independent():
+    """Two recurrent sequences decoded concurrently under CUDA graphs must each
+    match their solo (single-stream) graphed decode -- per-slot state stays isolated
+    across the shared fixed-address buffers."""
+    p = _prompts(2)
+    both, _ = _run_lfm2(2, enable_cuda_graph=True)
+    solo0 = _run_lfm2(1, enable_cuda_graph=True)[0][0]
+    # re-run seq 1 alone by building an engine with just the second prompt
+    torch.manual_seed(0)
+    cfg = _lfm2_cfg()
+    sd = _lfm2_sd(cfg)
+    eng = LLMEngine(cfg, sd, device="cuda", max_num_seqs=16, max_len=64, enable_cuda_graph=True)
+    solo1 = eng.generate([p[1]], SamplingParams(temperature=0.0, max_tokens=6, ignore_eos=True))[0]
+    assert both[0] == solo0
+    assert both[1] == solo1
+
+
 class _FakeModel:
     """`GraphedDecode._check_supported` only reads `model.config` -- stub the
     rest so the capability check can be tested without building full weights."""
     def __init__(self, cfg):
         self.config = cfg
+        self._mods = []
+
+    def modules(self):
+        return iter(self._mods)
 
 
 def _tiny_cache():
