@@ -92,6 +92,7 @@ class TransferHandle:
     compress_elapsed_ms: float
     p2p_elapsed_ms: float
     decompress_elapsed_ms: float | None = None
+    used_p2p: bool = False
 
     @property
     def on_wire_bytes(self) -> int:
@@ -117,6 +118,24 @@ def _elapsed_ms(fn):
     return result, start.elapsed_time(end)
 
 
+def _can_use_p2p(src: int, dst: int) -> bool:
+    """True when a direct device→device (``cudaMemcpyPeer``) copy is available.
+
+    ``torch.cuda.can_device_access_peer`` queries ``cudaDeviceCanAccessPeer``; when
+    it is True, PyTorch's cross-device ``copy_`` / ``.to(dst)`` issues
+    ``cudaMemcpyPeerAsync`` and lazily enables peer access in the caching allocator
+    — no manual ``cudaDeviceEnablePeerAccess`` call is required (and the previous
+    ``torch.cuda._Device`` path did not exist in this PyTorch, so P2P was never
+    actually selected). When it is False, the copy must stage through host RAM.
+    """
+    if src == dst:
+        return False
+    try:
+        return bool(torch.cuda.can_device_access_peer(src, dst))
+    except (RuntimeError, AttributeError):
+        return False
+
+
 def send(x: torch.Tensor, dst: int, *, scheme: str = "int8", group_size: int | None = None) -> TransferHandle:
     """Compress `x` on its device and copy the codes to device `dst`.
 
@@ -124,11 +143,19 @@ def send(x: torch.Tensor, dst: int, *, scheme: str = "int8", group_size: int | N
     is the fleet's PCIe path); the codes are copied on dedicated streams so the payload
     and scale transfers can overlap. `p2p_elapsed_ms` measures the code copy, not the
     fp16 activation.
+
+    When `src != dst` and the two GPUs support direct peer access the copy uses
+    ``cudaMemcpyPeer`` (P2P) instead of staging through host RAM. Peer access is checked
+    and enabled transparently; when unavailable the copy falls back to host staging.
     """
     src = x.device.index if x.is_cuda else torch.cuda.current_device()
 
     with torch.cuda.device(src):
         c, compress_ms = _elapsed_ms(lambda: fni8.compress_activation(x, scheme=scheme, group_size=group_size))
+
+    # Decide transfer strategy: P2P when src != dst and peers can access each other's
+    # memory directly; host-staging fallback otherwise.
+    use_p2p = _can_use_p2p(src, dst)
 
     # Copy the compressed codes src -> dst. Double-buffered: payload and scales ride
     # separate streams so their transfers overlap. `copy=True` forces a real copy even
@@ -140,10 +167,26 @@ def send(x: torch.Tensor, dst: int, *, scheme: str = "int8", group_size: int | N
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        with torch.cuda.stream(payload_stream):
-            d_payload = c.payload.to(dst, copy=True, non_blocking=True)
-        with torch.cuda.stream(scale_stream):
-            d_scales = c.scales.to(dst, copy=True, non_blocking=True)
+        if use_p2p:
+            # Direct device-to-device copy — PyTorch's .to() uses cudaMemcpyPeer
+            # when peer access is enabled, avoiding a round-trip through host RAM.
+            with torch.cuda.stream(payload_stream):
+                d_payload = c.payload.to(dst, copy=True, non_blocking=True)
+            with torch.cuda.stream(scale_stream):
+                d_scales = c.scales.to(dst, copy=True, non_blocking=True)
+        else:
+            # Host-staging fallback: copy through pinned CPU memory. Used when
+            # src == dst or when the GPU pair lacks direct peer access.
+            # Allocate pinned host staging buffers explicitly (Issue #185)
+            # and copy GPU → pinned CPU synchronously, then async to dst GPU.
+            cpu_payload = torch.empty(c.payload.shape, dtype=c.payload.dtype, pin_memory=True)
+            cpu_payload.copy_(c.payload)
+            cpu_scales = torch.empty(c.scales.shape, dtype=c.scales.dtype, pin_memory=True)
+            cpu_scales.copy_(c.scales)
+            with torch.cuda.stream(payload_stream):
+                d_payload = cpu_payload.to(dst, copy=True, non_blocking=True)
+            with torch.cuda.stream(scale_stream):
+                d_scales = cpu_scales.to(dst, copy=True, non_blocking=True)
         end.record(payload_stream)
         end.synchronize()
         payload_stream.synchronize()
@@ -161,6 +204,7 @@ def send(x: torch.Tensor, dst: int, *, scheme: str = "int8", group_size: int | N
         d_scales=d_scales,
         compress_elapsed_ms=compress_ms,
         p2p_elapsed_ms=p2p_ms,
+        used_p2p=use_p2p,
     )
 
 

@@ -130,6 +130,7 @@ class TestTransferHandle:
             d_scales=torch.empty(0, dtype=torch.float32),
             compress_elapsed_ms=1.0,
             p2p_elapsed_ms=2.0,
+            used_p2p=False,
         )
         assert h.on_wire_bytes == 4 * 64 * 256 * 1  # int8 payload only
 
@@ -145,6 +146,7 @@ class TestTransferHandle:
             d_scales=torch.empty(4 * 64, dtype=torch.float32),
             compress_elapsed_ms=1.0,
             p2p_elapsed_ms=2.0,
+            used_p2p=False,
         )
         # payload: 65536 bytes  (65536 * 1B)
         # scales:  1024 bytes   (256 * 4B)
@@ -162,6 +164,7 @@ class TestTransferHandle:
             d_scales=torch.empty(2 * 128, dtype=torch.float32),
             compress_elapsed_ms=0.5,
             p2p_elapsed_ms=3.0,
+            used_p2p=False,
         )
         wire_s = h.on_wire_bytes / 250e6
         assert h.theoretical_wire_ms == pytest.approx(wire_s * 1000)
@@ -220,6 +223,13 @@ class TestSendRecvSameDevice:
         assert handle.on_wire_bytes < fp16_bytes, "compression must shrink payload"
         assert handle.theoretical_wire_ms > 0
 
+    @cuda_only
+    def test_same_device_not_p2p(self):
+        """Same-device send must fall back to host-staging, never claim P2P."""
+        x = _activation((4, 64, 256))
+        handle = send(x, dst=torch.cuda.current_device(), scheme="int8")
+        assert not handle.used_p2p
+
 
 # ── send / recv multi-GPU (P2P) ─────────────────────────────────────────────
 
@@ -265,3 +275,69 @@ class TestSendRecvMultiGpu:
         assert handle.p2p_elapsed_ms > 0
         assert handle.src_device == src
         assert handle.dst_device == dst
+
+    @two_gpus
+    @cuda_only
+    def test_used_p2p_when_peers_accessible(self):
+        """P2P path must be selected when GPUs have direct peer access."""
+        src, dst = 0, 1
+        with torch.cuda.device(src):
+            x = _activation((8, 128, 256))
+        handle = send(x, dst=dst, scheme="int8")
+        assert handle.used_p2p, "expected P2P path across two GPUs with peer access"
+
+    @two_gpus
+    @cuda_only
+    def test_fp16_p2p_bit_exact(self):
+        """fp16 round-trip across GPUs via P2P must be bit-exact (lossless codec)."""
+        src, dst = 0, 1
+        with torch.cuda.device(src):
+            x = _activation((4, 64, 256))
+        handle = send(x, dst=dst, scheme="fp16")
+        with torch.cuda.device(dst):
+            xr = recv(handle)
+        assert handle.used_p2p
+        assert xr.device.index == dst
+        # Compare on a common device: x is on src, xr on dst (P2P copy).
+        assert torch.equal(x.cpu(), xr.cpu()), "fp16 P2P round-trip must be bit-exact"
+
+    @two_gpus
+    @cuda_only
+    def test_host_staging_fallback_selected_when_no_peer(self, monkeypatch):
+        """When peer access is unavailable, a cross-GPU send must fall back to
+        host-staging (used_p2p False) and still round-trip with fidelity.
+
+        The fleet's GPUs do have peer access, so we force the no-peer branch by
+        patching the capability probe — this genuinely exercises the
+        GPU→pinned-host→GPU fallback copy across two distinct devices.
+        """
+        import fni8serve.dist as dist_mod
+
+        monkeypatch.setattr(dist_mod, "_can_use_p2p", lambda src, dst: False)
+        src, dst = 0, 1
+        with torch.cuda.device(src):
+            x = _activation((8, 128, 256))
+        handle = send(x, dst=dst, scheme="int8")
+        assert not handle.used_p2p, "fallback must not claim P2P"
+        with torch.cuda.device(dst):
+            xr = recv(handle)
+        assert xr.device.index == dst
+        rep = accuracy_report(x.cpu(), xr.cpu(), "int8")
+        assert rep["sqnr_pass"], f"fallback SQNR {rep['sqnr_db']:.1f} < {rep['sqnr_bar']:.1f}"
+        assert rep["cos_pass"], f"fallback cos {rep['cos']:.6f} < {rep['cos_bar']:.6f}"
+
+    @two_gpus
+    @cuda_only
+    def test_fp16_host_staging_fallback_bit_exact(self, monkeypatch):
+        """The host-staging fallback must be bit-exact for the lossless fp16 codec."""
+        import fni8serve.dist as dist_mod
+
+        monkeypatch.setattr(dist_mod, "_can_use_p2p", lambda src, dst: False)
+        src, dst = 0, 1
+        with torch.cuda.device(src):
+            x = _activation((4, 64, 256))
+        handle = send(x, dst=dst, scheme="fp16")
+        assert not handle.used_p2p
+        with torch.cuda.device(dst):
+            xr = recv(handle)
+        assert torch.equal(x.cpu(), xr.cpu()), "fallback fp16 round-trip must be bit-exact"
