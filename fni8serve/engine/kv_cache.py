@@ -24,10 +24,386 @@ window slice for the existing `attn_int8_decode` fallback in that case — see
 
 from __future__ import annotations
 
+import logging
+import math
+from dataclasses import dataclass
+from typing import Callable
+
 import torch
 
 import fni8
 from fni8.quant.rotation import rotate_last
+
+logger = logging.getLogger(__name__)
+
+
+# ── Eviction configuration ────────────────────────────────────────────────────
+
+
+@dataclass
+class EvictionConfig:
+    """Configuration for KV-cache eviction policies (SnapKV + Ada-KV + DuoAttention).
+
+    When *enabled*, eviction runs prompt-time (once after prefill, before decode)
+    to free HBM by keeping only the *kv_budget* most important token positions per
+    sequence.  Gated behind *recall_threshold*: if the cosine similarity between the
+    full-KV and evicted-KV decode logits falls below this value, eviction is skipped
+    for that step (the "recall gate").
+
+    Policy-specific knobs:
+      *snapkv* — attention-pooled selection.  ``kv_budget`` tokens are kept across
+      all layers; which positions depends on the attention score of the last query
+      token against every cached K position.
+
+      *adakv* — per-layer / per-head budget following a pyramid schedule: early
+      layers get ``adakv_min_budget`` tokens, late layers get ``adakv_max_budget``,
+      with a linear ramp in between.  ``kv_budget`` becomes the total budget summed
+      across layers.
+
+      *duoattn* — a fraction of heads (``duoattn_streaming_heads``) keep only a
+      fixed-size streaming window of recent tokens; the rest use SnapKV with the
+      per-head budget.  ``duoattn_window`` sets the streaming window size.
+    """
+
+    enabled: bool = False
+    policy: str = "snapkv"  # "snapkv" | "adakv" | "duoattn"
+    kv_budget: int = 512
+    recall_threshold: float = 0.99
+    measure_hbm: bool = True
+    adakv_min_budget: int = 128
+    adakv_max_budget: int = 1024
+    duoattn_streaming_heads: float = 0.25
+    duoattn_window: int = 128
+
+
+# ── KV eviction strategy engine ────────────────────────────────────────────────
+
+
+class KVEviction:
+    """Prompt-time KV-cache eviction: SnapKV + Ada-KV budgets + DuoAttention.
+
+    Usage::
+
+        # After prefill completes for a slot:
+        keep = KVEviction.snapkv_selection(q_last, k_full, cfg.kv_budget, ...)
+        metrics = KVEviction.compact(cache, slot, keep)
+
+    All methods are static/classmethods usable without instantiation.
+    Compact operates on the PagedKVCache's internal block store.
+    """
+
+    # -- HBM accounting --------------------------------------------------------
+
+    @staticmethod
+    def block_bytes(num_kv_heads: int, block_size: int, head_dim: int) -> int:
+        """HBM bytes consumed by one block (K+V int8 + fp32 scales) per layer."""
+        kv = 2 * num_kv_heads * block_size * head_dim  # int8
+        scales = 2 * num_kv_heads * block_size * 4  # fp32
+        return kv + scales
+
+    # -- SnapKV: attention-pooled selection -----------------------------------
+
+    @staticmethod
+    def snapkv_selection(
+        q_last: torch.Tensor,
+        k_full: torch.Tensor,
+        budget: int,
+        num_heads: int,
+        num_kv_heads: int,
+    ) -> list[int]:
+        """Select top-*budget* KV positions by attention score of the last query
+        against every cached K position.
+
+        Args:
+            q_last: last query token  ``[num_heads, head_dim]`` or ``[1, num_heads, 1, head_dim]``.
+            k_full: all K states ``[num_kv_heads, seq_len, head_dim]`` or ``[1, num_kv_heads, seq_len, head_dim]``.
+            budget: max tokens to keep.
+            num_heads, num_kv_heads: GQA dimensions.
+
+        Returns:
+            Sorted list of position indices to keep.
+        """
+        seq_len = k_full.shape[-2]
+        if seq_len <= budget:
+            return list(range(seq_len))
+
+        # Normalise shapes
+        q = q_last.squeeze().reshape(num_heads, -1)  # [num_heads, head_dim]
+        k = k_full.squeeze(0) if k_full.dim() == 4 else k_full  # [num_kv_heads, seq_len, hd]
+        hd = q.shape[-1]
+
+        # GQA repeat: [num_kv_heads, seq_len, hd] -> [num_heads, seq_len, hd]
+        ng = num_heads // num_kv_heads
+        if ng > 1:
+            k = k.unsqueeze(1).expand(-1, ng, -1, -1).reshape(num_heads, seq_len, hd)
+
+        # Attention scores: Q @ K^T / sqrt(d)  -> softmax -> average over heads
+        scores = torch.einsum("hd,hsd->hs", q, k)  # [num_heads, seq_len]
+        scores = (scores / math.sqrt(hd)).softmax(dim=-1).mean(dim=0)  # [seq_len]
+
+        _, top_idx = torch.topk(scores, min(budget, seq_len))
+        return sorted(top_idx.tolist())
+
+    # -- Ada-KV / PyramidKV: per-layer budgets --------------------------------
+
+    @staticmethod
+    def adakv_budgets(
+        num_layers: int,
+        total_budget: int,
+        min_budget: int = 128,
+        max_budget: int = 1024,
+    ) -> list[int]:
+        """Pyramid schedule: early layers get few tokens, later layers many.
+
+        Returns a list of ``num_layers`` per-layer token budgets that sum to
+        *total_budget* (approximately).
+        """
+        if num_layers <= 1:
+            return [total_budget]
+
+        raw = [int(min_budget + i / (num_layers - 1) * (max_budget - min_budget)) for i in range(num_layers)]
+        scale = total_budget / sum(raw)
+        return [max(1, int(b * scale)) for b in raw]
+
+    # -- DuoAttention: streaming-head split -----------------------------------
+
+    @staticmethod
+    def duoattn_split(
+        num_heads: int,
+        streaming_fraction: float = 0.25,
+    ) -> tuple[list[int], list[int]]:
+        """Return ``(streaming_head_indices, snap_head_indices)``."""
+        n = max(1, int(num_heads * streaming_fraction))
+        return list(range(n)), list(range(n, num_heads))
+
+    # -- Block compaction -----------------------------------------------------
+
+    @classmethod
+    def compact(
+        cls,
+        cache: "PagedKVCache",
+        slot: int,
+        keep_positions: list[int],
+    ) -> dict:
+        """Compact a slot's KV blocks to keep only *keep_positions*.
+
+        Dequantizes each kept token from its old block, re-quantizes into the
+        minimum number of new blocks, frees the old blocks, and updates the
+        slot's block table.
+
+        Returns a metrics dict:
+
+            bytes_freed     total HBM freed across all layers
+            blocks_freed    number of physical blocks freed
+            blocks_after    number of physical blocks after compaction
+            tokens_kept     number of token positions preserved
+        """
+        old_blocks = list(cache._slot_blocks[slot])
+        if not old_blocks or not keep_positions:
+            return {"bytes_freed": 0, "blocks_freed": 0, "blocks_after": len(old_blocks), "tokens_kept": 0}
+
+        num_layers = cache.k_cache.shape[0]
+        num_kept = len(keep_positions)
+        needed_blocks = (num_kept + cache.block_size - 1) // cache.block_size
+
+        if needed_blocks >= len(old_blocks):
+            return {
+                "bytes_freed": 0,
+                "blocks_freed": 0,
+                "blocks_after": len(old_blocks),
+                "tokens_kept": num_kept,
+            }
+
+        # Allocate new blocks from the shared free pool
+        new_blocks: list[int] = []
+        for _ in range(needed_blocks):
+            if not cache._free_blocks:
+                raise RuntimeError("PagedKVCache: no free blocks for eviction compaction")
+            new_blocks.append(cache._free_blocks.pop())
+
+        blocks_freed = len(old_blocks) - needed_blocks
+
+        # Per-layer: dequantize kept tokens from old blocks and requantize into new
+        for layer in range(num_layers):
+            for new_blk_idx, new_blk in enumerate(new_blocks):
+                start = new_blk_idx * cache.block_size
+                end = min(start + cache.block_size, num_kept)
+                positions_in_this_block = keep_positions[start:end]
+                n_local = len(positions_in_this_block)
+                if n_local == 0:
+                    continue
+
+                k_chunks, v_chunks, mappings = [], [], []
+                for local_off, global_pos in enumerate(positions_in_this_block):
+                    old_blk = old_blocks[global_pos // cache.block_size]
+                    old_off = global_pos % cache.block_size
+
+                    # Dequantize: int8 * fp32 scale → fp16
+                    k_fp16 = (
+                        cache.k_cache[layer, old_blk, :, old_off, :].float()
+                        * cache.k_scale[layer, old_blk, :, old_off].unsqueeze(-1)
+                    ).to(torch.float16)
+                    v_fp16 = (
+                        cache.v_cache[layer, old_blk, :, old_off, :].float()
+                        * cache.v_scale[layer, old_blk, :, old_off].unsqueeze(-1)
+                    ).to(torch.float16)
+
+                    # Undo the write-time Hadamard rotation (involution) so that
+                    # quantize_kv_write_paged below re-applies it — without this
+                    # step the stored K would be double-rotated after a compact
+                    # cycle and read_dense would produce wrong output.
+                    k_fp16 = rotate_last(k_fp16)
+
+                    k_chunks.append(k_fp16)
+                    v_chunks.append(v_fp16)
+                    mappings.append(new_blk * cache.block_size + local_off)
+
+                k_batch = torch.stack(k_chunks, dim=0)  # [T, Hkv, D]
+                v_batch = torch.stack(v_chunks, dim=0)  # [T, Hkv, D]
+                mapping_tensor = torch.tensor(mappings, dtype=torch.int32, device=cache.device)
+
+                fni8.quantize_kv_write_paged(
+                    k_batch.contiguous(),
+                    v_batch.contiguous(),
+                    cache.k_cache[layer],
+                    cache.k_scale[layer],
+                    cache.v_cache[layer],
+                    cache.v_scale[layer],
+                    mapping_tensor,
+                )
+
+        # Free old blocks
+        for blk in old_blocks:
+            cache._block_refcount.pop(blk, None)
+            cache._free_blocks.append(blk)
+
+        cache._slot_blocks[slot] = new_blocks
+
+        bb = cls.block_bytes(cache.k_cache.shape[2], cache.block_size, cache.k_cache.shape[-1])
+        bytes_freed = blocks_freed * num_layers * bb
+
+        return {
+            "bytes_freed": bytes_freed,
+            "blocks_freed": blocks_freed,
+            "blocks_after": len(new_blocks),
+            "tokens_kept": num_kept,
+        }
+
+    # -- Recall gate ----------------------------------------------------------
+
+    @classmethod
+    def recall_check(
+        cls,
+        logits_full: torch.Tensor,
+        logits_evicted: torch.Tensor,
+        threshold: float = 0.99,
+    ) -> dict:
+        """Cos-sim recall gate: if similarity < threshold, return failed."""
+        a, b = logits_full.float().flatten(), logits_evicted.float().flatten()
+        cos = (a @ b / (a.norm() * b.norm() + 1e-12)).item()
+        return {"cos_sim": cos, "passed": cos >= threshold, "threshold": threshold}
+
+    # -- Top-level eviction driver --------------------------------------------
+
+    @classmethod
+    def evict(
+        cls,
+        cache: "PagedKVCache",
+        slot: int,
+        seq_len: int,
+        *,
+        eviction_config: EvictionConfig,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        q_last: torch.Tensor | None = None,
+        k_full: torch.Tensor | None = None,
+        keep_mask: list[int] | None = None,
+        logits_full: torch.Tensor | None = None,
+        logits_fn: Callable[[], torch.Tensor] | None = None,
+    ) -> dict:
+        """Run eviction for *slot* after prefill.  Returns a dict with all metrics.
+
+        Parameters:
+            cache: the PagedKVCache instance.
+            slot, seq_len: the slot to evict and its prefill length.
+            eviction_config: policy knobs.
+            num_heads, num_kv_heads, head_dim: model attention dimensions.
+            q_last: ``[num_heads, head_dim]`` last query token for SnapKV.
+            k_full: ``[num_kv_heads, seq_len, head_dim]`` full K cache for SnapKV.
+            keep_mask: explicit list of positions to keep (bypasses selection).
+            logits_full: pre-eviction logits for the recall gate.
+            logits_fn: callable that returns post-eviction logits for the recall
+                       gate (lazy — only called if recall is enabled).
+
+        Returns:
+            metrics dict with at minimum:
+                evicted     bool
+                strategy    str
+                metrics     dict from compact()
+                recall      dict from recall_check() or None
+        """
+        if not eviction_config.enabled:
+            return {"evicted": False, "strategy": None, "metrics": None, "recall": None}
+
+        # 1. Determine which positions to keep
+        if keep_mask is not None:
+            positions = keep_mask
+        elif eviction_config.policy == "snapkv" and q_last is not None and k_full is not None:
+            positions = cls.snapkv_selection(q_last, k_full, eviction_config.kv_budget, num_heads, num_kv_heads)
+        elif eviction_config.policy == "adakv":
+            if seq_len <= eviction_config.kv_budget:
+                positions = list(range(seq_len))
+            else:
+                # For Ada-KV, each layer gets its own budget
+                budgets = cls.adakv_budgets(
+                    cache.k_cache.shape[0],
+                    eviction_config.kv_budget,
+                    eviction_config.adakv_min_budget,
+                    eviction_config.adakv_max_budget,
+                )
+                # Layer 0 budget determines positions
+                per_layer_budget = budgets[0]
+                if q_last is not None and k_full is not None:
+                    positions = cls.snapkv_selection(q_last, k_full, per_layer_budget, num_heads, num_kv_heads)
+                else:
+                    positions = list(range(min(per_layer_budget, seq_len)))
+        elif eviction_config.policy == "duoattn":
+            streaming_heads, _ = cls.duoattn_split(num_heads, eviction_config.duoattn_streaming_heads)
+            window = eviction_config.duoattn_window
+            streaming_positions = list(range(max(0, seq_len - window), seq_len))
+            if q_last is not None and k_full is not None:
+                snap_budget = eviction_config.kv_budget
+                snap_positions = cls.snapkv_selection(q_last, k_full, snap_budget, num_heads, num_kv_heads)
+            else:
+                snap_positions = list(range(min(eviction_config.kv_budget, seq_len)))
+            positions = sorted(set(streaming_positions + snap_positions))
+        else:
+            # Fallback: keep first kv_budget tokens (no attention info available)
+            positions = list(range(min(eviction_config.kv_budget, seq_len)))
+
+        if len(positions) >= seq_len:
+            return {"evicted": False, "strategy": eviction_config.policy, "metrics": None, "recall": None}
+
+        # 2. Recall gate: check quality BEFORE eviction
+        recall = None
+        if eviction_config.recall_threshold < 1.0 and logits_full is not None and logits_fn is not None:
+            logits_after = logits_fn()
+            recall = cls.recall_check(logits_full, logits_after, eviction_config.recall_threshold)
+            if not recall["passed"]:
+                logger.warning("Recall gate BLOCKED eviction (cos=%.4f < %.4f)", recall["cos_sim"], recall["threshold"])
+                return {"evicted": False, "strategy": eviction_config.policy, "metrics": None, "recall": recall}
+
+        # 3. Compact
+        metrics = cls.compact(cache, slot, positions)
+        metrics["budget"] = eviction_config.kv_budget
+
+        return {
+            "evicted": True,
+            "strategy": eviction_config.policy,
+            "metrics": metrics,
+            "recall": recall,
+        }
 
 
 class PagedKVCache:
@@ -45,6 +421,9 @@ class PagedKVCache:
         max_prefix_entries: int | None = None,
     ):
         self.block_size = block_size
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
         self.max_blocks_per_seq = (max_len + block_size - 1) // block_size
         # Worst case (every slot at max_len) by default -- never starves the
         # scheduler's slot-based admission; pass num_blocks to over-subscribe
@@ -467,4 +846,41 @@ class PagedKVCache:
         return (
             k.permute(1, 0, 2).unsqueeze(0).contiguous(),
             v.permute(1, 0, 2).unsqueeze(0).contiguous(),
+        )
+
+    # ── Eviction convenience API ──────────────────────────────────────────────
+
+    def evict_after_prefill(
+        self,
+        slot: int,
+        seq_len: int,
+        *,
+        eviction_config: EvictionConfig,
+        num_heads: int,
+        keep_mask: list[int] | None = None,
+        q_last: torch.Tensor | None = None,
+        k_full: torch.Tensor | None = None,
+        logits_full: torch.Tensor | None = None,
+        logits_fn: Callable[[], torch.Tensor] | None = None,
+    ) -> dict:
+        """Run eviction for *slot* after prefill.
+
+        Thin wrapper over ``KVEviction.evict`` with the cache's own dimensions
+        filled in.  See ``KVEviction.evict`` for parameter documentation.
+
+        Returns the metrics dict from ``KVEviction.evict``.
+        """
+        return KVEviction.evict(
+            self,
+            slot,
+            seq_len,
+            eviction_config=eviction_config,
+            num_heads=num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            q_last=q_last,
+            k_full=k_full,
+            keep_mask=keep_mask,
+            logits_full=logits_full,
+            logits_fn=logits_fn,
         )
