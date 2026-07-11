@@ -184,6 +184,43 @@ class ModelConfig:
         resolved_arch = arch or model_type or (archs[0] if archs else "unknown")
         n_heads = c["num_attention_heads"]
 
+        # ── hybrid linear-attention derivation (Qwen3-Next / Qwen3.5/3.6, MiniMax) ──
+        # A real HF config marks the per-layer hybrid pattern with EITHER a
+        # `layer_types` list ("linear_attention"/"full_attention", the Qwen3-Next
+        # family) OR an int `attn_type_list` (0=lightning/linear, 1=softmax, MiniMax)
+        # — NOT the scalar `linear_attention`/`full_attention_interval` that
+        # `attention_kind()` reads (synthetic tests set those by hand; LFM2 reads
+        # `layer_types` out of `extra` directly so it never needed this). Derive the
+        # scalars here so a REAL checkpoint reproduces the right hybrid layer pattern.
+        # `c.get("linear_attention")` is OR-ed in so a round-tripped `.fni8` dump
+        # (which already carries the flattened scalar, not `layer_types`) still loads.
+        layer_types = c.get("layer_types") or []
+        attn_type_list = c.get("attn_type_list") or []
+        has_linear = bool(
+            c.get("linear_attention", False)
+            or ("linear_attention" in layer_types)
+            or (0 in attn_type_list)
+        )
+        full_interval = int(c.get("full_attention_interval", 0) or 0)
+        if has_linear and not full_interval:
+            full_layers = [i for i, t in enumerate(layer_types) if t == "full_attention"] or [
+                i for i, t in enumerate(attn_type_list) if t == 1
+            ]
+            # attention_kind uses (i+1) % interval == 0, so the first full-attn layer
+            # sits at index (interval-1); recover the stride from that first full layer.
+            if full_layers:
+                full_interval = full_layers[0] + 1
+
+        # RoPE knobs may be flat (older configs, round-tripped dumps) or nested under
+        # `rope_parameters` (Qwen3.5/3.6). Read the nested dict first, else fall back
+        # to the flat key — this is where the correct rope_theta (1e7) and the
+        # partial-rotary factor (0.25 for the Qwen3-Next gated-attn layers) live.
+        rope_params = c.get("rope_parameters") or {}
+        rope_theta = rope_params.get("rope_theta", c.get("rope_theta", 1e6))
+        partial_rotary = rope_params.get(
+            "partial_rotary_factor", c.get("partial_rotary_factor", 1.0)
+        )
+
         # Multimodal VLM detection — read vision_config and expose on ModelConfig.
         if resolved_arch in _MULTIMODAL_ARCHS:
             v_raw = hf.get("vision_config") or {}
@@ -220,10 +257,13 @@ class ModelConfig:
             head_dim=c.get("head_dim"),
             hidden_act=c.get("hidden_act", "silu"),
             rms_norm_eps=c.get("rms_norm_eps", 1e-6),
-            rope_theta=c.get("rope_theta", 1e6),
+            rope_theta=rope_theta,
             rope_local_theta=c.get("rope_local_base_freq"),
             tie_word_embeddings=c.get("tie_word_embeddings", False),
             qkv_bias=c.get("attention_bias", False),
+            partial_rotary_factor=partial_rotary,
+            linear_attention=has_linear,
+            full_attention_interval=full_interval,
             query_pre_attn_scalar=c.get("query_pre_attn_scalar"),
             attn_logit_softcap=c.get("attn_logit_softcapping"),
             final_logit_softcap=c.get("final_logit_softcapping"),
@@ -266,6 +306,9 @@ _KNOWN_HF_KEYS = {
     "hidden_act",
     "rms_norm_eps",
     "rope_theta",
+    "rope_parameters",  # nested {rope_theta, partial_rotary_factor} (Qwen3.5/3.6)
+    "partial_rotary_factor",
+    "full_attention_interval",  # derived into the linear_attention/interval scalars
     "rope_local_base_freq",
     "tie_word_embeddings",
     "attention_bias",

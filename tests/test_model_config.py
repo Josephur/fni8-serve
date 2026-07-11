@@ -217,3 +217,96 @@ def test_from_hf_text_only_configs_unaffected():
     assert cfg.is_multimodal is False     # gemma3 is not in _MULTIMODAL_ARCHS
     assert cfg.vision_config is None
     assert cfg.num_attention_heads == 8   # text axes still work
+
+
+# ── hybrid linear-attention derivation (Qwen3-Next / Qwen3.5/3.6, MiniMax) ──────
+# A real HF config declares the hybrid layer pattern with `layer_types` /
+# `attn_type_list`, NOT the scalar linear_attention/full_attention_interval that
+# attention_kind() reads. from_hf must derive those (the #197 real-loading gate).
+
+
+def _qwen3_5_text_cfg(interval=4, n_layers=24, **ov):
+    """The text_config sub-dict of a real Qwen3.5 config.json (values from the
+    on-box Qwen3.5-0.8B checkpoint)."""
+    lt = ["full_attention" if (i + 1) % interval == 0 else "linear_attention"
+          for i in range(n_layers)]
+    cfg = dict(
+        model_type="qwen3_5_text", vocab_size=248320, hidden_size=1024,
+        num_hidden_layers=n_layers, num_attention_heads=8, num_key_value_heads=2,
+        intermediate_size=3584, head_dim=256, full_attention_interval=interval,
+        layer_types=lt, linear_num_key_heads=16, linear_num_value_heads=16,
+        linear_key_head_dim=128, linear_value_head_dim=128, linear_conv_kernel_dim=4,
+        rope_parameters={"rope_theta": 10000000, "partial_rotary_factor": 0.25,
+                         "rope_type": "default"},
+    )
+    cfg.update(ov)
+    return cfg
+
+
+def test_from_hf_qwen3_5_derives_hybrid_pattern():
+    """Real Qwen3.5 wrapper (arch qwen3_5, text axes nested) -> the scalar flags +
+    nested rope are derived so attention_kind() reproduces the layer_types list."""
+    hf = {"architectures": ["Qwen3_5ForConditionalGeneration"], "model_type": "qwen3_5",
+          "text_config": _qwen3_5_text_cfg()}
+    cfg = ModelConfig.from_hf(hf, arch="qwen3_next")
+    assert cfg.linear_attention is True
+    assert cfg.full_attention_interval == 4
+    # nested rope must win over the 1e6 default (gated-attn layers need theta 1e7 + 0.25)
+    assert cfg.rope_theta == 10000000
+    assert abs(cfg.partial_rotary_factor - 0.25) < 1e-9
+    # attention_kind must match the source layer_types exactly
+    lt = _qwen3_5_text_cfg()["layer_types"]
+    for i, t in enumerate(lt):
+        want = "full" if t == "full_attention" else "linear"
+        assert cfg.attention_kind(i) == want, (i, t, cfg.attention_kind(i))
+    # linear head dims survive into extra (the builder reads them there)
+    assert cfg.extra["linear_num_key_heads"] == 16
+
+
+def test_from_hf_derives_interval_when_only_layer_types_present():
+    """If full_attention_interval is absent, recover the stride from layer_types."""
+    tc = _qwen3_5_text_cfg()
+    tc.pop("full_attention_interval")
+    cfg = ModelConfig.from_hf({"model_type": "qwen3_5", "text_config": tc})
+    assert cfg.linear_attention is True
+    assert cfg.full_attention_interval == 4
+
+
+def test_from_hf_minimax_attn_type_list():
+    """MiniMax marks lightning(0)/softmax(1) per layer via attn_type_list; the scalar
+    linear_attention flag is derived, and attn_type_list survives into extra (the
+    MiniMax builder reads it there for the per-layer decision)."""
+    atl = [0, 0, 0, 0, 0, 0, 0, 1] * 2  # 7:1 lightning:softmax, 16 layers
+    hf = dict(model_type="minimax_text_01", vocab_size=32000, hidden_size=1024,
+              num_hidden_layers=16, num_attention_heads=8, num_key_value_heads=8,
+              intermediate_size=4096, attn_type_list=atl, num_experts=8,
+              num_experts_per_tok=2)
+    cfg = ModelConfig.from_hf(hf)
+    assert cfg.linear_attention is True
+    assert cfg.full_attention_interval == 8   # first softmax(1) at index 7 -> stride 8
+    assert cfg.extra["attn_type_list"] == atl
+
+
+def test_from_hf_roundtrip_dump_preserves_scalar_flags():
+    """A round-tripped .fni8 dump carries the FLATTENED scalars (linear_attention
+    bool, full_attention_interval int) but NOT layer_types — from_hf must keep the
+    stored scalars instead of resetting them to False/0 (the server load path)."""
+    dump = dict(arch="qwen3_next", model_type="qwen3_next", vocab_size=248320,
+                hidden_size=1024, num_hidden_layers=24, num_attention_heads=8,
+                num_key_value_heads=2, intermediate_size=3584, head_dim=256,
+                linear_attention=True, full_attention_interval=4,
+                partial_rotary_factor=0.25, rope_theta=10000000)
+    cfg = ModelConfig.from_hf(dump, arch="qwen3_next")
+    assert cfg.linear_attention is True
+    assert cfg.full_attention_interval == 4
+    assert abs(cfg.partial_rotary_factor - 0.25) < 1e-9
+    assert cfg.rope_theta == 10000000
+
+
+def test_from_hf_dense_model_unaffected_by_derivation():
+    """A plain dense config gets linear_attention=False / interval=0 and every layer
+    is 'full' — the derivation must not fire without layer_types/attn_type_list."""
+    cfg = ModelConfig.from_hf(_text_cfg(sliding_window=None, sliding_window_pattern=None))
+    assert cfg.linear_attention is False
+    assert cfg.full_attention_interval == 0
+    assert cfg.attention_kind(0) == "full"
