@@ -199,6 +199,95 @@ def test_from_hf_llava_next():
     assert cfg.image_token_id == 32001
 
 
+def _qwen3_5_vl_cfg(**overrides):
+    """Synthetic Qwen3.5-VL config.json: top-level VLM wrapper with nested
+    text_config (hybrid Gated-DeltaNet) + vision_config + MTP head."""
+    n_layers = 24
+    interval = 4
+    lt = ["full_attention" if (i + 1) % interval == 0 else "linear_attention"
+          for i in range(n_layers)]
+    text = dict(
+        vocab_size=248320, hidden_size=1024,
+        num_hidden_layers=n_layers, num_attention_heads=8, num_key_value_heads=2,
+        intermediate_size=3584, head_dim=256, full_attention_interval=interval,
+        layer_types=lt, linear_num_key_heads=16, linear_num_value_heads=16,
+        linear_key_head_dim=128, linear_value_head_dim=128, linear_conv_kernel_dim=4,
+        rope_parameters={"rope_theta": 10000000, "partial_rotary_factor": 0.25,
+                         "rope_type": "default"},
+        num_nextn_predict_layers=2,
+    )
+    hf = dict(
+        model_type="qwen3_5_vl",
+        architectures=["Qwen3_5VLForConditionalGeneration"],
+        text_config=text,
+        vision_config={
+            "depth": 32,
+            "hidden_size": 3584,
+            "patch_size": 14,
+            "spatial_merge_size": 2,
+        },
+        image_token_id=151655,
+    )
+    hf.update(overrides)
+    return hf
+
+
+def test_from_hf_qwen3_5_vl():
+    """Qwen3.5-VL: is_multimodal=True, vision axes parsed, hybrid linear-attention
+    derived from layer_types, MTP presence registered, text axes intact."""
+    hf = _qwen3_5_vl_cfg()
+    cfg = ModelConfig.from_hf(hf)
+    # Multimodal fields
+    assert cfg.is_multimodal is True
+    assert cfg.vision_config is not None
+    assert cfg.vision_config.hidden_size == 3584
+    assert cfg.vision_config.patch_size == 14
+    assert cfg.vision_config.num_layers == 32
+    assert cfg.vision_config.spatial_merge_size == 2
+    assert cfg.image_token_id == 151655
+    # Text axes
+    assert cfg.arch == "qwen3_5_vl"
+    assert cfg.vocab_size == 248320
+    assert cfg.hidden_size == 1024
+    assert cfg.num_hidden_layers == 24
+    assert cfg.num_attention_heads == 8
+    assert cfg.num_key_value_heads == 2
+    # Hybrid linear attention derived from layer_types
+    assert cfg.linear_attention is True
+    assert cfg.full_attention_interval == 4
+    # MTP
+    assert cfg.num_mtp_layers == 2
+    # Nested rope
+    assert cfg.rope_theta == 10000000
+    assert abs(cfg.partial_rotary_factor - 0.25) < 1e-9
+    # Linear head dims survive into extra
+    assert cfg.extra["linear_num_key_heads"] == 16
+    # attention_kind must match the source layer_types exactly
+    lt = _qwen3_5_vl_cfg()["text_config"]["layer_types"]
+    for i, t in enumerate(lt):
+        want = "full" if t == "full_attention" else "linear"
+        assert cfg.attention_kind(i) == want, (i, t, cfg.attention_kind(i))
+    # VLM keys consumed, not leaked into extra
+    assert "vision_config" not in cfg.extra
+    assert "image_token_id" not in cfg.extra
+
+
+def test_from_hf_qwen3_5_vl_roundtrips_scalars_when_text_config_absent():
+    """A round-tripped .fni8 dump (flat metadata, no text_config sub-dict) still
+    recovers the hybrid scalars + vision cfg when the top-level fields are set."""
+    hf = _qwen3_5_vl_cfg()
+    # Flatten the text_config into the top level (as a real .fni8 dump would)
+    text = hf.pop("text_config")
+    for k, v in text.items():
+        hf[k] = v
+    cfg = ModelConfig.from_hf(hf, arch="qwen3_5_vl")
+    assert cfg.is_multimodal is True
+    assert cfg.vision_config is not None
+    assert cfg.linear_attention is True
+    assert cfg.full_attention_interval == 4
+    assert cfg.num_mtp_layers == 2
+
+
 def test_from_hf_text_only_configs_unaffected():
     """Existing text-only configs still parse with is_multimodal=False."""
     cfg = ModelConfig.from_hf(_text_cfg())

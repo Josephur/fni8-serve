@@ -486,6 +486,101 @@ def test_qwen3_next_conv1d_trim_4part():
     assert conv_w.shape == (qkv_dim, 4), f"expected ({qkv_dim}, 4) got {conv_w.shape}"
 
 
+def test_qwen3_5_vl_remap_prefix():
+    """_remap_qwen3_next strips model.language_model.* and model.visual.*
+    prefixes for Qwen3.5-VL checkpoints so the qwen3_next text builder binds."""
+    H = 128
+    sd = {
+        "model.language_model.embed_tokens.weight": torch.randn(64, H, dtype=torch.float16),
+        "model.language_model.norm.weight": torch.randn(H, dtype=torch.float16),
+        "lm_head.weight": torch.randn(64, H, dtype=torch.float16),
+        "model.language_model.layers.0.input_layernorm.weight": torch.randn(H, dtype=torch.float16),
+        "model.language_model.layers.0.self_attn.q_proj.weight": torch.randn(128, H, dtype=torch.float16),
+        "model.visual.blocks.0.attn.qkv.weight": torch.randn(128, 128, dtype=torch.float16),
+        "model.visual.class_embedding": torch.randn(128, dtype=torch.float16),
+        "mtp.0.pred_model.weight": torch.randn(64, H, dtype=torch.float16),
+    }
+    cfg = ModelConfig(
+        arch="qwen3_5_vl", vocab_size=64, hidden_size=H,
+        num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
+        intermediate_size=64, head_dim=32,
+    )
+    mapped = _remap_qwen3_next(sd, cfg)
+
+    # Text prefixes stripped: model.language_model.* -> model.*
+    assert "model.embed_tokens.weight" in mapped
+    assert "model.norm.weight" in mapped
+    assert "lm_head.weight" in mapped
+    assert "model.layers.0.input_layernorm.weight" in mapped
+    assert "model.layers.0.self_attn.q_proj.weight" in mapped
+    # Visual prefixes stripped: model.visual.* -> visual.*
+    assert "visual.blocks.0.attn.qkv.weight" in mapped
+    assert "visual.class_embedding" in mapped
+    # MTP passes through unchanged
+    assert "mtp.0.pred_model.weight" in mapped
+    # Original prefixed names must be gone
+    assert not any("model.language_model" in k for k in mapped)
+    assert not any("model.visual." in k for k in mapped)
+
+
+def test_qwen3_5_vl_remap_prefix_also_splits_fused_linear_attn_names():
+    """For Qwen3.5-VL, prefix stripping runs BEFORE the fused-name split, so
+    model.language_model.layers.0.linear_attn.in_proj_qkvz.weight is first
+    renamed to layers.0.linear_attn.in_proj_qkvz.weight, then split into
+    qkv_proj + z_proj."""
+    H = 128
+    nk, nv, kd, vd = 2, 4, 16, 16
+    qk = nk * kd
+    v_dim = nv * vd
+    sd = {
+        "model.language_model.embed_tokens.weight": torch.randn(64, H, dtype=torch.float16),
+        "model.language_model.norm.weight": torch.randn(H, dtype=torch.float16),
+        "lm_head.weight": torch.randn(64, H, dtype=torch.float16),
+    }
+    p = "model.language_model.layers.0"
+    la = f"{p}.linear_attn"
+    sd[f"{la}.in_proj_qkvz.weight"] = torch.randn(qk + qk + v_dim + v_dim, H, dtype=torch.float16)
+    sd[f"{la}.in_proj_ba.weight"] = torch.randn(2 * nv, H, dtype=torch.float16)
+    sd[f"{la}.conv1d.weight"] = torch.randn(qk + qk + v_dim, 4, dtype=torch.float16)
+    sd[f"{la}.out_proj.weight"] = torch.randn(H, v_dim, dtype=torch.float16)
+    sd[f"{la}.A_log"] = torch.randn(nv).float()
+    sd[f"{la}.dt_bias"] = torch.randn(nv).float()
+    sd[f"{la}.norm.weight"] = torch.randn(v_dim, dtype=torch.float16)
+    sd["model.language_model.layers.0.post_attention_layernorm.weight"] = torch.randn(H, dtype=torch.float16)
+    sd["model.language_model.layers.0.mlp.gate_proj.weight"] = torch.randn(64, H, dtype=torch.float16)
+    sd["model.language_model.layers.0.mlp.up_proj.weight"] = torch.randn(64, H, dtype=torch.float16)
+    sd["model.language_model.layers.0.mlp.down_proj.weight"] = torch.randn(H, 64, dtype=torch.float16)
+
+    cfg = ModelConfig(
+        arch="qwen3_5_vl", vocab_size=64, hidden_size=H,
+        num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
+        intermediate_size=64, head_dim=32,
+        extra=dict(
+            linear_num_key_heads=nk, linear_num_value_heads=nv,
+            linear_key_head_dim=kd, linear_value_head_dim=vd,
+            linear_conv_kernel_dim=4,
+        ),
+    )
+    mapped = _remap_qwen3_next(sd, cfg)
+
+    # Fused names must be gone
+    assert not any("in_proj_qkvz" in k for k in mapped)
+    assert not any("in_proj_ba" in k for k in mapped)
+    assert not any("conv1d" in k for k in mapped)
+
+    # Builder-expected names must exist with correct prefix (model.layers.0.*)
+    la_out = "model.layers.0.linear_attn"
+    assert f"{la_out}.qkv_proj.weight" in mapped
+    assert f"{la_out}.z_proj.weight" in mapped
+    assert f"{la_out}.beta_proj.weight" in mapped
+    assert f"{la_out}.dt_proj.weight" in mapped
+    assert f"{la_out}.conv_weight" in mapped
+    assert f"{la_out}.out_proj.weight" in mapped
+    # Standard layers pass through
+    assert "model.layers.0.post_attention_layernorm.weight" in mapped
+    assert "model.layers.0.mlp.gate_proj.weight" in mapped
+
+
 def test_qwen3_next_remap_skips_other_archs():
     """_remap_qwen3_next is a no-op for non-qwen3_next architectures."""
     cfg = _cfg()

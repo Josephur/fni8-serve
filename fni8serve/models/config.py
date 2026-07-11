@@ -27,6 +27,7 @@ _MULTIMODAL_ARCHS = frozenset(
         "qwen2_5_vl",
         "llava",
         "llava_next",
+        "qwen3_5_vl",
     }
 )
 

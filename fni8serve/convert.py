@@ -147,11 +147,21 @@ def _raw_dtype(w: torch.Tensor) -> torch.Tensor:
     return w16
 
 
+_QWEN3_NEXT_ARCHS = frozenset({
+    "qwen3_next", "qwen3next", "Qwen3NextForCausalLM",
+    "qwen3_5_vl", "Qwen3_5VLForConditionalGeneration",
+})
+
+
 def _remap_qwen3_next(sd: dict, cfg: ModelConfig) -> dict:
     """Rename HF fused tensor names to the per-name tensors the builder expects
-    for the Qwen3-Next hybrid linear-attention layers.
+    for the Qwen3-Next / Qwen3.5-VL hybrid linear-attention layers.
 
-    HF stores:
+    For VLM checkpoints (Qwen3.5-VL) the text weights live under
+    ``model.language_model.*`` and the vision tower under ``model.visual.*``;
+    those prefixes are stripped so the qwen3_next text builder can bind.
+
+    HF stores (linear-attention layers):
       * ``in_proj_qkvz.weight``  — fused [qk+qk+nv*vd+nv*vd, H]
       * ``in_proj_ba.weight``     — fused [nv+nv, H]
       * ``conv1d.weight``         — [Wc, K]
@@ -163,7 +173,21 @@ def _remap_qwen3_next(sd: dict, cfg: ModelConfig) -> dict:
       * ``dt_proj.weight``   — second half of in_proj_ba
       * ``conv_weight``      — conv1d.weight unchanged
     """
-    if cfg.arch not in ("qwen3_next", "qwen3next", "Qwen3NextForCausalLM"):
+    # ── VLM prefix stripping (Qwen3.5-VL nests text under model.language_model.*,
+    #    visual under model.visual.*).  Detect by key presence so it works
+    #    regardless of whether the user passes --arch or auto-detects. ──
+    if any(k.startswith("model.language_model.") for k in sd):
+        out = {}
+        for name, w in sd.items():
+            if name.startswith("model.language_model."):
+                out["model." + name[len("model.language_model."):]] = w
+            elif name.startswith("model.visual."):
+                out[name[len("model."):]] = w
+            else:
+                out[name] = w
+        sd = out
+
+    if cfg.arch not in _QWEN3_NEXT_ARCHS:
         return sd
 
     x = cfg.extra
