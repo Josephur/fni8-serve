@@ -20,6 +20,9 @@ stabilization real kernels use, so it lives with that kernel, not here.
 
 from __future__ import annotations
 
+import os
+
+import fni8
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -60,6 +63,30 @@ def recurrent_gated_delta_rule(q, k, v, beta, g, state=None):
         S = at * S - erase + write
         out[:, :, t] = torch.einsum("bhvk,bhk->bhv", S, qt)  # o_t = S_t q_t
     return out.to(v.dtype), S
+
+
+# Kill-switch (default on); auto-degrades to the eager reference if the installed
+# fni8 predates the decode kernel, so this stays correct on an older prebuilt fni8.
+_DND_DECODE = os.environ.get("FNI8_DND_DECODE", "1") != "0" and hasattr(
+    fni8, "deltanet_recurrent_decode"
+)
+
+
+def _gated_delta_rule(q, k, v, beta, g, state, L):
+    """Dispatch the gated delta rule. For the single-token decode step (L==1, CUDA,
+    Dk/Dv<=128) use the fused `fni8.deltanet_recurrent_decode` kernel: same math as
+    the eager reference above (validated bit-close against it, cos 1.0), but it
+    collapses the ~5 tiny eager ops into ONE launch AND is CUDA-graph-capturable
+    (register state, no cudaFuncSetAttribute), so it replays inside the engine's
+    graphed decode instead of forcing an eager fallback. Eager reference otherwise
+    (prefill L>1, CPU, head dims > 128, or FNI8_DND_DECODE=0). The kernel takes
+    alpha=exp(g)."""
+    if _DND_DECODE and L == 1 and q.is_cuda and q.shape[-1] <= 128 and v.shape[-1] <= 128:
+        o, state = fni8.deltanet_recurrent_decode(
+            q.float(), k.float(), v.float(), g.exp().float(), beta.float(), initial_state=state
+        )
+        return o.to(v.dtype), state
+    return recurrent_gated_delta_rule(q, k, v, beta, g, state=state)
 
 
 class GatedDeltaNetAttention(nn.Module):
@@ -146,8 +173,8 @@ class GatedDeltaNetAttention(nn.Module):
         dt = self.gate_proj(hidden).transpose(1, 2)
         g = -F.softplus(dt.float() + self.dt_bias.view(1, -1, 1)) * self.A_log.exp().view(1, -1, 1)
         state = cache.get_state(layer_idx) if cache is not None else None
-        o, state = recurrent_gated_delta_rule(
-            q, k, v, beta.reshape(B, self.nv, L), g.reshape(B, self.nv, L), state=state
+        o, state = _gated_delta_rule(
+            q, k, v, beta.reshape(B, self.nv, L), g.reshape(B, self.nv, L), state, L
         )
         if cache is not None:
             cache.set_state(layer_idx, state)
