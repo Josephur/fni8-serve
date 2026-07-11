@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Engine-boundary transport: compress -> P2P -> decompress (issue #81).
+"""Engine-boundary transport: compress -> (entropy) -> P2P -> decompress (issues #81, #185, #188).
 
 The pure-Python transport seam that ships activations between engine ranks on the
 PCIe-1.0-x1 fleet. Bandwidth is the constraint, so the wire always carries the
@@ -7,6 +7,15 @@ PCIe-1.0-x1 fleet. Bandwidth is the constraint, so the wire always carries the
 codec seam is kept clean: `send` compresses on the source device and copies the
 codes to the destination; `recv` decompresses on the destination. `accuracy_report`
 gates a round-trip against per-scheme SQNR / cosine bars.
+
+When both GPUs have direct peer access the code copy uses ``cudaMemcpyPeer`` (P2P);
+otherwise it stages through pinned host RAM (see ``_can_use_p2p``).
+
+An optional *entropy* stage (rANS, see :mod:`fni8serve.dist.entropy`) can be stacked
+after quantization to shrink the wire payload further by losslessly coding the
+quantized symbols at their empirical entropy floor. It is opt-in via
+``send(x, dst, scheme="int8", entropy=True)`` (default ``entropy=False``); the handle
+carries the rANS metadata so ``recv`` inverts the coding before dequantization.
 
 Compression is delegated to `fni8.compress_activation` / `fni8.decompress_activation`;
 this module only owns the transfer + accounting, not the quant math.
@@ -16,10 +25,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 import fni8
 from fni8 import Compressed
+
+from fni8serve.dist.entropy import decode as rans_decode
+from fni8serve.dist.entropy import encode as rans_encode
 
 # Modeled PCIe-1.0-x1 unidirectional bandwidth (bytes/s) used for the analytic
 # `theoretical_wire_ms`. Kept as a module constant so the wire model is explicit.
@@ -93,13 +106,26 @@ class TransferHandle:
     p2p_elapsed_ms: float
     decompress_elapsed_ms: float | None = None
     used_p2p: bool = False
+    entropy_freqs: np.ndarray | None = None
+    entropy_n: int | None = None
+    entropy_payload_dtype: torch.dtype | None = None
+    entropy_payload_shape: tuple[int, ...] | None = None
 
     @property
     def on_wire_bytes(self) -> int:
-        """Bytes actually crossing the link: packed codes + fp32 group scales."""
+        """Bytes actually crossing the link: packed codes + fp32 group scales.
+
+        When the entropy (rANS) stage is active the payload is the compressed
+        byte stream, and the normalized frequency table must also cross the wire
+        so the receiver can invert the coding — so it is counted here. The table
+        is transmitted as uint16 (freqs sum to 2**12 < 2**16), i.e. 2 bytes/entry.
+        """
         payload_bytes = self.d_payload.numel() * self.d_payload.element_size()
         scale_bytes = self.d_scales.numel() * self.d_scales.element_size()
-        return payload_bytes + scale_bytes
+        freq_bytes = 0
+        if self.entropy_freqs is not None:
+            freq_bytes = int(self.entropy_freqs.size) * 2
+        return payload_bytes + scale_bytes + freq_bytes
 
     @property
     def theoretical_wire_ms(self) -> float:
@@ -136,7 +162,14 @@ def _can_use_p2p(src: int, dst: int) -> bool:
         return False
 
 
-def send(x: torch.Tensor, dst: int, *, scheme: str = "int8", group_size: int | None = None) -> TransferHandle:
+def send(
+    x: torch.Tensor,
+    dst: int,
+    *,
+    scheme: str = "int8",
+    group_size: int | None = None,
+    entropy: bool = False,
+) -> TransferHandle:
     """Compress `x` on its device and copy the codes to device `dst`.
 
     Returns a `TransferHandle` the receiver hands to `recv`. In-process here (the P2P
@@ -147,11 +180,31 @@ def send(x: torch.Tensor, dst: int, *, scheme: str = "int8", group_size: int | N
     When `src != dst` and the two GPUs support direct peer access the copy uses
     ``cudaMemcpyPeer`` (P2P) instead of staging through host RAM. Peer access is checked
     and enabled transparently; when unavailable the copy falls back to host staging.
+
+    When *entropy* is True (opt-in; default False) the quantized payload is losslessly
+    rANS-coded before the copy — composes with any scheme and with either the P2P or
+    host-staging transfer path. ``recv`` inverts the entropy coding before dequantization.
     """
     src = x.device.index if x.is_cuda else torch.cuda.current_device()
 
     with torch.cuda.device(src):
         c, compress_ms = _elapsed_ms(lambda: fni8.compress_activation(x, scheme=scheme, group_size=group_size))
+
+    # Optional entropy (rANS) stage: losslessly code the raw *bytes* of the compressed
+    # payload (whatever its dtype — int8 codes, packed-int32 nibbles, fp16). Record the
+    # original dtype/shape so `recv` reconstructs the exact tensor bit-for-bit.
+    payload_tensor = c.payload
+    entropy_freqs: np.ndarray | None = None
+    entropy_n: int | None = None
+    entropy_payload_dtype: torch.dtype | None = None
+    entropy_payload_shape: tuple[int, ...] | None = None
+    if entropy:
+        entropy_payload_dtype = c.payload.dtype
+        entropy_payload_shape = tuple(c.payload.shape)
+        np_bytes = c.payload.detach().cpu().contiguous().view(torch.uint8).numpy().ravel()
+        encoded_bytes, entropy_freqs = rans_encode(np_bytes)
+        entropy_n = int(np_bytes.size)
+        payload_tensor = torch.frombuffer(bytearray(encoded_bytes), dtype=torch.uint8)
 
     # Decide transfer strategy: P2P when src != dst and peers can access each other's
     # memory directly; host-staging fallback otherwise.
@@ -170,8 +223,10 @@ def send(x: torch.Tensor, dst: int, *, scheme: str = "int8", group_size: int | N
         if use_p2p:
             # Direct device-to-device copy — PyTorch's .to() uses cudaMemcpyPeer
             # when peer access is enabled, avoiding a round-trip through host RAM.
+            # (With entropy on, payload_tensor is a small CPU byte stream, so its
+            # copy is H2D; the device-resident scales still ride the P2P path.)
             with torch.cuda.stream(payload_stream):
-                d_payload = c.payload.to(dst, copy=True, non_blocking=True)
+                d_payload = payload_tensor.to(dst, copy=True, non_blocking=True)
             with torch.cuda.stream(scale_stream):
                 d_scales = c.scales.to(dst, copy=True, non_blocking=True)
         else:
@@ -179,8 +234,8 @@ def send(x: torch.Tensor, dst: int, *, scheme: str = "int8", group_size: int | N
             # src == dst or when the GPU pair lacks direct peer access.
             # Allocate pinned host staging buffers explicitly (Issue #185)
             # and copy GPU → pinned CPU synchronously, then async to dst GPU.
-            cpu_payload = torch.empty(c.payload.shape, dtype=c.payload.dtype, pin_memory=True)
-            cpu_payload.copy_(c.payload)
+            cpu_payload = torch.empty(payload_tensor.shape, dtype=payload_tensor.dtype, pin_memory=True)
+            cpu_payload.copy_(payload_tensor)
             cpu_scales = torch.empty(c.scales.shape, dtype=c.scales.dtype, pin_memory=True)
             cpu_scales.copy_(c.scales)
             with torch.cuda.stream(payload_stream):
@@ -205,6 +260,10 @@ def send(x: torch.Tensor, dst: int, *, scheme: str = "int8", group_size: int | N
         compress_elapsed_ms=compress_ms,
         p2p_elapsed_ms=p2p_ms,
         used_p2p=use_p2p,
+        entropy_freqs=entropy_freqs,
+        entropy_n=entropy_n,
+        entropy_payload_dtype=entropy_payload_dtype,
+        entropy_payload_shape=entropy_payload_shape,
     )
 
 
@@ -212,15 +271,30 @@ def recv(handle: TransferHandle) -> torch.Tensor:
     """Decompress the transferred codes on the destination device.
 
     Reconstructs the `fni8.Compressed` payload from the handle and runs the decoder,
-    returning the fp16 activation on `handle.dst_device`. Records
+    returning the fp16 activation on `handle.dst_device`. When *entropy* coding was
+    applied during `send`, the rANS stage is inverted (losslessly) first, so the
+    reconstructed activation is identical to the non-entropy path. Records
     `handle.decompress_elapsed_ms` as a side effect.
     """
+    payload = handle.d_payload
+
+    if handle.entropy_freqs is not None and handle.entropy_n is not None:
+        # Invert the rANS stage byte-for-byte, then reinterpret the recovered
+        # bytes back into the original payload dtype/shape (recorded by `send`).
+        payload_cpu = payload.cpu().contiguous().numpy().tobytes()
+        decoded = rans_decode(payload_cpu, handle.entropy_freqs, handle.entropy_n)
+        byte_tensor = torch.from_numpy(decoded.copy()).to(handle.d_payload.device)
+        target_dtype = handle.entropy_payload_dtype or torch.uint8
+        payload = byte_tensor.view(target_dtype)
+        if handle.entropy_payload_shape is not None:
+            payload = payload.reshape(handle.entropy_payload_shape)
+
     c = Compressed(
         scheme=handle.scheme,
         shape=tuple(handle.shape),
         dtype=handle.dtype,
         group_size=handle.group_size,
-        payload=handle.d_payload,
+        payload=payload,
         scales=handle.d_scales,
         d=handle.shape[-1],
     )

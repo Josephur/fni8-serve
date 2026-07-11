@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: MIT
-"""Calibrated 250 MB/s transfer-time model for the PP/EP scheduler (issue #173).
+"""Calibrated 250 MB/s transfer-time model for the PP/EP scheduler (issues #173, #188).
 
 Estimates the wall-clock cost (ms) of a compress -> P2P -> decompress boundary
 transfer for a given activation shape, dtype, and compressor scheme. The model
 is calibrated against the fleet's PCIe-1.0-x1 link (~250 MB/s) and empirical
 compression kernel measurements.
+
+An optional *entropy* stage (rANS, see :mod:`fni8serve.dist.entropy`) can be
+stacked after quantization to shrink the wire payload further by losslessly
+coding the quantized symbols at their empirical entropy floor.  The entropy
+stage adds CPU compression overhead (~0.1–0.5 µs/element) but reduces wire
+bytes by the entropy ratio.
 
 Reference: fni8 transport-compression.md, fni8.effective_transfer_ms.
 """
@@ -72,6 +78,21 @@ _DECOMPRESS_PER_ELEMENT_US: dict[str, float] = {
 # link-layer framing that does not scale with payload size.
 _WIRE_FIXED_LATENCY_US = 5.0
 
+# Conservative rough entropy compression ratios measured on Gaussian activations
+# with int8/int4 wire codecs (issue #188).  Actual ratio depends on the source
+# distribution; these floor estimates are safe for scheduler overhead accounting.
+_ENTROPY_PAYLOAD_RATIO: dict[str, float] = {
+    "fp16": 1.0,
+    "int8": 0.65,
+    "int4": 0.50,
+    "int4-had": 0.50,
+    "nf4": 0.50,
+}
+
+# CPU-side rANS encode/decode overhead (µs/element).  Conservative estimate
+# for numpy-backed rANS on the fleet's Xeon Silver 4116.
+_ENTROPY_CPU_PER_ELEMENT_US: float = 0.3
+
 
 def bytes_per_element(scheme: str) -> float:
     """Bytes per element on the wire for *scheme* (code payload, no group scales)."""
@@ -82,12 +103,19 @@ def _numel(shape) -> int:
     return int(torch.Size(shape).numel())
 
 
-def _on_wire_bytes(shape, scheme: str) -> int:
-    """Compressed bytes crossing the PCIe link for *shape* under *scheme*."""
+def _on_wire_bytes(shape, scheme: str, entropy: bool = False) -> int:
+    """Compressed bytes crossing the PCIe link for *shape* under *scheme*.
+
+    When *entropy* is True the payload is further shrunk by the empirical
+    entropy ratio for that scheme.
+    """
     num_elements = _numel(shape)
     hidden = int(shape[-1])
     bpe = _BYTES_PER_ELEMENT.get(scheme, 1.0)
     payload_bytes = int(num_elements * bpe)
+    if entropy:
+        ratio = _ENTROPY_PAYLOAD_RATIO.get(scheme, 1.0)
+        payload_bytes = int(payload_bytes * ratio)
     gs = _DEFAULT_GROUP_SIZE.get(scheme)
     if gs is not None and gs > 0:
         rows = num_elements // hidden
@@ -98,7 +126,7 @@ def _on_wire_bytes(shape, scheme: str) -> int:
     return payload_bytes + scale_bytes
 
 
-def estimate_boundary_ms(shape, dtype, compressor) -> float:
+def estimate_boundary_ms(shape, dtype, compressor: str, entropy: bool = False) -> float:
     """Estimated wall-clock time (ms) for a compress -> P2P -> decompress boundary transfer.
 
     Combines analytic wire time (PCIe-1.0-x1 at 250 MB/s) with calibrated
@@ -114,6 +142,9 @@ def estimate_boundary_ms(shape, dtype, compressor) -> float:
     compressor:
         Compression scheme name. One of ``"fp16"``, ``"int8"``, ``"int4"``,
         ``"int4-had"``, ``"nf4"``. Unknown names fall back to ``"int8"``.
+    entropy:
+        When True, include a lossless rANS post-quantization stage that
+        reduces wire bytes and adds CPU encode/decode overhead.
 
     Returns
     -------
@@ -127,13 +158,17 @@ def estimate_boundary_ms(shape, dtype, compressor) -> float:
     cb = _COMPRESS_BASE_MS.get(compressor, _COMPRESS_BASE_MS["int8"])
     cpu = _COMPRESS_PER_ELEMENT_US.get(compressor, _COMPRESS_PER_ELEMENT_US["int8"])
     compress_ms = cb + cpu * num_elements / 1e6
+    if entropy:
+        compress_ms += _ENTROPY_CPU_PER_ELEMENT_US * num_elements / 1e6
 
-    wire_bytes = _on_wire_bytes(shape, compressor)
+    wire_bytes = _on_wire_bytes(shape, compressor, entropy=entropy)
     wire_ms = wire_bytes / _WIRE_BYTES_PER_S * 1000.0
     wire_ms += _WIRE_FIXED_LATENCY_US / 1000.0
 
     db = _DECOMPRESS_BASE_MS.get(compressor, _DECOMPRESS_BASE_MS["int8"])
     dpu = _DECOMPRESS_PER_ELEMENT_US.get(compressor, _DECOMPRESS_PER_ELEMENT_US["int8"])
     decompress_ms = db + dpu * num_elements / 1e6
+    if entropy:
+        decompress_ms += _ENTROPY_CPU_PER_ELEMENT_US * num_elements / 1e6
 
     return compress_ms + wire_ms + decompress_ms
