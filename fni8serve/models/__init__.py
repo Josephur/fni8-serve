@@ -16,6 +16,7 @@ from . import qwen3 as _qwen3  # noqa: E402,F401
 from . import gemma3 as _gemma3  # noqa: E402,F401
 from . import deepseek as _deepseek  # noqa: E402,F401
 from . import qwen3_next as _qwen3_next  # noqa: E402,F401
+from . import qwen3_5 as _qwen3_5  # noqa: E402,F401
 from . import lfm2 as _lfm2  # noqa: E402,F401
 from . import glm as _glm  # noqa: E402,F401
 from . import hunyuan as _hunyuan  # noqa: E402,F401

@@ -278,7 +278,9 @@ class ModelConfig:
             shared_expert_intermediate_size=c.get("shared_expert_intermediate_size", 0),
             decoder_sparse_step=c.get("decoder_sparse_step", 1),
             mlp_only_layers=tuple(c.get("mlp_only_layers", []) or []),
-            num_mtp_layers=c.get("num_nextn_predict_layers", 0),
+            # MTP depth: DeepSeek/Qwen3-Next spell it `num_nextn_predict_layers`;
+            # the Qwen3.5 release uses `mtp_num_hidden_layers` — accept either.
+            num_mtp_layers=c.get("num_nextn_predict_layers") or c.get("mtp_num_hidden_layers", 0),
             is_multimodal=vision_cfg is not None,
             vision_config=vision_cfg,
             image_token_id=vision_cfg.image_token_id if vision_cfg else None,
@@ -328,6 +330,7 @@ _KNOWN_HF_KEYS = {
     "decoder_sparse_step",
     "mlp_only_layers",
     "num_nextn_predict_layers",
+    "mtp_num_hidden_layers",  # Qwen3.5 MTP depth (== num_nextn_predict_layers)
     # VLM / multimodal keys — consumed by from_hf, not leaked into extra
     "vision_config",
     "image_token_id",

@@ -147,10 +147,21 @@ def _raw_dtype(w: torch.Tensor) -> torch.Tensor:
     return w16
 
 
-_QWEN3_NEXT_ARCHS = frozenset({
-    "qwen3_next", "qwen3next", "Qwen3NextForCausalLM",
-    "qwen3_5_vl", "Qwen3_5VLForConditionalGeneration",
-})
+_QWEN3_NEXT_ARCHS = frozenset(
+    {
+        "qwen3_next",
+        "qwen3next",
+        "Qwen3NextForCausalLM",
+        "qwen3_5_vl",
+        "Qwen3_5VLForConditionalGeneration",
+        # Qwen3.5-9B (dense hybrid) ships as a VLM wrapper; text backbone reuses the
+        # same fused linear-attn tensor layout, so it needs the same in_proj remap.
+        "qwen3_5",
+        "qwen3.5",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+    }
+)
 
 
 def _remap_qwen3_next(sd: dict, cfg: ModelConfig) -> dict:
@@ -180,9 +191,9 @@ def _remap_qwen3_next(sd: dict, cfg: ModelConfig) -> dict:
         out = {}
         for name, w in sd.items():
             if name.startswith("model.language_model."):
-                out["model." + name[len("model.language_model."):]] = w
+                out["model." + name[len("model.language_model.") :]] = w
             elif name.startswith("model.visual."):
-                out[name[len("model."):]] = w
+                out[name[len("model.") :]] = w
             else:
                 out[name] = w
         sd = out
