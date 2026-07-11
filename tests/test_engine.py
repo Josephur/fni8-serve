@@ -270,7 +270,7 @@ def _qwen3_next_hybrid_cfg_sd():
             sd[f"{la}.beta_proj.weight"] = r(nv, H)
             sd[f"{la}.dt_proj.weight"] = r(nv, H)
             sd[f"{la}.z_proj.weight"] = r(nv * vd, H)
-            sd[f"{la}.norm.weight"] = r(nv * vd)
+            sd[f"{la}.norm.weight"] = r(vd)  # gated DeltaNet norm is PER-HEAD (head_v_dim)
         for w, d in (("gate", cfg.num_experts),):
             sd[f"{p}.mlp.gate.weight"] = r(d, H)
         for e in range(cfg.num_experts):

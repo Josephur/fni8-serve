@@ -195,7 +195,7 @@ def _sd(cfg, device="cpu"):
             sd[f"{la}.dt_bias"] = r(_NV).float()
             sd[f"{la}.beta_proj.weight"] = r(_NV, _H)
             sd[f"{la}.dt_proj.weight"] = r(_NV, _H)
-            sd[f"{la}.norm.weight"] = r(_NV * _VD)
+            sd[f"{la}.norm.weight"] = r(_VD)  # gated DeltaNet norm is PER-HEAD (head_v_dim)
         # dense SwiGLU MLP (no experts)
         sd[f"{p}.mlp.gate_proj.weight"] = r(_INTER, _H)
         sd[f"{p}.mlp.up_proj.weight"] = r(_INTER, _H)
@@ -234,25 +234,38 @@ def test_qwen3_5_hybrid_decode_matches_teacher_forced():
     model = build_model(cfg, _sd(cfg, "cuda")).cuda().eval()
     runner = ModelRunner(model, cfg, max_batch=1, max_len=32, device="cuda")
     prompt = torch.randint(0, cfg.vocab_size, (1, 5), device="cuda")
-    gen = runner.generate_greedy(prompt, max_new_tokens=4)
+
+    # Decode path: capture the per-step logits (not just tokens), stepping greedily.
+    step_logits = [runner.prefill(prompt)[0]]
+    tok = step_logits[-1].argmax(-1, keepdim=True).unsqueeze(0)
+    gen = [tok]
+    for _ in range(3):
+        step_logits.append(runner.decode(tok)[0])
+        tok = step_logits[-1].argmax(-1, keepdim=True).unsqueeze(0)
+        gen.append(tok)
+    gen = torch.cat(gen, dim=1)
 
     full_ids = torch.cat([prompt, gen], dim=1)
     pos = torch.arange(full_ids.shape[1], device="cuda").unsqueeze(0)
     from fni8serve.models.cache import RecurrentStateCache
 
     ref_cache = KVCache(
-        cfg.num_hidden_layers,
-        1,
-        cfg.num_key_value_heads,
-        32,
-        cfg.resolved_head_dim(),
+        cfg.num_hidden_layers, 1, cfg.num_key_value_heads, 32, cfg.resolved_head_dim(),
         device="cuda",
     )
     ctx = ForwardContext(is_prefill=True, kv_cache=ref_cache, lin_cache=RecurrentStateCache())
     hidden = model(full_ids, pos, ctx)
-    logits = model.compute_logits(hidden)
-    ref_tokens = logits[:, prompt.shape[1] - 1 : -1].argmax(-1)
-    assert torch.equal(ref_tokens, gen)
+    tf_logits = model.compute_logits(hidden)[0, prompt.shape[1] - 1 : -1]  # [4, vocab]
+
+    # The recurrent state + KV cache must make each decode step reproduce the
+    # teacher-forced logits. int8 prefill vs decode kernels round slightly differently,
+    # so compare with a cosine bar (AGENTS.md: int8 paths use cosine-sim, not argmax
+    # equality) rather than exact token match, which is brittle at near-tie logits.
+    for i in range(4):
+        cos = torch.nn.functional.cosine_similarity(
+            step_logits[i].float(), tf_logits[i].float(), dim=0
+        )
+        assert cos > 0.999, f"decode step {i} diverges from teacher-forced: cos={cos.item()}"
 
 
 def _cos(a, b):
@@ -379,3 +392,87 @@ def test_qwen3_5_offline_fni8_roundtrip(tmp_path):
     r_d = ModelRunner(m_direct, cfg, max_batch=1, max_len=32, device="cuda")
     r_o = ModelRunner(m_off, cfg, max_batch=1, max_len=32, device="cuda")
     torch.testing.assert_close(r_o.prefill(prompt), r_d.prefill(prompt), rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# HF-equivalence guards (transformers >= Qwen3.5). These are the tests that would
+# have caught the real-checkpoint bring-up bugs the earlier self-consistency tests
+# missed (they matched OUR own reference, not HF): the DeltaNet q-scale, the per-head
+# gated output norm, and the zero-centered (Gemma-style) Qwen3_5RMSNorm. Pure DeltaNet
+# + norm, so no attention kernel is needed.
+# ---------------------------------------------------------------------------
+
+def _hf_qwen35_cfg():
+    cfg_mod = pytest.importorskip("transformers.models.qwen3_5.configuration_qwen3_5")
+    return cfg_mod.Qwen3_5Config(
+        vocab_size=256, hidden_size=128, intermediate_size=256, num_hidden_layers=1,
+        num_attention_heads=8, num_key_value_heads=8, head_dim=64, hidden_act="silu",
+        linear_num_key_heads=4, linear_num_value_heads=4,
+        linear_key_head_dim=32, linear_value_head_dim=32, linear_conv_kernel_dim=4,
+        full_attention_interval=999, layer_types=["linear_attention"],
+        partial_rotary_factor=0.25, rope_theta=1e6, rms_norm_eps=1e-6,
+        max_position_embeddings=64, pad_token_id=0, tie_word_embeddings=True,
+    )
+
+
+@pytest.mark.skipif(not CUDA, reason="needs CUDA")
+def test_qwen3_5_rmsnorm_is_zero_centered():
+    """Qwen3_5RMSNorm is Gemma-style zero-centered (gain = 1 + weight, weight init 0);
+    q_norm/k_norm and all decoder norms use it. Our RMSNorm(add_unit_offset=True) must
+    reproduce it — the plain-weight variant (the bring-up bug) must NOT."""
+    import torch.nn.functional as F
+    hf_mod = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+    from fni8serve.layers.norm import RMSNorm
+    torch.manual_seed(0)
+    x = torch.randn(2, 5, 64, device="cuda", dtype=torch.float16)
+    w = (torch.randn(64, device="cuda") * 0.3)
+    hf = hf_mod.Qwen3_5RMSNorm(64).cuda()
+    with torch.no_grad():
+        hf.weight.copy_(w)
+    ref = hf(x.float())
+    ours = RMSNorm(64, 1e-6, w.half(), add_unit_offset=True).cuda()(x).float()
+    bug = RMSNorm(64, 1e-6, w.half(), add_unit_offset=False).cuda()(x).float()
+    assert F.cosine_similarity(ref.reshape(-1), ours.reshape(-1), dim=0) > 0.999
+    assert F.cosine_similarity(ref.reshape(-1), bug.reshape(-1), dim=0) < 0.99
+
+
+@pytest.mark.skipif(not CUDA, reason="needs CUDA")
+def test_qwen3_5_gated_deltanet_matches_hf():
+    """Our GatedDeltaNetAttention vs HF Qwen3_5GatedDeltaNet on shared fp weights: guards
+    the q-scale (1/sqrt head_k_dim) readout and the PER-HEAD gated output norm. Either
+    fix regressing drops the cosine well below the bar."""
+    import torch.nn.functional as F
+    hf_mod = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+    from fni8 import QTensor
+
+    from fni8serve.layers.linear_attn import GatedDeltaNetAttention
+    c = _hf_qwen35_cfg()
+    torch.manual_seed(0)
+    hfdn = hf_mod.Qwen3_5GatedDeltaNet(c, 0).cuda().float().eval()
+    W = {n: p.detach() for n, p in hfdn.named_parameters()}
+    nk, nv = c.linear_num_key_heads, c.linear_num_value_heads
+    kd, vd = c.linear_key_head_dim, c.linear_value_head_dim
+
+    def qt(w):
+        w = w.cuda().half()
+        s = w.abs().amax(-1, keepdim=True).clamp_min(1e-8).float() / 127
+        return QTensor(torch.round(w / s).clamp_(-127, 127).to(torch.int8),
+                       s.squeeze(-1), scheme="per_row_i8")
+
+    ocfg = _MC.from_hf(c.to_dict(), arch="qwen3_5")
+    blk = GatedDeltaNetAttention(
+        ocfg, qkv_proj=qt(W["in_proj_qkv.weight"]), out_proj=qt(W["out_proj.weight"]),
+        conv_weight=W["conv1d.weight"].squeeze(1).cuda().half(),
+        a_log=W["A_log"].cuda().float(), dt_bias=W["dt_bias"].cuda().float(),
+        beta_proj=qt(W["in_proj_b.weight"]), gate_proj=qt(W["in_proj_a.weight"]),
+        z_proj=qt(W["in_proj_z.weight"]), norm_gain=W["norm.weight"].cuda().half(),
+        num_k_heads=nk, num_v_heads=nv, key_dim=kd, value_dim=vd,
+        conv_kernel=c.linear_conv_kernel_dim,
+    ).cuda()
+    x = torch.randn(1, 6, c.hidden_size, device="cuda", dtype=torch.float16)
+    with torch.no_grad():
+        ref = hfdn(x.float())
+        ref = ref[0] if isinstance(ref, tuple) else ref
+        ours = blk(x, None, None, 0).float()
+    cos = F.cosine_similarity(ref.reshape(-1), ours.reshape(-1), dim=0).item()
+    assert cos > 0.98, f"DeltaNet diverges from HF: cos={cos}"

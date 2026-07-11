@@ -226,9 +226,26 @@ def _remap_qwen3_next(sd: dict, cfg: ModelConfig) -> dict:
             out[f"{prefix}.linear_attn.dt_proj.weight"] = w[nv:]
         elif ".linear_attn.conv1d.weight" in name:
             prefix = name.replace(".linear_attn.conv1d.weight", "")
-            # Trim to match qkv output dim (builder conv applies only to QKV, not Z)
+            # Trim to match qkv output dim (builder conv applies only to QKV, not Z),
+            # then squeeze the depthwise in-channel dim: HF stores Conv1d weight as
+            # [Wc, 1, K]; the builder buffer is [Wc, K] (it re-adds the 1 via unsqueeze).
             qkv_dim = qk + qk + v_dim
-            out[f"{prefix}.linear_attn.conv_weight"] = w[:qkv_dim]
+            cw = w[:qkv_dim]
+            out[f"{prefix}.linear_attn.conv_weight"] = cw.squeeze(1) if cw.dim() == 3 else cw
+        # Qwen3.5 stores the DeltaNet projections already-SEPARATE (not fused like
+        # Qwen3-Next's in_proj_qkvz / in_proj_ba) — a rename, not a split. Mapping
+        # matches the fused convention above: b -> beta_proj, a -> dt_proj.
+        elif ".linear_attn.in_proj_qkv.weight" in name:
+            out[name.replace(".linear_attn.in_proj_qkv.weight", ".linear_attn.qkv_proj.weight")] = w
+        elif ".linear_attn.in_proj_z.weight" in name:
+            out[name.replace(".linear_attn.in_proj_z.weight", ".linear_attn.z_proj.weight")] = w
+        elif ".linear_attn.in_proj_b.weight" in name:
+            out[name.replace(".linear_attn.in_proj_b.weight", ".linear_attn.beta_proj.weight")] = w
+        elif ".linear_attn.in_proj_a.weight" in name:
+            out[name.replace(".linear_attn.in_proj_a.weight", ".linear_attn.dt_proj.weight")] = w
+        elif name.endswith(".linear_attn.conv_weight"):
+            # Qwen3.5 stores the depthwise conv as [Wc, 1, K]; buffer wants [Wc, K].
+            out[name] = w.squeeze(1) if w.dim() == 3 else w
         else:
             out[name] = w
     return out

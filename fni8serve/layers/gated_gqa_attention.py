@@ -52,6 +52,7 @@ class GatedGQAAttention(nn.Module):
         q_norm: torch.Tensor | None = None,
         k_norm: torch.Tensor | None = None,
         rms_norm_eps: float = 1e-6,
+        qk_unit_offset: bool = False,
         window_left: int = -1,
         causal: bool = True,
     ):
@@ -63,8 +64,14 @@ class GatedGQAAttention(nn.Module):
         self.qkv_gate_proj = LinearW8A8(qkv_gate_proj)
         self.o_proj = LinearW8A8(o_proj)
         self.rope = rope
-        self.q_norm = RMSNorm(head_dim, rms_norm_eps, q_norm) if q_norm is not None else None
-        self.k_norm = RMSNorm(head_dim, rms_norm_eps, k_norm) if k_norm is not None else None
+        self.q_norm = (
+            RMSNorm(head_dim, rms_norm_eps, q_norm, add_unit_offset=qk_unit_offset)
+            if q_norm is not None else None
+        )
+        self.k_norm = (
+            RMSNorm(head_dim, rms_norm_eps, k_norm, add_unit_offset=qk_unit_offset)
+            if k_norm is not None else None
+        )
 
     def _project(self, x):
         """x: [B, S, hidden] -> (q, gate, k, v) each head-shaped, plus applies QK-norm

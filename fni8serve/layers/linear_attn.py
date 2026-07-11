@@ -129,7 +129,12 @@ class GatedDeltaNetAttention(nn.Module):
             cache.set_conv_tail(layer_idx, conv_tail)
         qk = self.nk * self.kd
         q, k, v = qkv.split([qk, qk, self.nv * self.vd], dim=-1)
-        q = _l2norm(q.view(B, L, self.nk, self.kd)).transpose(1, 2)
+        # HF gated-delta-rule scales the (l2-normed) query by 1/sqrt(head_k_dim) before
+        # the readout (`query = query * scale`). Applied here (not inside the shared
+        # recurrence, which stays a pure delta rule) since it is a per-model readout
+        # scale. Omitting it inflates the pre-norm output ~sqrt(Dk)x and — via the gated
+        # RMSNorm eps — rotates the normed output (cos ~0.84 vs HF instead of 1.0).
+        q = (_l2norm(q.view(B, L, self.nk, self.kd)) * (self.kd**-0.5)).transpose(1, 2)
         k = _l2norm(k.view(B, L, self.nk, self.kd)).transpose(1, 2)
         v = v.view(B, L, self.nv, self.vd).transpose(1, 2)
         # broadcast k/q heads to value heads (GQA)
@@ -146,10 +151,18 @@ class GatedDeltaNetAttention(nn.Module):
         )
         if cache is not None:
             cache.set_state(layer_idx, state)
-        o = self.norm(o.transpose(1, 2).reshape(B, L, self.nv * self.vd))
+        # HF Qwen3_5RMSNormGated ("norm BEFORE gate"): a PER-HEAD RMS over head_v_dim,
+        # then the per-head gain, THEN the z gate (silu) — in that order. Done in fp32
+        # (the gated norm is numerically load-bearing, never quantized). The gain is
+        # per-head (length vd), so normalize over the last (vd) axis, not nv*vd.
+        o = o.transpose(1, 2).float()  # [B, L, nv, vd]
+        o = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + self.norm.eps)
+        o = o * self.norm.weight.float()
         if hasattr(self, "z_proj"):
-            o = F.silu(self.z_proj(hidden)) * o
-        return self.out_proj(o)
+            gate = self.z_proj(hidden).view(B, L, self.nv, self.vd).float()
+            o = o * F.silu(gate)
+        o = o.reshape(B, L, self.nv * self.vd)
+        return self.out_proj(o.to(hidden.dtype))
 
 
 def lightning_attention(q, k, v, slopes, state=None):

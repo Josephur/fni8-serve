@@ -103,7 +103,7 @@ def _qwen3_next_hybrid_cfg_sd():
             sd[f"{la}.dt_bias"] = _r(nv).float()
             sd[f"{la}.beta_proj.weight"] = _r(nv, H)
             sd[f"{la}.dt_proj.weight"] = _r(nv, H)
-            sd[f"{la}.norm.weight"] = _r(nv * vd)
+            sd[f"{la}.norm.weight"] = _r(vd)  # gated DeltaNet norm is PER-HEAD (head_v_dim)
         _moe_sd(sd, p, H, cfg.num_experts, cfg.moe_intermediate_size, shared_name="shared_expert")
     return cfg, sd
 

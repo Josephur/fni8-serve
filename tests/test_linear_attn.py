@@ -177,7 +177,9 @@ def test_deltanet_block_runs():
         conv_weight=torch.randn(2 * nk * kd + nv * vd, 4, device="cuda", dtype=torch.float16),
         a_log=torch.zeros(nv, device="cuda"), dt_bias=torch.zeros(nv, device="cuda"),
         beta_proj=qt(nv, H), gate_proj=qt(nv, H),
-        norm_gain=torch.ones(nv * vd, device="cuda", dtype=torch.float16),
+        # gated output norm is PER-HEAD over head_v_dim (HF Qwen3_5RMSNormGated), so the
+        # gain is `vd`-sized, not the flattened nv*vd.
+        norm_gain=torch.ones(vd, device="cuda", dtype=torch.float16),
         num_k_heads=nk, num_v_heads=nv, key_dim=kd, value_dim=vd).cuda()
     x = torch.randn(1, 6, H, device="cuda", dtype=torch.float16)
     y = blk(x, None, None, 0)

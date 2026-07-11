@@ -54,6 +54,9 @@ def _gated_full_attn(cfg, sd, p, rope):
         q_norm=sd.get(f"{p}.self_attn.q_norm.weight"),
         k_norm=sd.get(f"{p}.self_attn.k_norm.weight"),
         rms_norm_eps=cfg.rms_norm_eps,
+        # Qwen3.5's Qwen3_5RMSNorm is ZERO-CENTERED (gain = 1 + weight, weight init 0),
+        # incl. q_norm/k_norm. (The gated DeltaNet output norm is standard, unchanged.)
+        qk_unit_offset=True,
     )
 
 
@@ -121,11 +124,14 @@ class Qwen3_5DecoderLayer(nn.Module):
         self.attn = (
             _gated_full_attn(cfg, sd, p, rope) if self.kind == "full" else _linear_attn(cfg, sd, p)
         )
+        # Qwen3.5 RMSNorm is zero-centered (Gemma-style gain = 1 + weight).
         self.input_layernorm = RMSNorm(
-            cfg.hidden_size, cfg.rms_norm_eps, sd[f"{p}.input_layernorm.weight"]
+            cfg.hidden_size, cfg.rms_norm_eps, sd[f"{p}.input_layernorm.weight"],
+            add_unit_offset=True,
         )
         self.post_attention_layernorm = RMSNorm(
-            cfg.hidden_size, cfg.rms_norm_eps, sd[f"{p}.post_attention_layernorm.weight"]
+            cfg.hidden_size, cfg.rms_norm_eps, sd[f"{p}.post_attention_layernorm.weight"],
+            add_unit_offset=True,
         )
         self.mlp = _build_mlp(cfg, sd, p)
 
@@ -139,10 +145,28 @@ class Qwen3_5DecoderLayer(nn.Module):
         return self.mlp(h), residual
 
 
+def _unwrap_vlm_text_backbone(sd: dict) -> dict:
+    """Real Qwen3.5 ships as a VLM wrapper (`Qwen3_5ForConditionalGeneration`):
+    published `.fni8`s store the text backbone under `model.language_model.*` and
+    the vision tower under `model.visual.*`. To serve text we strip the
+    `model.language_model.` prefix down to `model.` and drop the vision tower.
+    No-op for a plain (already-unwrapped) text checkpoint."""
+    if not any(k.startswith("model.language_model.") for k in sd):
+        return sd
+    pref = "model.language_model."
+    out = {}
+    for k, v in sd.items():
+        if k.startswith("model.visual.") or ".visual." in k:
+            continue  # vision tower — not needed to serve the text model
+        out[("model." + k[len(pref):]) if k.startswith(pref) else k] = v
+    return out
+
+
 class Qwen3_5ForCausalLM(nn.Module):
     def __init__(self, cfg: ModelConfig, sd: dict):
         super().__init__()
         self.config = cfg
+        sd = _unwrap_vlm_text_backbone(sd)
         self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"])
         rope = RotaryEmbedding(
             cfg.resolved_head_dim(),
@@ -153,7 +177,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.layers = nn.ModuleList(
             [Qwen3_5DecoderLayer(cfg, i, sd, rope) for i in range(cfg.num_hidden_layers)]
         )
-        self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, sd["model.norm.weight"])
+        self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, sd["model.norm.weight"],
+                            add_unit_offset=True)  # zero-centered (Qwen3_5RMSNorm)
         lm_w = sd["model.embed_tokens.weight"] if cfg.tie_word_embeddings else sd["lm_head.weight"]
         self.lm_head = LMHead(to_qtensor(lm_w))
 
@@ -169,6 +194,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         return self.lm_head(hidden)
 
 
-@register_model("qwen3_5", "qwen3.5", "Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
+@register_model(
+    "qwen3_5",
+    "qwen3.5",
+    "qwen3_5_text",  # text backbone of the VLM wrapper — published .fni8s (e.g.
+    "qwen3_5_text_config",  # Qwen3.5-0.8B-fni8) carry this as their meta arch
+    "Qwen3_5ForCausalLM",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5TextModel",
+)
 def build_qwen3_5(cfg: ModelConfig, weights: dict) -> Qwen3_5ForCausalLM:
     return Qwen3_5ForCausalLM(cfg, weights)
