@@ -7,9 +7,15 @@ a thin `models/<family>.py` assembly over shared layers, registered with
 Support splits by **attention backend** — that's the axis that decides whether a
 family runs on today's fni8 dp4a kernels or needs a new one.
 
-Legend: ✅ concrete + GPU-tested (full decode) · 🟩 registered + prefill-tested
-(decode needs recurrent-state/latent cache) · 🟡 config ready, needs real weights ·
-🟧 scaffold · ⛔ int8 accel needs a new fni8 kernel (fp16 backend works).
+Legend (**status** column): ✅ concrete + GPU-tested (full decode) · 🟩 registered +
+prefill-tested (decode needs recurrent-state/latent cache) · 🟡 config ready, needs real
+weights · 🟧 scaffold · ⛔ int8 accel needs a new fni8 kernel (fp16 backend works).
+
+**The `released` column ≠ "decodes".** ✅ under `released` only means a `.fni8` checkpoint
+exists / is published for the family. Whether the family actually **decodes int8 end-to-end
+is governed solely by the `status` column** — only a ✅ status means full int8 decode today
+(🟩 = prefill only; ⛔ = decodes on the fp16 backend, not int8-accelerated). Do not read a
+released-✅ as "supported for generation."
 
 | family | released | attention backend | MLP | status | notes |
 |---|---|---|---|---|---|

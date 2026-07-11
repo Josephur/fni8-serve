@@ -9,6 +9,24 @@ The scheduler, paged-KV, and continuous-batching design follow
 fp16 flash-attention for `fni8`'s int8 dp4a kernels, because on this hardware the fp16
 tensor cores are firmware-disabled and dp4a is the fast path.
 
+## What's feature-complete vs in-progress
+
+**Supported for generation (decodes int8 end-to-end today):** **Qwen3** dense/untied,
+**Qwen3-MoE**, and **Gemma3** (text) — full prefill + autoregressive decode on the dp4a
+kernels, behind the OpenAI-compatible server. Only these three families are usable for
+generation. Everything else is partial:
+
+- **DeepSeek-V3 (MLA)** decodes correctly but in **fp16** (via `MLALatentCache`); the int8
+  dp4a absorb kernel that would accelerate it is in progress (Track 2).
+- **Qwen3-Next / 3.5 / 3.6, MiniMax, LFM2, GLM-4.5/4.6, Hunyuan** are **prefill only** —
+  they build and run a prefill forward but **cannot yet generate**; full decode is pending
+  the recurrent-state / linear-attention decode cache (in progress).
+- **Multi-GPU (PP + MoE-EP)** and **MTP speculative decode** are scaffolded, not yet wired
+  end-to-end.
+
+See [Model support](#model-support) and the authoritative
+[`fni8serve/models/COVERAGE.md`](fni8serve/models/COVERAGE.md) matrix.
+
 ## Contents
 
 - [Why this exists](#why-this-exists)
@@ -268,12 +286,16 @@ Model support is a registry: a family is a `ModelConfig` plus a thin `models/<fa
 over shared layers, registered with `@register_model`. The engine never changes. See
 [`fni8serve/models/COVERAGE.md`](fni8serve/models/COVERAGE.md) for current status.
 
-- Full decode through the dp4a kernels: Qwen3, Qwen3-MoE, Gemma3 (GQA with QK-norm and
-  sliding window).
-- Divergent-attention families on ported fp16 backends (int8 acceleration is the
-  DeltaNet/MLA kernel track in `fni8`): DeepSeek (MLA), Qwen3-Next / 3.5 / 3.6 (hybrid
-  Gated-DeltaNet plus full attention), LFM2 (short-conv plus attention), GLM-4.5/4.6,
-  Hunyuan, MiniMax (lightning).
+- **Decodes int8 end-to-end** (full generation on the dp4a kernels — the supported set):
+  Qwen3 dense/untied, Qwen3-MoE, Gemma3 (GQA with QK-norm and sliding window).
+- **Decodes, but fp16 (not int8-accelerated yet):** DeepSeek-V3 (MLA). Full prefill +
+  autoregressive decode run through the fp16 decompress-MLA path and `MLALatentCache`; the
+  int8 dp4a absorb kernel is in progress (Track 2 in `fni8`).
+- **Prefill only — cannot decode yet:** Qwen3-Next / 3.5 / 3.6 (hybrid Gated-DeltaNet plus
+  full attention), MiniMax (lightning), LFM2 (short-conv plus attention), GLM-4.5/4.6,
+  Hunyuan. These build through the registry and run a prefill forward on a ported fp16
+  backend, but full autoregressive generation is pending the recurrent-state / linear-
+  attention decode cache (in progress). Do not treat them as usable for generation yet.
 
 ## Status
 
@@ -281,8 +303,11 @@ over shared layers, registered with `@register_model`. The engine never changes.
       (`fni8serve.convert`), including FP8-source models (DeepSeek, Hy3)
 - [x] int8 / W4A8 dp4a GEMM in `fni8`; the Linear seam runs it (fp16 fallback for NF4/CPU)
 - [x] Continuous-batching engine (scheduler, slot KV, `LLMEngine.generate()`)
-- [x] Modular model registry, 8+ families (build + prefill validated)
-- [x] Recurrent-state and latent decode caching for the linear/DeltaNet/MLA families
+- [x] Modular model registry, 8+ families build + prefill-validated (full int8 decode is
+      Qwen3 / Qwen3-MoE / Gemma3 only; DeepSeek decodes in fp16; the rest are prefill-only)
+- [x] Latent-KV decode cache (`MLALatentCache`) for DeepSeek MLA — fp16 decode
+- [ ] Recurrent-state decode cache for the linear/DeltaNet/conv/lightning families
+      (Qwen3-Next/3.5/3.6, LFM2, GLM, Hunyuan, MiniMax); until it lands they are prefill-only
 - [x] Paged-KV block-table with int8 quantize-on-write, wired into the engine
 - [x] OpenAI-compatible API server (`fni8serve.api`) with SSE streaming, plus a
       per-step logit-processor hook in the sampler for structured outputs / grammars
