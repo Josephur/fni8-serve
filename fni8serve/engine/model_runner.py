@@ -22,12 +22,14 @@ from .sequence import Sequence
 
 class EngineRunner:
     def __init__(
-        self, model, cache, *, device="cuda", enable_cuda_graph: bool | None = None, lin_cache=None
+        self, model, cache, *, device="cuda", enable_cuda_graph: bool | None = None,
+        lin_cache=None, chunked_prefill_size: int = 0,
     ):
         self.model = model
         self.cache = cache
         self.device = device
         self.lin_cache = lin_cache or RecurrentStateCache()
+        self._chunk_size = chunked_prefill_size
         # Families with recurrent (DeltaNet / lightning / short-conv) layers carry
         # per-slot decode state through `lin_cache`. Two consequences for the engine:
         # (1) each such layer's state is keyed per slot, so prefill must clear+bind
@@ -131,26 +133,62 @@ class EngineRunner:
             return self._prefill_varlen(batch)
         out = []
         for seq in batch:
-            # Fresh slot for this sequence's recurrent state; bind so the mixer
-            # layers read/write only this slot (not other running sequences').
             self.lin_cache.clear_slot(seq.slot)
             self.lin_cache.bind([seq.slot])
-            ids = torch.tensor([seq.prompt_ids], device=self.device)  # [1, S]
-            pos = torch.arange(seq.num_prompt, device=self.device).unsqueeze(0)
-            self.cache.ensure_capacity([seq.slot], [seq.num_prompt])
+            n = seq.num_prompt
+            self.cache.ensure_capacity([seq.slot], [n])
+            chunk_size = self._chunk_size
+            if chunk_size > 0 and n > chunk_size:
+                out.append(self._prefill_chunked(seq))
+            else:
+                ids = torch.tensor([seq.prompt_ids], device=self.device)
+                pos = torch.arange(n, device=self.device).unsqueeze(0)
+                ctx = ForwardContext(
+                    is_prefill=True,
+                    kv_cache=self.cache,
+                    lin_cache=self.lin_cache,
+                    slots=[seq.slot],
+                    prefill_start=seq.prefix_matched_len,
+                    pixel_values=seq.pixel_values,
+                )
+                hidden = self.model(ids, pos, ctx)
+                seq.length = n
+                logits = self.model.compute_logits(hidden[:, -1])
+                out.append(self._sample(logits, [seq])[0])
+        return out
+
+    def _prefill_chunked(self, seq: Sequence) -> int:
+        """Chunked prefill: split the prompt into chunks, accumulate fp16 K/V
+        across chunks for bit-identical attention, write each chunk to the paged
+        cache, and sample from the last token.
+
+        When *prefix_matched_len > 0*, the shared prefix tokens are still
+        processed through the model (accumulating fp16 K/V for attention) but
+        their K/V is NOT written to the paged cache (it is already there from
+        the original request that filled the prefix)."""
+        n = seq.num_prompt
+        chunk_size = self._chunk_size
+        prompt = seq.prompt_ids
+        prefix_len = seq.prefix_matched_len
+        acc_buf: list = []
+        for chunk_start in range(0, n, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n)
+            chunk_ids = prompt[chunk_start:chunk_end]
+            ids = torch.tensor([chunk_ids], device=self.device)
+            pos = torch.arange(chunk_start, chunk_end, device=self.device).unsqueeze(0)
             ctx = ForwardContext(
                 is_prefill=True,
                 kv_cache=self.cache,
                 lin_cache=self.lin_cache,
                 slots=[seq.slot],
-                prefill_start=seq.prefix_matched_len,
+                prefill_start=prefix_len,
                 pixel_values=seq.pixel_values,
+                acc_kv_buffer=acc_buf,
             )
             hidden = self.model(ids, pos, ctx)
-            seq.length = seq.num_prompt
-            logits = self.model.compute_logits(hidden[:, -1])
-            out.append(self._sample(logits, [seq])[0])
-        return out
+        seq.length = n
+        logits = self.model.compute_logits(hidden[:, -1])
+        return self._sample(logits, [seq])[0]
 
     @torch.inference_mode()
     def _prefill_varlen(self, batch: list[Sequence]) -> list[int]:

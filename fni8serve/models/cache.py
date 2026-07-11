@@ -29,7 +29,7 @@ class KVCache:
         self.length = 0
 
     def write_prefill(
-        self, layer: int, k: torch.Tensor, v: torch.Tensor, *, slot=None, start: int = 0
+        self, layer: int, k: torch.Tensor, v: torch.Tensor, *, slot=None, start: int = 0, **kwargs
     ):
         """k, v: [B, Hkv, S, D] at positions [0, S). `slot` is ignored (the simple
         runner cache is single-batch); the engine's PagedKVCache uses it."""
@@ -245,7 +245,7 @@ class MLALatentCache:
     def reset(self):
         self.length = 0
 
-    def write_prefill(self, layer: int, latent: torch.Tensor, *, slot: int | None = None):
+    def write_prefill(self, layer: int, latent: torch.Tensor, *, slot: int | None = None, **kwargs):
         """latent: [B, S, D] at positions [0, S). When *slot* is given, B must be 1
         and only that slot row is written (engine path — one seq at a time)."""
         s = latent.shape[1]

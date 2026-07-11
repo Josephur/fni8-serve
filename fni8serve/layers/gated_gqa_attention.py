@@ -122,10 +122,36 @@ class GatedGQAAttention(nn.Module):
             kt = k.transpose(1, 2).contiguous()
             vt = v.transpose(1, 2).contiguous()
             slot = ctx.slots[0] if ctx.slots is not None else None
-            ctx.kv_cache.write_prefill(layer_idx, kt, vt, slot=slot, start=ctx.prefill_start)
-            out = fni8.attn_int8_fwd(
-                qt, kt, vt, causal=self.causal, scale=self.scale, window_left=self.window_left
+            ctx.kv_cache.write_prefill(
+                layer_idx, kt, vt, slot=slot, start=ctx.prefill_start, positions=positions,
             )
+            # Chunked prefill: use accumulated fp16 K/V + current K/V with
+            # attn_int8_fwd (same kernel as full prefill) by zero-padding Q.
+            acc_buf = getattr(ctx, "acc_kv_buffer", None)
+            if acc_buf is not None and layer_idx < len(acc_buf) and acc_buf[layer_idx] is not None:
+                k_prev, v_prev = acc_buf[layer_idx]
+                prev_len = k_prev.shape[2]
+                cur_len = kt.shape[2]
+                kt_all = torch.cat([k_prev, kt], dim=2)
+                vt_all = torch.cat([v_prev, vt], dim=2)
+                total_len = kt_all.shape[2]
+                q_pad = kt_all.new_zeros(1, self.nh, total_len, self.hd)
+                q_pad[:, :, -cur_len:, :] = qt  # actual Q at the end
+                out = fni8.attn_int8_fwd(
+                    q_pad, kt_all, vt_all,
+                    causal=self.causal, scale=self.scale, window_left=self.window_left,
+                )
+                out = out[:, :, -cur_len:, :]
+                acc_buf[layer_idx] = (kt_all.contiguous(), vt_all.contiguous())
+            else:
+                out = fni8.attn_int8_fwd(
+                    qt, kt, vt, causal=self.causal, scale=self.scale, window_left=self.window_left
+                )
+            # Initialize or update accumulated buffer
+            if acc_buf is not None and not (layer_idx < len(acc_buf) and acc_buf[layer_idx] is not None):
+                while len(acc_buf) <= layer_idx:
+                    acc_buf.append(None)
+                acc_buf[layer_idx] = (kt.contiguous(), vt.contiguous())
             out = out.transpose(1, 2)  # [B,H,S,D] -> [B,S,H,D]
             return self._gate_and_project(out, gate, B, S)
 

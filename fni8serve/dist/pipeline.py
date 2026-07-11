@@ -129,8 +129,8 @@ class LayerRemappedCache:
     def block_table(self, slots: list[int]):
         return self._cache.block_table(slots)
 
-    def write_prefill(self, layer: int, k, v, *, slot: int, start: int = 0):
-        return self._cache.write_prefill(layer - self._offset, k, v, slot=slot, start=start)
+    def write_prefill(self, layer: int, k, v, *, slot: int, start: int = 0, **kwargs):
+        return self._cache.write_prefill(layer - self._offset, k, v, slot=slot, start=start, **kwargs)
 
     def write_prefill_varlen(self, layer: int, slot_mapping, k, v):
         return self._cache.write_prefill_varlen(layer - self._offset, slot_mapping, k, v)

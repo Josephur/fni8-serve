@@ -42,6 +42,7 @@ class PagedKVCache:
         device,
         block_size: int = 16,
         num_blocks: int | None = None,
+        max_prefix_entries: int | None = None,
     ):
         self.block_size = block_size
         self.max_blocks_per_seq = (max_len + block_size - 1) // block_size
@@ -62,7 +63,12 @@ class PagedKVCache:
         self._free_slots = list(range(num_slots))
         self._slot_blocks: list[list[int]] = [[] for _ in range(num_slots)]
         self._block_refcount: dict[int, int] = {}
-        self._prefix_trie: dict = {}
+        # RadixAttention trie: token-by-token nested dict with block-aligned entries.
+        # Each node is a dict with optional key "_entry" holding prefix block data.
+        # "_lru" is a monotonic counter bumped on every store/access for LRU eviction.
+        self._prefix_trie: dict = {"_lru": 0}
+        self._max_prefix_entries = max_prefix_entries
+        self._prefix_entry_count = 0
         # Pinned host staging for the CUDA-graph decode hot path (issue #183): the
         # per-step slot-mapping / block-table used to be rebuilt with
         # `torch.tensor(list, device=cuda)` (a blocking pageable H2D) then D2D-copied
@@ -127,43 +133,104 @@ class PagedKVCache:
         for blk in blocks:
             self._block_refcount[blk] = self._block_refcount.get(blk, 1) + 1
 
+    def _tick_lru(self) -> int:
+        """Bump and return the global LRU counter."""
+        self._prefix_trie["_lru"] = self._prefix_trie.get("_lru", 0) + 1
+        return self._prefix_trie["_lru"]
+
+    def _evict_one_prefix(self):
+        """Find the prefix entry with the oldest LRU timestamp and evict it.
+        Releases block refcounts and cleans up orphaned trie nodes."""
+        oldest = None
+        oldest_lru = None
+
+        def _walk(node: dict, path: list):
+            nonlocal oldest, oldest_lru
+            for k, v in node.items():
+                if isinstance(k, str) and k.startswith("_"):
+                    continue
+                if isinstance(v, dict):
+                    if "_entry" in v:
+                        lru = v["_entry"]["lru"]
+                        if oldest is None or lru < oldest_lru:
+                            oldest = (path + [k], v)
+                            oldest_lru = lru
+                    _walk(v, path + [k])
+
+        _walk(self._prefix_trie, [])
+        if oldest is None:
+            return
+        path, node = oldest
+        entry = node.pop("_entry", None)
+        if entry is not None:
+            for blk in entry["blocks"]:
+                c = self._block_refcount.get(blk, 1) - 1
+                if c <= 0:
+                    self._block_refcount.pop(blk, None)
+                    self._free_blocks.append(blk)
+                else:
+                    self._block_refcount[blk] = c
+            self._prefix_entry_count -= 1
+        # Clean up orphaned nodes (leaf nodes with no children or entries)
+        if len(node) == 0:
+            parent = self._prefix_trie
+            for p in path[:-1]:
+                parent = parent.get(p, {})
+            parent.pop(path[-1], None)
+
     def store_prefix(self, token_ids: list[int], slot: int):
         """Store a completed prefix in the radix trie for future lookups.
-        Stores entries at every block-aligned boundary so that shorter lookups
-        that diverge at the suffix can still find the longest block-aligned match."""
+        Stores entries at every block-aligned boundary with LRU tracking.
+        Evicts the oldest entry when max_prefix_entries is exceeded."""
         n = len(token_ids)
         num_shared = n // self.block_size
         if num_shared == 0:
             return
         full_blocks = list(self._slot_blocks[slot])
+        lru_now = self._tick_lru()
         node = self._prefix_trie
         for i, tid in enumerate(token_ids):
             node = node.setdefault(tid, {})
             pos = i + 1
             if pos % self.block_size == 0 and pos // self.block_size <= num_shared:
-                key = "_"
-                if key not in node:
-                    nb = pos // self.block_size
-                    node[key] = {"blocks": full_blocks[:nb], "num_tokens": pos, "slot": slot}
+                nb = pos // self.block_size
+                # Block-aligned boundary — store an entry if not already present
+                if "_entry" not in node:
+                    if (
+                        self._max_prefix_entries is not None
+                        and self._prefix_entry_count >= self._max_prefix_entries
+                    ):
+                        self._evict_one_prefix()
+                    node["_entry"] = {
+                        "blocks": full_blocks[:nb],
+                        "num_tokens": pos,
+                        "lru": lru_now,
+                    }
                     for blk in full_blocks[:nb]:
                         self._block_refcount[blk] = self._block_refcount.get(blk, 1) + 1
+                    self._prefix_entry_count += 1
+                else:
+                    # Entry already exists — bump its LRU timestamp
+                    node["_entry"]["lru"] = lru_now
 
     def lookup_prefix(self, token_ids: list[int]) -> tuple[int, list[int]]:
         """Find the longest block-aligned matching prefix.
-        Returns (matched_len, shared_blocks)."""
+        Returns (matched_len, shared_blocks). Bumps LRU on accessed entries."""
         node = self._prefix_trie
         best_len = 0
         best_blocks: list[int] = []
+        lru_now = self._tick_lru()
         for i, tid in enumerate(token_ids):
             if tid not in node:
                 break
             node = node[tid]
-            if "_" in node:
-                entry = node["_"]
+            if "_entry" in node:
+                entry = node["_entry"]
                 stored = entry["num_tokens"]
                 if i + 1 >= stored:
                     best_len = stored
                     best_blocks = list(entry["blocks"])
+                    entry["lru"] = lru_now  # bump LRU on access
         return best_len, best_blocks
 
     def _slot_mapping(self, slots: list[int], positions: list[int]) -> torch.Tensor:
@@ -213,14 +280,25 @@ class PagedKVCache:
         dst.copy_(host, non_blocking=self._pin)
 
     def write_prefill(
-        self, layer: int, k: torch.Tensor, v: torch.Tensor, *, slot: int, start: int = 0
+        self, layer: int, k: torch.Tensor, v: torch.Tensor, *, slot: int, start: int = 0,
+        positions: torch.Tensor | None = None,
     ):
         """k, v: [1, Hkv, S, D] fp16 -> quantize-on-write, one position at a time
         (the kernel's write granularity), into this one sequence's blocks.
-        *start* skips the first *start* positions (shared-prefix reuse)."""
+        *start* skips the first *start* positions (shared-prefix reuse).
+        *positions*, if given, overrides the implicit [0, S) sequence positions with
+        the actual positions in the sequence (needed for chunked prefill where the
+        K/V tensor covers a subset of the prompt)."""
         s = k.shape[2]
-        for t in range(start, s):
-            mapping = self._slot_mapping([slot], [t])
+        for t in range(s):
+            if positions is not None:
+                pos = positions[t] if positions.dim() == 1 else positions[0, t]
+                pos = int(pos)
+            else:
+                pos = t
+            if pos < start:
+                continue
+            mapping = self._slot_mapping([slot], [pos])
             fni8.quantize_kv_write_paged(
                 k[:, :, t, :].contiguous(),
                 v[:, :, t, :].contiguous(),

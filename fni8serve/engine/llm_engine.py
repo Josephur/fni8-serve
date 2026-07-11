@@ -37,6 +37,7 @@ class LLMEngine:
         eos_id: int | None = None,
         enable_cuda_graph: bool | None = None,
         num_diffusion_steps: int = 8,
+        chunked_prefill_size: int = 0,
     ):
         self.cfg = cfg
         self.device = device
@@ -83,6 +84,7 @@ class LLMEngine:
             device=device,
             enable_cuda_graph=enable_cuda_graph,
             lin_cache=self.lin_cache,
+            chunked_prefill_size=chunked_prefill_size,
         )
         self._ids = itertools.count()
         self._out: dict[int, Sequence] = {}
