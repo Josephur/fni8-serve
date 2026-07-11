@@ -14,7 +14,7 @@
       }
     }
   },
-  "model": "deepseek/deepseek-v4-pro",
+  "model": "deepseek/deepseek-v4-flash",
   "lsp": true,
   "formatter": {
     "ruff": { "command": ["ruff", "format", "$FILE"], "extensions": [".py"] }

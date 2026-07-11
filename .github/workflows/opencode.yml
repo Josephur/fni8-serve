@@ -1,7 +1,7 @@
 name: OpenCode (DeepSeek)
 
 # A second autonomous coding lane alongside Claude: comment "@deepseek <task>" on an
-# issue, or add the "deepseek" label. deepseek-v4-pro drives `opencode run` on your
+# issue, or add the "deepseek" label. deepseek-v4-flash drives `opencode run` on your
 # self-hosted Volta runner (in the ci/opencode image, which has the host docker socket
 # — so it BUILDS + TESTS the change itself), then pushes a branch and comments a PR
 # link. Auto-loads AGENTS.md, MCP servers (context7 / sequential-thinking / brave).
@@ -41,7 +41,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run opencode (deepseek-v4-pro)
+      - name: Run opencode (deepseek-v4-flash)
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
