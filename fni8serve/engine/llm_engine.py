@@ -132,8 +132,9 @@ class LLMEngine:
                 self.cache.store_prefix(seq.prompt_ids, seq.slot)
         else:
             toks = self.runner.prefill(batch) if is_prefill else self.runner.decode(batch)
-            for seq, tok in zip(batch, toks):
-                seq.output_ids.append(int(tok))
+            if toks is not None:
+                for seq, tok in zip(batch, toks):
+                    seq.output_ids.append(int(tok))
             if is_prefill:
                 for seq in batch:
                     self.cache.store_prefix(seq.prompt_ids, seq.slot)

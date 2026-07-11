@@ -327,3 +327,212 @@ def test_engine_qwen3_next_concurrent_recurrent_decode():
 
     assert both[0] == solo_a, f"seq A corrupted by concurrent decode: {both[0]} vs {solo_a}"
     assert both[1] == solo_b, f"seq B corrupted by concurrent decode: {both[1]} vs {solo_b}"
+
+
+# ── MTP speculative-decode tests ──────────────────────────────────────────
+
+
+def _cfg_mtp():
+    return ModelConfig(
+        arch="qwen3",
+        vocab_size=256,
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=256,
+        max_position_embeddings=256,
+        head_dim=32,
+        qk_norm=True,
+        tie_word_embeddings=True,
+        num_mtp_layers=1,  # single MTP depth
+    )
+
+
+def _sd_mtp(cfg):
+    def r(*s):
+        # Larger weight scale than the other engine tests on purpose: it makes the
+        # tiny random model's greedy decode genuinely CONTEXT-sensitive (a varied,
+        # non-cyclic token stream) instead of collapsing to a 2-token limit cycle.
+        # That sensitivity is what lets the spec-decode bit-identical test below
+        # actually catch a corrupted / missing accepted-token KV commit — with a
+        # degenerate cyclic model, a KV hole leaves the output unchanged.
+        return torch.randn(*s, device="cuda", dtype=torch.float16) * 0.5
+
+    hd, nh, nkv, H = (
+        cfg.resolved_head_dim(),
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+        cfg.hidden_size,
+    )
+    sd = {"model.embed_tokens.weight": r(cfg.vocab_size, H), "model.norm.weight": r(H)}
+    for i in range(cfg.num_hidden_layers):
+        p = f"model.layers.{i}"
+        sd[f"{p}.input_layernorm.weight"] = r(H)
+        sd[f"{p}.post_attention_layernorm.weight"] = r(H)
+        sd[f"{p}.self_attn.q_proj.weight"] = r(nh * hd, H)
+        sd[f"{p}.self_attn.k_proj.weight"] = r(nkv * hd, H)
+        sd[f"{p}.self_attn.v_proj.weight"] = r(nkv * hd, H)
+        sd[f"{p}.self_attn.o_proj.weight"] = r(H, nh * hd)
+        sd[f"{p}.self_attn.q_norm.weight"] = r(hd)
+        sd[f"{p}.self_attn.k_norm.weight"] = r(hd)
+        sd[f"{p}.mlp.gate_proj.weight"] = r(cfg.intermediate_size, H)
+        sd[f"{p}.mlp.up_proj.weight"] = r(cfg.intermediate_size, H)
+        sd[f"{p}.mlp.down_proj.weight"] = r(H, cfg.intermediate_size)
+    # MTP depth 1
+    mp = "model.mtp.1"
+    sd[f"{mp}.fc.weight"] = r(H, 2 * H)
+    sd[f"{mp}.pre_fc_norm_hidden.weight"] = r(H)
+    sd[f"{mp}.pre_fc_norm_embedding.weight"] = r(H)
+    sd[f"{mp}.self_attn.q_proj.weight"] = r(nh * hd, H)
+    sd[f"{mp}.self_attn.k_proj.weight"] = r(nkv * hd, H)
+    sd[f"{mp}.self_attn.v_proj.weight"] = r(nkv * hd, H)
+    sd[f"{mp}.self_attn.o_proj.weight"] = r(H, nh * hd)
+    sd[f"{mp}.self_attn.q_norm.weight"] = r(hd)
+    sd[f"{mp}.self_attn.k_norm.weight"] = r(hd)
+    sd[f"{mp}.input_layernorm.weight"] = r(H)
+    sd[f"{mp}.post_attention_layernorm.weight"] = r(H)
+    sd[f"{mp}.mlp.gate_proj.weight"] = r(cfg.intermediate_size, H)
+    sd[f"{mp}.mlp.up_proj.weight"] = r(cfg.intermediate_size, H)
+    sd[f"{mp}.mlp.down_proj.weight"] = r(H, cfg.intermediate_size)
+    return sd
+
+
+def test_mtp_spec_decode_runs():
+    """MTP spec-decode completes without error (single seq, greedy)."""
+    torch.manual_seed(0)
+    cfg = _cfg_mtp()
+    sd = _sd_mtp(cfg)
+    eng = LLMEngine(cfg, sd, device="cuda", max_num_seqs=2, max_len=64)
+    prompt = [1, 2, 3, 4]
+    out = eng.generate([prompt], SamplingParams(temperature=0.0, max_tokens=8))
+    assert len(out) == 1
+    assert len(out[0]) == 8
+    assert all(0 <= t < cfg.vocab_size for t in out[0])
+
+
+def _no_mtp_cfg(cfg):
+    """The same ModelConfig with the MTP head stripped — the non-spec greedy
+    reference engine (plain autoregressive decode, one token per step)."""
+    return ModelConfig(
+        **{k: v for k, v in vars(cfg).items() if k not in ("num_mtp_layers", "extra")},
+        extra=cfg.extra,
+    )
+
+
+def _force_full_acceptance(eng_spec, ref_by_prompt):
+    """Wire a spec-decode engine so its MTP draft head ALWAYS proposes the true
+    greedy continuation, forcing every draft to be accepted (n_acc >= 2).
+
+    Random-init MTP heads have ~0 draft acceptance, so the accept/commit path
+    (the part with the corrupting bugs) would never run — every step would fall
+    back to n_acc == 1, which is trivially equal to non-spec greedy and hides
+    both the double-o_proj verify bug and the missing accepted-token KV commit.
+    We instead monkeypatch ``draft_greedy`` to emit, per sequence, the very token
+    the target model will greedily verify next (looked up from a precomputed
+    non-spec reference), so acceptance is guaranteed and the real commit path is
+    exercised. Returns a list that accumulates the per-step n_acc actually taken.
+
+    ``ref_by_prompt`` maps ``tuple(prompt_ids) -> (prompt_len, reference_output)``.
+    """
+    holder: dict = {}
+    naccs: list[int] = []
+
+    def forced_draft(last_hidden, last_token, positions, ctx):
+        batch = holder["batch"]
+        toks = []
+        for b in range(positions.shape[0]):
+            P, ref = ref_by_prompt[tuple(batch[b].prompt_ids)]
+            # positions[b, 0] is this sequence's current KV length L; after prefill
+            # L == P and len(output_ids) == 1, and both advance in lockstep, so the
+            # token that should follow the base token is ref[L - P + 2].
+            idx = int(positions[b, 0].item()) - P + 2
+            toks.append(ref[idx] if 0 <= idx < len(ref) else 0)
+        return [torch.tensor(toks, device=last_hidden.device, dtype=torch.long).view(-1, 1)]
+
+    eng_spec.model.mtp.draft_greedy = forced_draft
+
+    runner = eng_spec.runner
+    orig = runner._spec_decode_eager
+
+    def wrapped(batch, mtp):
+        holder["batch"] = batch  # so forced_draft can map row -> sequence
+        before = [len(s.output_ids) for s in batch]
+        result = orig(batch, mtp)
+        naccs.extend(len(s.output_ids) - b for s, b in zip(batch, before))
+        return result
+
+    runner._spec_decode_eager = wrapped
+    return naccs
+
+
+def test_mtp_spec_decode_bit_identical_greedy():
+    """Greedy spec-decode MUST be bit-identical to plain greedy decode.
+
+    This is the load-bearing correctness contract: with temperature 0 the
+    accept-longest-greedy-prefix rule can only ever emit tokens the target model
+    would have emitted anyway, so the token stream must match non-spec greedy
+    EXACTLY (not "mostly" — the old >= 0.8 agreement bar passed even with both
+    silent-corruption bugs present). We force full draft acceptance so several
+    tokens are committed per step, which:
+      * exercises the accepted-token KV commit — if the intermediate accepted
+        tokens' K/V are not written to the paged cache, the next step reads a
+        hole and the output diverges (caught by the bit-identical assert);
+      * exercises the verify o_proj path — if ``_verify_batched``'s output is
+        o_proj'd twice, the verify logits are garbage, no forced draft is ever
+        accepted, and n_acc collapses to 1 (caught by the n_acc >= 2 assert).
+    """
+    torch.manual_seed(0)
+    cfg = _cfg_mtp()
+    sd = _sd_mtp(cfg)
+    prompt = [3, 1, 4, 1, 5, 9, 2, 6]
+    params = SamplingParams(temperature=0.0, max_tokens=24)
+
+    # Non-spec greedy reference.
+    eng_ref = LLMEngine(_no_mtp_cfg(cfg), sd, device="cuda", max_num_seqs=2,
+                        max_len=64, enable_cuda_graph=False)
+    out_ref = eng_ref.generate([prompt], params)[0]
+
+    # Spec-decode engine with forced full acceptance.
+    eng_spec = LLMEngine(cfg, sd, device="cuda", max_num_seqs=2, max_len=64,
+                         enable_cuda_graph=False)
+    naccs = _force_full_acceptance(eng_spec, {tuple(prompt): (len(prompt), out_ref)})
+    out_spec = eng_spec.generate([prompt], params)[0]
+
+    assert max(naccs) >= 2, (
+        f"forced draft was never accepted (n_acc stayed 1: {naccs}); verify logits "
+        f"are wrong — check for double o_proj in _verify_batched"
+    )
+    assert out_spec == out_ref, (
+        f"spec-decode NOT bit-identical to non-spec greedy:\n  spec={out_spec}\n   ref={out_ref}\n"
+        f"  (accepted-token KV likely not committed to the paged cache)"
+    )
+
+
+def test_mtp_spec_decode_bit_identical_greedy_concurrent():
+    """Same bit-identical contract as above, but with THREE sequences of
+    different lengths decoded concurrently through one engine — the accepted-token
+    KV commit and verify o_proj must be correct per row in a ragged batch, not
+    just for a single sequence."""
+    torch.manual_seed(0)
+    cfg = _cfg_mtp()
+    sd = _sd_mtp(cfg)
+    prompts = [[3, 1, 4, 1, 5, 9, 2, 6], [7, 2, 7, 1, 8], [1, 6, 1, 8, 0, 3]]
+    params = SamplingParams(temperature=0.0, max_tokens=20)
+
+    eng_ref = LLMEngine(_no_mtp_cfg(cfg), sd, device="cuda", max_num_seqs=4,
+                        max_len=64, enable_cuda_graph=False)
+    refs = eng_ref.generate(prompts, params)
+
+    eng_spec = LLMEngine(cfg, sd, device="cuda", max_num_seqs=4, max_len=64,
+                         enable_cuda_graph=False)
+    ref_by_prompt = {tuple(p): (len(p), r) for p, r in zip(prompts, refs)}
+    naccs = _force_full_acceptance(eng_spec, ref_by_prompt)
+    outs = eng_spec.generate(prompts, params)
+
+    assert max(naccs) >= 2, f"forced draft never accepted in the concurrent batch: {naccs}"
+    for i, (spec, ref) in enumerate(zip(outs, refs)):
+        assert spec == ref, (
+            f"seq {i}: spec-decode NOT bit-identical to non-spec greedy:\n"
+            f"  spec={spec}\n   ref={ref}"
+        )

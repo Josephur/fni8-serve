@@ -338,6 +338,36 @@ class PagedKVCache:
             scale=scale,
         )
 
+    def build_verify_cache(
+        self,
+        layer: int,
+        slots: list[int],
+        lengths: list[int],
+        k_draft: torch.Tensor,
+        v_draft: torch.Tensor,
+    ):
+        """Build a contiguous int8 KV cache for the verify kernel: prefix K/V
+        (read from the paged store and dequantised) + draft K/V concatenated.
+
+        *k_draft*, *v_draft*: fp16 [B, Hkv, k, D]. Returns
+        ``(k_i8, k_scale, v_i8, v_scale)`` shaped ``[B, Hkv, N, D]`` /
+        ``[B, Hkv, N]`` float32 as required by :func:`fni8.attn_int8_verify`."""
+        B = len(slots)
+        max_prefix = max(lengths) if lengths else 0
+        k_parts, v_parts = [], []
+        for b in range(B):
+            kp, vp = self.read_dense(layer, slots[b], lengths[b])
+            if lengths[b] < max_prefix:
+                pad_sz = max_prefix - lengths[b]
+                pad = kp.new_zeros(1, kp.shape[1], pad_sz, kp.shape[3])
+                kp = torch.cat([kp, pad], dim=2)
+                vp = torch.cat([vp, pad], dim=2)
+            k_parts.append(torch.cat([kp, k_draft[b : b + 1]], dim=2))
+            v_parts.append(torch.cat([vp, v_draft[b : b + 1]], dim=2))
+        full_k = torch.cat(k_parts, dim=0)  # [B, Hkv, N, D]
+        full_v = torch.cat(v_parts, dim=0)
+        return fni8.quantize_kv_cache(full_k, full_v)
+
     def read_dense(self, layer: int, slot: int, length: int, *, window: int | None = None):
         """Dequantize one sequence's cached K/V back to fp16 [1,Hkv,N,D] -- the
         sliding-window fallback (`attn_paged_decode_cached` has no window parameter

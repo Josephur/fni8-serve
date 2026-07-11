@@ -21,11 +21,13 @@ import torch.nn as nn
 from ..layers.embedding import LMHead, VocabEmbedding
 from ..layers.gqa_attention import GQAAttention
 from ..layers.linear_attn import GatedDeltaNetAttention
+from ..layers.mlp import GatedMLP
 from ..layers.norm import RMSNorm
 from ..layers.rotary import RotaryEmbedding
 from .base import ForwardContext
 from .config import ModelConfig
 from .moe import SparseMoE
+from .mtp import build_mtp
 from .registry import register_model
 from .weights import gate_up_weight, qkv_weight, to_qtensor
 
@@ -116,6 +118,53 @@ class Qwen3NextDecoderLayer(nn.Module):
         return self.mlp(h), residual
 
 
+def _qwen3_next_mtp_decoder(cfg, depth_idx, prefix, sd, rope):
+    """Full-attention MTP block for Qwen3-Next (MTP layers always use dense
+    full attention, not the hybrid linear/full pattern)."""
+    hd = cfg.resolved_head_dim()
+    attn = GQAAttention(
+        num_heads=cfg.num_attention_heads, num_kv_heads=cfg.num_key_value_heads,
+        head_dim=hd, qkv_proj=qkv_weight(sd, f"{prefix}.self_attn"),
+        o_proj=to_qtensor(sd[f"{prefix}.self_attn.o_proj.weight"]), scale=hd**-0.5, rope=rope,
+        q_norm=sd.get(f"{prefix}.self_attn.q_norm.weight"),
+        k_norm=sd.get(f"{prefix}.self_attn.k_norm.weight"),
+        rms_norm_eps=cfg.rms_norm_eps,
+    )
+    class _MTPBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps,
+                                           sd[f"{prefix}.input_layernorm.weight"])
+            self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps,
+                                                    sd[f"{prefix}.post_attention_layernorm.weight"])
+            self.self_attn = attn
+            self.mlp = GatedMLP(gate_up_weight(sd, f"{prefix}.mlp"),
+                                to_qtensor(sd[f"{prefix}.mlp.down_proj.weight"]), act=cfg.hidden_act)
+        def forward(self, x, positions, ctx, residual):
+            B, S, Hd = x.shape
+            if residual is None:
+                residual, h = x, self.input_layernorm(x)
+            else:
+                h, residual = self.input_layernorm(x, residual)
+            qkv = self.self_attn.qkv_proj(h)
+            q, k, v = qkv.split([self.self_attn.nh * self.self_attn.hd,
+                                 self.self_attn.nkv * self.self_attn.hd,
+                                 self.self_attn.nkv * self.self_attn.hd], dim=-1)
+            q = q.view(B, S, self.self_attn.nh, self.self_attn.hd)
+            k = k.view(B, S, self.self_attn.nkv, self.self_attn.hd)
+            v = v.view(B, S, self.self_attn.nkv, self.self_attn.hd)
+            if self.self_attn.q_norm is not None:
+                q = self.self_attn.q_norm(q)
+                k = self.self_attn.k_norm(k)
+            q, k = self.self_attn.rope(positions, q, k)
+            h = GQAAttention._draft_attn(q.transpose(1, 2), k.transpose(1, 2),
+                                          v.transpose(1, 2), scale=self.self_attn.scale)
+            h = self.self_attn.o_proj(h.to(x.dtype))
+            h, residual = self.post_attention_layernorm(h, residual)
+            return self.mlp(h), residual
+    return _MTPBlock()
+
+
 class Qwen3NextForCausalLM(nn.Module):
     def __init__(self, cfg: ModelConfig, sd: dict):
         super().__init__()
@@ -133,6 +182,8 @@ class Qwen3NextForCausalLM(nn.Module):
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, sd["model.norm.weight"])
         lm_w = sd["model.embed_tokens.weight"] if cfg.tie_word_embeddings else sd["lm_head.weight"]
         self.lm_head = LMHead(to_qtensor(lm_w))
+        self.mtp = build_mtp(cfg, sd, self.embed_tokens, self.norm,
+                             self.lm_head, rope, _qwen3_next_mtp_decoder)
 
     def forward(self, input_ids, positions, ctx: ForwardContext):
         h = self.embed_tokens(input_ids)

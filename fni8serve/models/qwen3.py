@@ -26,6 +26,7 @@ from ..layers.rotary import RotaryEmbedding
 from .base import ForwardContext
 from .config import ModelConfig
 from .moe import SparseMoE
+from .mtp import build_mtp
 from .registry import register_model
 from .weights import gate_up_weight, qkv_weight, to_qtensor
 
@@ -101,6 +102,57 @@ class Qwen3Model(nn.Module):
         return h
 
 
+def _qwen3_mtp_decoder(cfg, depth_idx, prefix, sd, rope):
+    """Build one decoder block for an MTP depth (same structure as Qwen3DecoderLayer
+    but without the input/post-attention norms — those come from MTPLayer)."""
+    hd = cfg.resolved_head_dim()
+    scale = (cfg.query_pre_attn_scalar ** -0.5) if cfg.query_pre_attn_scalar else hd ** -0.5
+    attn = GQAAttention(
+        num_heads=cfg.num_attention_heads, num_kv_heads=cfg.num_key_value_heads,
+        head_dim=hd, qkv_proj=qkv_weight(sd, f"{prefix}.self_attn"),
+        o_proj=to_qtensor(sd[f"{prefix}.self_attn.o_proj.weight"]), scale=scale, rope=rope,
+        q_norm=sd.get(f"{prefix}.self_attn.q_norm.weight") if cfg.qk_norm else None,
+        k_norm=sd.get(f"{prefix}.self_attn.k_norm.weight") if cfg.qk_norm else None,
+        rms_norm_eps=cfg.rms_norm_eps,
+    )
+    class _MTPBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps,
+                                           sd[f"{prefix}.input_layernorm.weight"])
+            self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps,
+                                                    sd[f"{prefix}.post_attention_layernorm.weight"])
+            self.self_attn = attn
+            self.mlp = GatedMLP(gate_up_weight(sd, f"{prefix}.mlp"),
+                                to_qtensor(sd[f"{prefix}.mlp.down_proj.weight"]), act=cfg.hidden_act)
+        def forward(self, x, positions, ctx, residual):
+            B, S, Hd = x.shape
+            if residual is None:
+                residual = x
+                h = self.input_layernorm(x)
+            else:
+                h, residual = self.input_layernorm(x, residual)
+            # Use cache-free draft attention so MTP never corrupts the main KV
+            qkv = self.self_attn.qkv_proj(h)
+            q, k, v = qkv.split([self.self_attn.nh * self.self_attn.hd,
+                                 self.self_attn.nkv * self.self_attn.hd,
+                                 self.self_attn.nkv * self.self_attn.hd], dim=-1)
+            q = q.view(B, S, self.self_attn.nh, self.self_attn.hd)
+            k = k.view(B, S, self.self_attn.nkv, self.self_attn.hd)
+            v = v.view(B, S, self.self_attn.nkv, self.self_attn.hd)
+            if self.self_attn.q_norm is not None:
+                q = self.self_attn.q_norm(q)
+                k = self.self_attn.k_norm(k)
+            q, k = self.self_attn.rope(positions, q, k)
+            h = GQAAttention._draft_attn(q.transpose(1, 2), k.transpose(1, 2),
+                                          v.transpose(1, 2), scale=self.self_attn.scale)
+            h = self.self_attn.o_proj(h.to(x.dtype))
+            h, residual = self.post_attention_layernorm(h, residual)
+            h = self.mlp(h)
+            return h, residual
+    return _MTPBlock()
+
+
 class Qwen3ForCausalLM(nn.Module):
     def __init__(self, cfg: ModelConfig, sd: dict):
         super().__init__()
@@ -112,6 +164,10 @@ class Qwen3ForCausalLM(nn.Module):
         # biggest decode kernel. The embedding lookup keeps its own fp16 table.
         head_w = to_qtensor(lm_w)
         self.lm_head = LMHead(head_w, logit_softcap=cfg.final_logit_softcap)
+        rope = RotaryEmbedding(cfg.resolved_head_dim(), cfg.max_position_embeddings,
+                               base=cfg.rope_theta, rotary_dim=cfg.rotary_dim())
+        self.mtp = build_mtp(cfg, sd, self.model.embed_tokens, self.model.norm,
+                             self.lm_head, rope, _qwen3_mtp_decoder)
 
     def forward(self, input_ids, positions, ctx: ForwardContext):
         return self.model(input_ids, positions, ctx)

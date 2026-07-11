@@ -60,6 +60,8 @@ class ForwardContext:
         slot_lengths: list[int] | None = None,  # engine: per-row KV length (ragged decode)
         prefill_start: int = 0,  # prefix cache: first position to compute/write
         pixel_values: torch.Tensor | None = None,  # VLM: [1, 3, H, W] image pixels
+        is_verify: bool = False,  # speculative-decode verify forward
+        verify_slot_mapping: torch.Tensor | None = None,  # [total_verify_tok] int32 slot mapping
     ):
         self.is_prefill = is_prefill
         self.kv_cache = kv_cache
@@ -81,6 +83,8 @@ class ForwardContext:
         self.slot_lengths = slot_lengths
         self.prefill_start = prefill_start
         self.pixel_values: torch.Tensor | None = pixel_values  # VLM: image pixels for vision tower
+        self.is_verify = is_verify
+        self.verify_slot_mapping = verify_slot_mapping
 
 
 class DecodeStrategy(Protocol):

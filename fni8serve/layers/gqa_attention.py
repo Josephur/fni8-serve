@@ -108,6 +108,10 @@ class GQAAttention(nn.Module):
                 out = fni8.attn_int8_fwd(
                     q, k, v, causal=self.causal, scale=self.scale, window_left=self.window_left
                 )
+        elif getattr(ctx, "is_verify", False):
+            # Spec-decode verify: returns RAW [B, H, S, D]; the shared tail below
+            # merges heads and applies o_proj exactly once (do NOT o_proj here).
+            out = self._verify_batched(q, k, v, ctx, layer_idx)
         elif ctx.slot_lengths is not None or ctx.slot_mapping is not None:
             # Decode-batched hot path: takes [B, S=1, H, D] directly (no transpose here).
             out = self._decode_batched(q, k, v, ctx, layer_idx)  # engine continuous batch
@@ -171,3 +175,79 @@ class GQAAttention(nn.Module):
             kb, vb = cache.read_dense(layer_idx, slot, n + 1, window=self.window_left)
             outs.append(fni8.attn_int8_decode(q[b : b + 1], kb, vb, scale=self.scale))
         return torch.cat(outs, dim=0)
+
+    @staticmethod
+    def _draft_attn(q, k, v, *, scale):
+        """Cache-free single-step attention for MTP drafting.
+
+        Computes attention without reading/writing any external KV cache.
+        q, k, v are fp16 in [B, H, S, D] / [B, Hkv, S, D] layout (after
+        transpose). Used by MTP heads during the draft phase so they never
+        corrupt the main model's paged cache.
+        """
+        bs, H, S, D = q.shape
+        Hkv = k.shape[1]
+        if H != Hkv:
+            rep = H // Hkv
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+        scores = (q @ k.transpose(-2, -1)) * scale  # [B, H, S, S]
+        attn = torch.softmax(scores, dim=-1)
+        return (attn @ v).transpose(1, 2).reshape(bs, S, H * D)
+
+    def _verify_batched(self, q, k, v, ctx, layer_idx):
+        """Spec-decode verify: S = 1 + num_drafts tokens per batch row. Reads
+        prefix K/V from paged cache, prepends prefix to the current forward's
+        K/V (base + drafts), builds a contiguous int8 cache, and calls
+        ``fni8.attn_int8_verify`` — once for the base token (prefix + itself)
+        and once for the k drafts (prefix + base + preceding drafts).
+
+        Also COMMITS every verify token's K/V to the paged store (at the
+        positions in ``ctx.verify_slot_mapping``). This is load-bearing: the
+        engine accepts the longest greedy-matching prefix and advances each
+        sequence's length by ``n_acc``, but only the base token gets its K/V
+        written by the preceding base decode forward. Without persisting the
+        verify tokens here, every INTERMEDIATE accepted token (the first
+        ``n_acc-1``) would leave a permanent hole in the paged cache and the
+        next step would read stale/uninitialised K/V. We write all S positions
+        unconditionally; positions past ``n_acc`` are never read (reads are
+        gated by each row's committed length / ``context_lens``) and are
+        overwritten by the next step, so writing the rejected tail is harmless.
+
+        Returns the RAW attention output ``[B, H, S, D]`` (heads not merged, no
+        ``o_proj``). The shared forward tail merges heads and applies ``o_proj``
+        exactly once — returning an already-projected tensor here would apply
+        ``o_proj`` twice and scramble the verify logits.
+        """
+        n_drafts = q.shape[1] - 1
+        cache = ctx.kv_cache
+        k_t = k.transpose(1, 2).contiguous()  # [B, Hkv, S, D]
+        v_t = v.transpose(1, 2).contiguous()  # [B, Hkv, S, D]
+        q_t = q.transpose(1, 2).contiguous()  # [B, H, S, D]
+
+        # Commit every verify token's K/V to the paged store (accepted-token KV).
+        if ctx.verify_slot_mapping is not None:
+            B, Hkv, S, D = k_t.shape
+            k_flat = k_t.permute(0, 2, 1, 3).reshape(B * S, Hkv, D)  # token-major
+            v_flat = v_t.permute(0, 2, 1, 3).reshape(B * S, Hkv, D)
+            cache.write_decode_static(layer_idx, ctx.verify_slot_mapping, k_flat, v_flat)
+
+        # Base token: cache = prefix + base KV
+        k_b, ks_b, v_b, vs_b = cache.build_verify_cache(
+            layer_idx, ctx.slots, ctx.slot_lengths, k_t[:, :, :1], v_t[:, :, :1]
+        )
+        out_base = fni8.attn_int8_verify(q_t[:, :, :1], k_b, ks_b, v_b, vs_b, scale=self.scale)
+
+        if n_drafts > 0:
+            # Drafts: cache = prefix + base KV + draft KVs
+            k_d, ks_d, v_d, vs_d = cache.build_verify_cache(
+                layer_idx, ctx.slots, ctx.slot_lengths, k_t, v_t
+            )
+            out_drafts = fni8.attn_int8_verify(
+                q_t[:, :, 1:], k_d, ks_d, v_d, vs_d, scale=self.scale
+            )
+            out_t = torch.cat([out_base, out_drafts], dim=2)
+        else:
+            out_t = out_base
+
+        return out_t  # [B, H, S, D]; heads merged + o_proj'd once by the forward tail

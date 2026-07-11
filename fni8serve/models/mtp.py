@@ -71,6 +71,9 @@ class MultiTokenPredictor(nn.Module):
         self.norm = final_norm          # shared final RMSNorm
         self.lm_head = lm_head          # shared LMHead
 
+    def num_depths(self) -> int:
+        return len(self.layers)
+
     @torch.inference_mode()
     def draft_greedy(self, last_hidden, last_token, positions, ctx) -> list[torch.Tensor]:
         """last_hidden [B,1,H], last_token [B,1] -> list of k proposed token ids."""
@@ -82,3 +85,26 @@ class MultiTokenPredictor(nn.Module):
             token = logits.argmax(-1, keepdim=True)
             drafts.append(token)
         return drafts
+
+
+def build_mtp(cfg: ModelConfig, sd: dict, embed, norm, lm_head, rope,
+              decoder_fn) -> MultiTokenPredictor | None:
+    """Build MTP heads from weights if cfg.num_mtp_layers > 0.
+
+    *decoder_fn* builds a single decoder layer (attention + MLP + pre/post norms):
+    ``decoder_fn(cfg, layer_idx, mtp_prefix, sd, rope) -> module`` whose forward
+    is ``(x, positions, ctx, residual) -> (output, residual)``.
+    """
+    if cfg.num_mtp_layers <= 0:
+        return None
+    K = cfg.num_mtp_layers
+    layers = []
+    for k in range(1, K + 1):
+        p = f"model.mtp.{k}"
+        fc_weight = sd[f"{p}.fc.weight"]
+        hidden_norm = sd[f"{p}.pre_fc_norm_hidden.weight"]
+        emb_norm = sd[f"{p}.pre_fc_norm_embedding.weight"]
+        block = decoder_fn(cfg, k, p, sd, rope)
+        layers.append(MTPLayer(cfg, fc_weight=fc_weight, hidden_norm=hidden_norm,
+                                emb_norm=emb_norm, block=block))
+    return MultiTokenPredictor(cfg, layers=layers, embed=embed, final_norm=norm, lm_head=lm_head)

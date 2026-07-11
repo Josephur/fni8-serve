@@ -204,13 +204,114 @@ class EngineRunner:
         return self._sample(logits, batch)
 
     @torch.inference_mode()
-    def decode(self, batch: list[Sequence]) -> list[int]:
+    def decode(self, batch: list[Sequence]) -> list[int] | None:
+        mtp = getattr(self.model, "mtp", None)
+        if mtp is not None and all(s.params.temperature == 0.0 for s in batch):
+            return self._spec_decode_eager(batch, mtp)
         logits = self.graphed.try_decode(batch) if self.graphed is not None else None
         if logits is None:
             return self._decode_eager(batch)
         for s in batch:
             s.length += 1
         return self._sample(logits, batch)
+
+    @torch.inference_mode()
+    def _spec_decode_eager(self, batch: list[Sequence], mtp) -> None:
+        """Speculative-decode step: draft *k* tokens via MTP heads, verify in
+        ONE target forward with :func:`fni8.attn_int8_verify`, accept the longest
+        greedy-matching prefix, and commit all accepted tokens to each sequence's
+        ``output_ids`` and ``length``.
+
+        Returns ``None`` — the caller (``llm_engine.step``) must skip its usual
+        per-sequence token append when it sees a ``None`` return."""
+        B = len(batch)
+        device = self.device
+        k = mtp.num_depths()
+        slots = [s.slot for s in batch]
+        lengths = [s.length for s in batch]
+
+        # -- 1. Base forward: run the model on the last token -------------------
+        ids = torch.tensor([[s.last_token] for s in batch], device=device)
+        pos = torch.tensor([[s.length] for s in batch], device=device)
+        self.cache.ensure_capacity(slots, [n + 1 for n in lengths])
+        self.lin_cache.bind(slots)
+        ctx = ForwardContext(
+            is_prefill=False,
+            kv_cache=self.cache,
+            lin_cache=self.lin_cache,
+            slots=slots,
+            slot_lengths=lengths,
+        )
+        hidden = self.model(ids, pos, ctx)
+        base_logits = self.model.compute_logits(hidden[:, -1])  # [B, vocab]
+        base_tok = base_logits.argmax(-1)  # [B]
+
+        # -- 2. MTP draft: propose k candidate tokens (greedy) ------------------
+        drafts = mtp.draft_greedy(hidden[:, -1:], base_tok.unsqueeze(-1), pos, ctx)
+        # drafts: list of k tensors, each [B, 1]
+
+        # -- 3. Verify forward: run the main model on [base, draft_1..k] --------
+        S = k + 1  # total verify tokens
+        verify_ids = torch.cat([base_tok.unsqueeze(-1)] + drafts, dim=-1)  # [B, S]
+        verify_pos = torch.tensor(
+            [[s.length + 1 + t for t in range(S)] for s in batch], device=device
+        )
+
+        # Ensure enough KV blocks for all verify positions. The highest verify
+        # position is `n + 1 + k` (base at n+1, then k drafts), so the cache must
+        # hold `n + 2 + k == n + 1 + S` tokens — the earlier `n + 1 + k` was one
+        # short and could IndexError when that top position crossed a block
+        # boundary (e.g. n+1+k a multiple of block_size).
+        self.cache.ensure_capacity(slots, [n + 1 + S for n in lengths])
+
+        # Precompute flat slot mapping for the verify token positions
+        flat_slots, flat_positions = [], []
+        for s in batch:
+            base = s.length + 1
+            for t in range(S):
+                flat_slots.append(s.slot)
+                flat_positions.append(base + t)
+        verify_slot_mapping = self.cache.slot_mapping_for(flat_slots, flat_positions)
+
+        # The prefix now has `length + 1` committed tokens (step 1 wrote at pos `length`)
+        v_ctx = ForwardContext(
+            is_prefill=False,
+            is_verify=True,
+            kv_cache=self.cache,
+            lin_cache=self.lin_cache,
+            slots=slots,
+            slot_lengths=[n + 1 for n in lengths],
+            verify_slot_mapping=verify_slot_mapping,
+        )
+        hidden_v = self.model(verify_ids, verify_pos, v_ctx)
+        logits_v = self.model.compute_logits(hidden_v)  # [B, S, vocab]
+        true_tokens = logits_v.argmax(-1)  # [B, S] — true greedy at each verify slot
+
+        # -- 4. Accept the longest greedy-matching prefix -----------------------
+        for b in range(B):
+            seq = batch[b]
+            # base token (index 0 in verify input) is always accepted
+            n_acc = 1
+            for t in range(k):
+                draft_tok = drafts[t][b, 0].item()
+                true_tok = true_tokens[b, t].item()  # true prediction for position N+2+t
+                if draft_tok == true_tok:
+                    n_acc += 1
+                else:
+                    break
+            # Never emit past the request's token budget: a spec step can accept
+            # several tokens at once, so cap n_acc so the sequence stops at exactly
+            # max_tokens (greedy spec-decode must return the SAME token stream as
+            # non-spec greedy, not one that overshoots). Capping n_acc only shortens
+            # the committed prefix; the surplus verify positions are simply never
+            # read (reads are gated by the sequence's committed length).
+            remaining = seq.params.max_tokens - len(seq.output_ids)
+            n_acc = max(1, min(n_acc, remaining))
+            # Commit accepted tokens
+            accepted = [base_tok[b].item()] + [drafts[t][b, 0].item() for t in range(n_acc - 1)]
+            for tok in accepted:
+                seq.output_ids.append(tok)
+            seq.length += n_acc
 
     @torch.inference_mode()
     def _decode_eager(self, batch: list[Sequence]) -> list[int]:
