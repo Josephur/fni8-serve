@@ -15,9 +15,10 @@ is additive and does not perturb the shared block that every non-gated family us
 It implements the two paths the standalone `ModelRunner` drives — non-varlen prefill
 (`attn_int8_fwd`) and simple single-sequence decode (`attn_int8_decode`) — plus
 varlen prefill for the engine's packed prefill. The engine's paged/continuous-batch
-*decode* path (slot_mapping / slot_lengths) is intentionally NOT implemented here
-yet; it needs the gate threaded through `GQAAttention._decode_batched`, which is the
-contested engine surface — see the module TODO.
+*decode* path (slot_mapping / slot_lengths) reuses `GQAAttention._decode_batched`
+(the shared paged-decode kernels) on the query half and applies the sigmoid output
+gate via the same `_gate_and_project` the standalone paths use — so gated Qwen3.5
+decodes under the continuous-batching engine, not just the standalone ModelRunner.
 
 Softmax/LSE stay fp32 inside the fni8 kernels; only the gate multiply is fp16, on
 the healthy half2 CUDA-core pipe (never the dead Volta tensor cores).
@@ -31,6 +32,7 @@ import torch.nn as nn
 import fni8
 from fni8 import QTensor
 
+from .gqa_attention import GQAAttention
 from .linear import LinearW8A8
 from .norm import RMSNorm
 from .rotary import RotaryEmbedding
@@ -121,13 +123,18 @@ class GatedGQAAttention(nn.Module):
             return self._gate_and_project(out, gate, B, S)
 
         if ctx.slot_lengths is not None or ctx.slot_mapping is not None:
-            # Engine paged/continuous-batch decode: the gate must be threaded through
-            # GQAAttention._decode_batched (contested engine surface). Not wired yet.
-            raise NotImplementedError(
-                "GatedGQAAttention: engine paged-decode (slot_mapping/slot_lengths) not "
-                "implemented — full generation runs through the standalone ModelRunner "
-                "(simple decode). See module docstring / PR flag."
-            )
+            # Engine paged/continuous-batch decode. Reuse the shared batched-decode
+            # kernels verbatim (paged int8 write + one `attn_paged_decode_cached`
+            # launch, or the CUDA-graph static path) by borrowing GQAAttention's
+            # `_decode_batched` as an unbound method — it only touches attributes
+            # GatedGQAAttention shares (`scale`, `window_left`) and `ctx.kv_cache`,
+            # and runs on the QUERY half (q here is the query, gate is held aside).
+            # It returns [B, H, 1, D]; transpose to token-major [B, 1, H, D] so the
+            # SAME `_gate_and_project` the standalone paths use applies the sigmoid
+            # output gate before o_proj — identical gate math to the ModelRunner path.
+            out = GQAAttention._decode_batched(self, q, k, v, ctx, layer_idx)
+            out = out.transpose(1, 2)  # [B,H,1,D] -> [B,1,H,D] = [B,S,nh,hd]
+            return self._gate_and_project(out, gate, B, S)
 
         # Simple single-sequence decode: kernels want [B, H, 1, D].
         qt = q.transpose(1, 2).contiguous()

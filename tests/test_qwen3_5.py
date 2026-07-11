@@ -255,6 +255,93 @@ def test_qwen3_5_hybrid_decode_matches_teacher_forced():
     assert torch.equal(ref_tokens, gen)
 
 
+def _cos(a, b):
+    a, b = a.float().flatten(), b.float().flatten()
+    return (a @ b / (a.norm() * b.norm())).item()
+
+
+@pytest.mark.skipif(not CUDA, reason="engine paged decode needs the CUDA fni8 kernels")
+@torch.inference_mode()
+def test_qwen3_5_engine_paged_decode_gate_matches_standalone():
+    """Qwen3.5-9B's gated full-attention layers must decode through the ENGINE's
+    paged/continuous-batch path (slot_mapping/slot_lengths), not just the standalone
+    ModelRunner. `GatedGQAAttention` now threads the sigmoid output gate through
+    `GQAAttention._decode_batched` (the shared paged-decode kernels), so the whole
+    dense-hybrid model generates under `LLMEngine`.
+
+    Two properties, one per the two int8 error regimes:
+      * ENGINE greedy decode == standalone ModelRunner greedy decode (the same
+        weights + prompt), the end-to-end "it decodes under the batching engine" bar;
+      * teacher-forced (SAME token fed to both) engine paged-decode logits match the
+        standalone contiguous-cache logits within the int8 paged bar the shared
+        `test_paged_engine` uses (cos > 0.995) — isolates the gated paged kernel
+        from any autoregressive argmax drift.
+    The engine forces per-sequence NON-varlen prefill for recurrent (hybrid) models,
+    so this validates decode without touching the separate varlen-256 prefill gap.
+    """
+    from fni8serve.engine import LLMEngine, PagedKVCache, SamplingParams
+
+    cfg = _cfg()
+    # Identical weights for both models even if build_model consumes the dict.
+    torch.manual_seed(0)
+    sd_std = _sd(cfg, "cuda")
+    torch.manual_seed(0)
+    sd_eng = _sd(cfg, "cuda")
+
+    model = build_model(cfg, sd_std).cuda().eval()
+    runner = ModelRunner(model, cfg, max_batch=1, max_len=32, device="cuda")
+    prompt = [3, 1, 4, 1, 5]
+    gen_std = runner.generate_greedy(
+        torch.tensor([prompt], device="cuda"), max_new_tokens=4
+    )[0]
+
+    eng = LLMEngine(
+        cfg, sd_eng, device="cuda", max_num_seqs=1, max_len=32, enable_cuda_graph=False
+    )
+    gen_eng = eng.generate([prompt], SamplingParams(temperature=0.0, max_tokens=4))[0]
+
+    assert gen_eng == gen_std.tolist(), (
+        f"engine paged-decode greedy {gen_eng} != standalone {gen_std.tolist()}"
+    )
+
+    # Teacher-forced: same next token fed to a fresh standalone decode and a fresh
+    # engine paged decode; the gated paged kernel path must match within int8 bar.
+    next_tok = 7
+    ref_runner = ModelRunner(model, cfg, max_batch=1, max_len=32, device="cuda")
+    ref_runner.prefill(torch.tensor([prompt], device="cuda"))
+    ref_decode = ref_runner.decode(torch.tensor([[next_tok]], device="cuda"))
+
+    from fni8serve.models.cache import RecurrentStateCache
+
+    cache = PagedKVCache(
+        cfg.num_hidden_layers, 1, cfg.num_key_value_heads, 64,
+        cfg.resolved_head_dim(), device="cuda",
+    )
+    lin_cache = RecurrentStateCache()
+    slot = cache.alloc()
+    cache.ensure_capacity([slot], [len(prompt)])
+    lin_cache.clear_slot(slot)  # fresh recurrent state for this slot (EngineRunner order)
+    lin_cache.bind([slot])
+    ids = torch.tensor([prompt], device="cuda")
+    pos = torch.arange(len(prompt), device="cuda").unsqueeze(0)
+    ctx = ForwardContext(
+        is_prefill=True, kv_cache=cache, lin_cache=lin_cache, slots=[slot]
+    )
+    model(ids, pos, ctx)
+
+    cache.ensure_capacity([slot], [len(prompt) + 1])
+    lin_cache.bind([slot])
+    ctx = ForwardContext(
+        is_prefill=False, kv_cache=cache, lin_cache=lin_cache,
+        slots=[slot], slot_lengths=[len(prompt)],
+    )
+    hidden = model(torch.tensor([[next_tok]], device="cuda"),
+                   torch.tensor([[len(prompt)]], device="cuda"), ctx)
+    eng_decode = model.compute_logits(hidden[:, -1])
+
+    assert _cos(ref_decode, eng_decode) > 0.995
+
+
 @pytest.mark.skipif(not CUDA, reason="forward needs CUDA")
 def test_qwen3_5_offline_fni8_roundtrip(tmp_path):
     """Convert path: quantize -> .fni8 -> load -> build must byte-match a model built
