@@ -169,6 +169,11 @@ class MLAAttention(nn.Module):
             Lq, Nk = scores.shape[-2], scores.shape[-1]
             mask = torch.ones(Lq, Nk, device=hidden.device, dtype=torch.bool).tril()
             scores = scores.masked_fill(~mask, float("-inf"))
-        p = torch.softmax(scores, dim=-1).to(v.dtype)
-        o = torch.einsum("bhqk,bhkd->bhqd", p, v)  # [B,nh,L,vd]
-        return self.o_proj(o.transpose(1, 2).reshape(B, L, self.nh * self.vd))
+        # PV stays fp32 (numerics contract: softmax/LSE/PV are load-bearing, never
+        # downcast). On this fleet an fp16 P·V einsum also lands on the firmware-gimped
+        # fp16 tensor cores; keeping it fp32 runs on the CUDA cores instead — measured
+        # ~1.19x faster at prefill (Lq=512) and neutral at decode, with better accuracy
+        # (SQNR inf vs ~69 dB). See fp16-matmul audit (#146).
+        p = torch.softmax(scores, dim=-1)               # fp32
+        o = torch.einsum("bhqk,bhkd->bhqd", p, v.float())  # [B,nh,L,vd] fp32
+        return self.o_proj(o.to(v.dtype).transpose(1, 2).reshape(B, L, self.nh * self.vd))

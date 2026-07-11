@@ -49,6 +49,17 @@ First, the fp16/TF32 tensor cores are firmware-limited to about 6.9 TFLOP/s, whi
 fp16, which is the opposite of a normal GPU's verdict. `fni8` is the kernel that makes
 that work.
 
+**fp *fallback* matmul dtype (the int8 dp4a path is unaffected).** For the rare fp
+matmuls that survive (NF4/CPU Linear fallback, unquantized/tied LM head, the fp MLA
+`P·V`), do **not** reflexively rewrite fp16 → bf16. Measured on the deployment stack
+(torch 2.10+cu129 / cuBLAS, real V100 idx 4): bf16 GEMM is **2-3x *slower* than fp16 at
+small batch (M=2-32)** and ~0.9x at prefill on this cuBLAS; it only wins at a pure M=1
+GEMV (~1.9x). The safe, monotone lever is **fp32** — it runs on the CUDA cores at ~8.5
+TFLOP/s (~1.2x over fp16 on large GEMMs) and is the numerically-correct dtype for the
+load-bearing pieces anyway. **Rule: softmax / LSE / `P·V` stay fp32; never feed them to
+a bf16 or fp16 matmul. For other fp fallbacks, keep fp16 or step up to fp32 — never
+blanket-convert to bf16.** See the #146 fp16-matmul audit.
+
 Second, the interconnect is roughly 3,300x slower than HBM. Tensor and FSDP parallelism
 are unusable here (seconds per token); only pipeline and MoE-expert parallelism survive,
 with the tokens on the wire compressed by `fni8.transport`. See
