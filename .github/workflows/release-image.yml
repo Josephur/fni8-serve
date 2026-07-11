@@ -37,8 +37,7 @@ jobs:
       - name: Resolve version
         id: v
         run: |
-          V="${GITHUB_REF_NAME#v}"
-          [ -z "$V" ] && V="${{ github.event.inputs.version }}"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then V="${GITHUB_REF_NAME#v}"; else V="${{ github.event.inputs.version }}"; fi
           if [ -z "$V" ]; then echo "no version resolved" >&2; exit 1; fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
