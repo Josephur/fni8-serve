@@ -71,6 +71,16 @@ _DND_DECODE = os.environ.get("FNI8_DND_DECODE", "1") != "0" and hasattr(
     fni8, "deltanet_recurrent_decode"
 )
 
+# Fused per-token DECODE elementwise kernels (same kill-switch / older-fni8
+# auto-degrade pattern as _DND_DECODE): the causal conv1d+SiLU token shift and
+# the gated output RMSNorm. Each collapses ~4-6 tiny eager ops into ONE launch
+# and is CUDA-graph-capturable (no cudaFuncSetAttribute), so they replay inside
+# the engine's graphed decode. Fall back to eager if the installed fni8 predates
+# them (prebuilt-image compatibility) or FNI8_DND_FUSED=0.
+_DND_FUSED = os.environ.get("FNI8_DND_FUSED", "1") != "0"
+_DND_CONV = _DND_FUSED and hasattr(fni8, "causal_conv1d_silu_decode")
+_DND_GNORM = _DND_FUSED and hasattr(fni8, "gated_rmsnorm_decode")
+
 
 def _gated_delta_rule(q, k, v, beta, g, state, L):
     """Dispatch the gated delta rule. For the single-token decode step (L==1, CUDA,
@@ -149,6 +159,15 @@ class GatedDeltaNetAttention(nn.Module):
         K = self.conv_kernel
         if tail is None:
             tail = x.new_zeros(B, K - 1, W)
+        # Fused single-launch decode path (L==1, CUDA, K<=8): one causal
+        # conv1d+SiLU kernel replaces cat/conv1d/slice/silu and is
+        # CUDA-graph-capturable. Same math as the eager branch below (validated
+        # bit-close, cos 1.0). Falls back to eager for prefill / CPU / older fni8.
+        if _DND_CONV and L == 1 and x.is_cuda and K <= 8:
+            out2d, new_tail = fni8.causal_conv1d_silu_decode(
+                x.reshape(B, W), self.conv_weight, tail
+            )
+            return out2d.reshape(B, 1, W), new_tail
         xt = torch.cat([tail, x], dim=1)  # [B,K-1+L,Wc]
         new_tail = xt[:, -(K - 1) :] if K > 1 else x.new_zeros(B, 0, W)
         xt = F.conv1d(xt.transpose(1, 2), self.conv_weight.unsqueeze(1), groups=W)
@@ -189,14 +208,30 @@ class GatedDeltaNetAttention(nn.Module):
         # then the per-head gain, THEN the z gate (silu) — in that order. Done in fp32
         # (the gated norm is numerically load-bearing, never quantized). The gain is
         # per-head (length vd), so normalize over the last (vd) axis, not nv*vd.
-        # [B, L, nv, vd] in fp32. `.float()` is a no-op (free) when the fused decode
-        # kernel already returned fp32; it upcasts only the eager (prefill) fp16 output.
-        o = o.transpose(1, 2).float()
-        o = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + self.norm.eps)
-        o = o * self.norm.weight.float()
+        # [B, L, nv, vd] in fp32. `.float()` is a no-op (free) when _gated_delta_rule
+        # already returned fp32 for the decode path (#228); it upcasts only the eager
+        # (prefill) fp16 output.
+        o = o.transpose(1, 2).float()  # [B, L, nv, vd]
+        z = None
         if hasattr(self, "z_proj"):
-            gate = self.z_proj(hidden).view(B, L, self.nv, self.vd).float()
-            o = o * F.silu(gate)
+            z = self.z_proj(hidden).view(B, L, self.nv, self.vd).float()
+        # Fused single-launch gated RMSNorm (HF Qwen3_5RMSNormGated, "norm before
+        # gate") for the L==1 decode step: per-head RMS over vd, ×gain, ×silu(z)
+        # in ONE CUDA-graph-capturable kernel replacing ~6 eager fp32 ops. Same
+        # math as the eager branch (fp32, load-bearing, never quantized). Falls
+        # back to eager for prefill / CPU / older fni8 / vd>128.
+        if _DND_GNORM and L == 1 and o.is_cuda and self.vd <= 128:
+            o = fni8.gated_rmsnorm_decode(
+                o.reshape(B, self.nv, self.vd),
+                self.norm.weight.float(),
+                z.reshape(B, self.nv, self.vd) if z is not None else None,
+                float(self.norm.eps),
+            ).reshape(B, L, self.nv, self.vd)
+        else:
+            o = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + self.norm.eps)
+            o = o * self.norm.weight.float()
+            if z is not None:
+                o = o * F.silu(z)
         o = o.reshape(B, L, self.nv * self.vd)
         return self.out_proj(o.to(hidden.dtype))
 
