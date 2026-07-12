@@ -27,6 +27,7 @@ import torch.nn as nn
 
 from ..layers.embedding import LMHead, VocabEmbedding
 from ..layers.gated_gqa_attention import GatedGQAAttention
+from ..layers.gqa_attention import GQAAttention
 from ..layers.linear_attn import GatedDeltaNetAttention
 from ..layers.mlp import GatedMLP
 from ..layers.norm import RMSNorm
@@ -34,6 +35,7 @@ from ..layers.rotary import RotaryEmbedding
 from .base import ForwardContext
 from .config import ModelConfig
 from .moe import SparseMoE
+from .mtp import MTPLayer, MultiTokenPredictor
 from .registry import register_model
 from .weights import gate_up_weight, qkv_weight, to_qtensor
 
@@ -164,6 +166,104 @@ def _build_mlp(cfg, sd, p):
     )
 
 
+def _qwen3_5_mtp_decoder(cfg, prefix, sd, rope):
+    """One MTP-depth decoder block for Qwen3.5: GATED full attention + SwiGLU MLP,
+    with Qwen3.5's zero-centered (add_unit_offset) norms. Mirrors
+    ``qwen3.py::_qwen3_mtp_decoder`` but uses ``GatedGQAAttention`` (fused
+    query|gate ``q_proj``) and the qk_unit_offset q/k-norm.
+
+    Attention is CACHE-FREE (``GQAAttention._draft_attn`` on the query half): MTP
+    drafting must never touch the main model's paged KV cache OR — critically for
+    this hybrid family — the DeltaNet recurrent state carried in ``ctx.lin_cache``.
+    """
+    attn = _gated_full_attn(cfg, sd, prefix, rope)
+
+    class _MTPBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = attn
+            self.input_layernorm = RMSNorm(
+                cfg.hidden_size, cfg.rms_norm_eps,
+                sd[f"{prefix}.input_layernorm.weight"], add_unit_offset=True)
+            self.post_attention_layernorm = RMSNorm(
+                cfg.hidden_size, cfg.rms_norm_eps,
+                sd[f"{prefix}.post_attention_layernorm.weight"], add_unit_offset=True)
+            self.mlp = GatedMLP(
+                gate_up_weight(sd, f"{prefix}.mlp"),
+                to_qtensor(sd[f"{prefix}.mlp.down_proj.weight"]), act=cfg.hidden_act)
+
+        def forward(self, x, positions, ctx, residual):
+            B, S, _ = x.shape
+            if residual is None:
+                residual, h = x, self.input_layernorm(x)
+            else:
+                h, residual = self.input_layernorm(x, residual)
+            a = self.self_attn
+            q, gate, k, v = a._project(h)  # gated projection + qk-norm (pre-RoPE)
+            q, k = a.rope(positions, q, k)
+            out = GQAAttention._draft_attn(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=a.scale)
+            out = out.view(B, S, a.nh, a.hd)
+            h = a._gate_and_project(out, gate, B, S)  # sigmoid gate + o_proj
+            h, residual = self.post_attention_layernorm(h, residual)
+            return self.mlp(h), residual
+
+    return _MTPBlock()
+
+
+def _resolve_mtp_prefix(sd: dict) -> str | None:
+    """The Qwen3.5-0.8B `.fni8` ships the MTP head at ROOT level (`mtp.*`), a sibling
+    of the text backbone that lives under `model.language_model.*`; a differently
+    nested VLM checkpoint may carry it as `model.mtp.*` (after language_model unwrap).
+    Accept either. Returns the prefix or None if no MTP head is present."""
+    for cand in ("mtp", "model.mtp", "model.language_model.mtp"):
+        if f"{cand}.fc.weight" in sd:
+            return cand
+    return None
+
+
+def build_qwen3_5_mtp(cfg, sd, embed, lm_head, rope):
+    """Build the Qwen3.5 MTP speculative-decode head if the checkpoint ships one.
+
+    The shipped 0.8B layout is a SINGLE depth: a shared `fc` (2H->H), two pre-fc
+    RMSNorms, a gated-full-attn + MLP decoder block (`mtp.layers.0.*`), and the
+    head's OWN final norm (`mtp.norm.weight`) applied before the SHARED int8 LM head.
+    All norms are zero-centered (Qwen3_5RMSNorm), forced on here since the config
+    does not carry `norm_add_unit_offset`.
+
+    Depth count is recovered from the WEIGHTS, not the config: the shipped 0.8B
+    `.fni8` meta baked in `num_mtp_layers=0` (its converter didn't read the nested
+    `text_config.mtp_num_hidden_layers`), so gating on the config would silently
+    skip a head that is physically present — same weight-recovery pattern as
+    `_la_dims`. A fresh conversion from the raw HF config carries the count and it
+    is honored as an upper bound."""
+    mp = _resolve_mtp_prefix(sd)
+    if mp is None:
+        return None  # no MTP head shipped in this checkpoint
+    n_present = 0
+    while f"{mp}.layers.{n_present}.self_attn.q_proj.weight" in sd:
+        n_present += 1
+    n_depths = min(n_present, cfg.num_mtp_layers) if cfg.num_mtp_layers > 0 else n_present
+    layers = []
+    for d in range(n_depths):
+        layers.append(MTPLayer(
+            cfg,
+            fc_weight=sd[f"{mp}.fc.weight"],
+            hidden_norm=sd[f"{mp}.pre_fc_norm_hidden.weight"],
+            emb_norm=sd[f"{mp}.pre_fc_norm_embedding.weight"],
+            block=_qwen3_5_mtp_decoder(cfg, f"{mp}.layers.{d}", sd, rope),
+            norm_add_unit_offset=True,
+        ))
+    if not layers:
+        return None
+    # Qwen3.5's MTP carries its OWN final norm (not the main model's) before the
+    # shared LM head — use it so draft logits match the head's training.
+    mtp_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, sd[f"{mp}.norm.weight"],
+                       add_unit_offset=True)
+    return MultiTokenPredictor(cfg, layers=layers, embed=embed, final_norm=mtp_norm,
+                               lm_head=lm_head)
+
+
 class Qwen3_5DecoderLayer(nn.Module):
     def __init__(self, cfg: ModelConfig, i: int, sd: dict, rope: RotaryEmbedding):
         super().__init__()
@@ -230,6 +330,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                             add_unit_offset=True)  # zero-centered (Qwen3_5RMSNorm)
         lm_w = sd["model.embed_tokens.weight"] if cfg.tie_word_embeddings else sd["lm_head.weight"]
         self.lm_head = LMHead(to_qtensor(lm_w))
+        # MTP speculative-decode head (present in the shipped .fni8; None if absent).
+        self.mtp = build_qwen3_5_mtp(cfg, sd, self.embed_tokens, self.lm_head, rope)
 
     def forward(self, input_ids, positions, ctx: ForwardContext):
         h = self.embed_tokens(input_ids)

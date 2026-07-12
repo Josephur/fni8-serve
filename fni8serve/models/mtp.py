@@ -42,12 +42,17 @@ class MTPLayer(nn.Module):
     inherits the family's attention/MLP exactly. `fc_weight` is the M_k projection
     [hidden, 2*hidden]."""
 
-    def __init__(self, cfg: ModelConfig, *, fc_weight, hidden_norm, emb_norm, block):
+    def __init__(self, cfg: ModelConfig, *, fc_weight, hidden_norm, emb_norm, block,
+                 norm_add_unit_offset: bool | None = None):
         super().__init__()
+        # Qwen3.5's RMSNorm is zero-centered (gain = 1 + weight) but its config does
+        # NOT set `cfg.norm_add_unit_offset` (the builder hardcodes it), so allow the
+        # caller to force the offset for the pre-fc norms explicitly.
+        off = cfg.norm_add_unit_offset if norm_add_unit_offset is None else norm_add_unit_offset
         self.pre_fc_norm_hidden = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, hidden_norm,
-                                          add_unit_offset=cfg.norm_add_unit_offset)
+                                          add_unit_offset=off)
         self.pre_fc_norm_embedding = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, emb_norm,
-                                             add_unit_offset=cfg.norm_add_unit_offset)
+                                             add_unit_offset=off)
         self.fc = nn.Parameter(fc_weight)                # [hidden, 2*hidden]
         self.block = block
 

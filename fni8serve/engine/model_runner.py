@@ -243,10 +243,39 @@ class EngineRunner:
 
         return self._sample(logits, batch)
 
+    def _spec_decode_allowed(self, batch: list[Sequence], mtp) -> bool:
+        """Gate MTP speculative decode. It engages only when ALL hold:
+
+        * an MTP head exists and every sequence is greedy (temp 0) — the
+          accept-longest-greedy-prefix rule is only bit-identical to plain greedy;
+        * the model has NO recurrent layers. The multi-token verify forward advances
+          DeltaNet / lightning / short-conv recurrent state by EVERY drafted token,
+          but only the accepted prefix should count, and the paged-KV canonicalizer
+          can't roll back a running scan (it's position-addressed, the recurrence is
+          not). Verify also isn't wired through the gated / linear mixers at all
+          (``GatedGQAAttention``/``GatedDeltaNetAttention`` ignore ``is_verify`` and
+          the M=1 paged-decode kernel asserts on the S=k+1 verify tensor). So on a
+          hybrid family (Qwen3.5, Qwen3-Next, MiniMax) spec-decode is UNSAFE — fall
+          back to plain decode until a recurrent-aware verify path exists;
+        * NO sequence carries an image (``pixel_values``). MTP×vision is the exact
+          interaction that broke in llama.cpp; the vision families here are also the
+          recurrent ones, so this is belt-and-suspenders — a text-only spec path must
+          never run the verify forward over spliced image embeds / image positions.
+        """
+        if mtp is None:
+            return False
+        if not all(s.params.temperature == 0.0 for s in batch):
+            return False
+        if self.has_recurrent:
+            return False
+        if any(s.pixel_values is not None for s in batch):
+            return False
+        return True
+
     @torch.inference_mode()
     def decode(self, batch: list[Sequence]) -> list[int] | None:
         mtp = getattr(self.model, "mtp", None)
-        if mtp is not None and all(s.params.temperature == 0.0 for s in batch):
+        if self._spec_decode_allowed(batch, mtp):
             return self._spec_decode_eager(batch, mtp)
         logits = self.graphed.try_decode(batch) if self.graphed is not None else None
         if logits is None:

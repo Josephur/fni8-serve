@@ -76,6 +76,13 @@ class Qwen3_5VLForCausalLM(nn.Module):
         self.image_token_id = cfg.image_token_id or vcfg.image_token_id
         self.spatial_merge_size = vcfg.spatial_merge_size
 
+        # Expose the text backbone's MTP speculative-decode head so the engine's
+        # `getattr(model, "mtp")` dispatch reaches it for TEXT decode. Image requests
+        # are guarded off in the engine (EngineRunner.decode) — see the guard there:
+        # spec-decode's multi-token verify forward is unsafe for this hybrid family
+        # (DeltaNet recurrent-state corruption) and doubly so mixed with vision.
+        self.mtp = self.lm.mtp
+
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor, ctx: ForwardContext
     ) -> torch.Tensor:
