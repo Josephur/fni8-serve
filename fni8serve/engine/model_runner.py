@@ -326,8 +326,12 @@ class EngineRunner:
         true_tokens = logits_v.argmax(-1)  # [B, S] — true greedy at each verify slot
 
         # -- 4. Accept the longest greedy-matching prefix -----------------------
+        # Intermediate accepted tokens (all but the last, when n_acc>=2) need their
+        # K/V re-committed canonically -- see _canonicalize_accepted_kv below.
+        canon_rows: list[list[tuple[int, int]]] = []  # per-seq [(token, position)]
         for b in range(B):
             seq = batch[b]
+            orig_len = seq.length
             # base token (index 0 in verify input) is always accepted
             n_acc = 1
             for t in range(k):
@@ -350,6 +354,55 @@ class EngineRunner:
             for tok in accepted:
                 seq.output_ids.append(tok)
             seq.length += n_acc
+            # The verify forward committed every accepted token's K/V using the
+            # verify-attention path, whose prefix is dequantized then REQUANTIZED
+            # (build_verify_cache) -- numerically slightly different from the paged
+            # decode path (attn_paged_decode_cached reads the paged int8 directly).
+            # The LAST accepted token is rewritten canonically by the next step's
+            # base forward, but INTERMEDIATE accepted tokens (n_acc>=2) are never
+            # rewritten, so their cache entry keeps the verify path's off-by-a-quant
+            # K/V. That corrupts later reads and breaks greedy bit-identity on
+            # tight-margin prompts (verified: layer-1 pos-of-the-intermediate-token
+            # K/V differed). Re-decode them so the cache matches the decode path.
+            canon_rows.append(
+                [(accepted[i], orig_len + 1 + i) for i in range(n_acc - 1)]
+            )
+        self._canonicalize_accepted_kv(batch, canon_rows)
+
+    @torch.inference_mode()
+    def _canonicalize_accepted_kv(
+        self, batch: list["Sequence"], canon_rows: list[list[tuple[int, int]]]
+    ) -> None:
+        """Re-commit intermediate accepted tokens' K/V through the canonical paged
+        decode path so the cache is byte-identical to non-spec decode.
+
+        ``canon_rows[b]`` lists ``(token, position)`` for sequence ``batch[b]``'s
+        intermediate accepted tokens (in ascending position). Tokens are processed
+        one index-round at a time across the batch so each attends an already
+        canonicalized prefix; each round is ONE batched decode forward whose logits
+        are discarded (we already know the tokens) -- only the K/V write matters."""
+        max_rounds = max((len(r) for r in canon_rows), default=0)
+        for i in range(max_rounds):
+            rows = [(batch[b], canon_rows[b][i]) for b in range(len(batch)) if i < len(canon_rows[b])]
+            if not rows:
+                continue
+            ids = torch.tensor([[tp[0]] for _, tp in rows], device=self.device)
+            pos = torch.tensor([[tp[1]] for _, tp in rows], device=self.device)
+            slots = [s.slot for s, _ in rows]
+            # slot_lengths == the write position: _decode_batched writes each token's
+            # K/V at slot_lengths[j] and attends context 0..slot_lengths[j] (itself
+            # included), the exact canonical causal write for that position.
+            slot_lengths = [tp[1] for _, tp in rows]
+            self.cache.ensure_capacity(slots, [p + 1 for p in slot_lengths])
+            self.lin_cache.bind(slots)
+            ctx = ForwardContext(
+                is_prefill=False,
+                kv_cache=self.cache,
+                lin_cache=self.lin_cache,
+                slots=slots,
+                slot_lengths=slot_lengths,
+            )
+            self.model(ids, pos, ctx)  # canonical K/V write; logits unused
 
     @torch.inference_mode()
     def _decode_eager(self, batch: list[Sequence]) -> list[int]:
