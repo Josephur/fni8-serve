@@ -60,6 +60,7 @@ class ForwardContext:
         slot_lengths: list[int] | None = None,  # engine: per-row KV length (ragged decode)
         prefill_start: int = 0,  # prefix cache: first position to compute/write
         pixel_values: torch.Tensor | None = None,  # VLM: [1, 3, H, W] image pixels
+        image_grid_thw: torch.Tensor | None = None,  # VLM: [num_images, 3] (t, gh, gw)
         is_verify: bool = False,  # speculative-decode verify forward
         verify_slot_mapping: torch.Tensor | None = None,  # [total_verify_tok] int32 slot mapping
         acc_kv_buffer: list | None = None,  # chunked prefill: accumulated fp16 K/V per layer
@@ -84,6 +85,9 @@ class ForwardContext:
         self.slot_lengths = slot_lengths
         self.prefill_start = prefill_start
         self.pixel_values: torch.Tensor | None = pixel_values  # VLM: image pixels for vision tower
+        # VLM: grid dims (temporal, grid_h, grid_w) per image — the Qwen3.5 vision
+        # tower needs these to build position ids / merge windows. None for text.
+        self.image_grid_thw: torch.Tensor | None = image_grid_thw
         self.is_verify = is_verify
         self.verify_slot_mapping = verify_slot_mapping
         # Chunked prefill: per-layer accumulated fp16 K/V from earlier chunks.

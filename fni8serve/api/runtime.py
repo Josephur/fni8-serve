@@ -34,6 +34,7 @@ class _PendingRequest:
     prompt_ids: list[int]
     params: SamplingParams
     pixel_values: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
     out_queue: queue.Queue = field(default_factory=queue.Queue)
     seq_id: int | None = None
     sent: int = 0
@@ -55,10 +56,13 @@ class EngineWorker:
         prompt_ids: list[int],
         params: SamplingParams,
         pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
     ) -> queue.Queue:
         """Enqueue a generation request; returns the queue it will be streamed onto
         (token ids, terminated by a single `Done`)."""
-        req = _PendingRequest(prompt_ids, params, pixel_values=pixel_values)
+        req = _PendingRequest(
+            prompt_ids, params, pixel_values=pixel_values, image_grid_thw=image_grid_thw
+        )
         self._inbox.put(req)
         return req.out_queue
 
@@ -71,8 +75,11 @@ class EngineWorker:
         prompt_ids: list[int],
         params: SamplingParams,
         pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
     ) -> AsyncIterator[int | Done]:
-        out_q = self.submit(prompt_ids, params, pixel_values=pixel_values)
+        out_q = self.submit(
+            prompt_ids, params, pixel_values=pixel_values, image_grid_thw=image_grid_thw
+        )
         loop = asyncio.get_running_loop()
         while True:
             item = await loop.run_in_executor(None, out_q.get)
@@ -97,6 +104,7 @@ class EngineWorker:
         seq = self.engine.sequence(req.seq_id)
         if req.pixel_values is not None:
             seq.pixel_values = req.pixel_values
+            seq.image_grid_thw = req.image_grid_thw
         self._pending[req.seq_id] = req
         if self.stats is not None:
             p = req.params

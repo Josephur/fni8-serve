@@ -78,7 +78,11 @@ def test_qwen3_5_from_hf_real_config():
     dense MLP (no experts), partial-rotary 0.25 over head_dim 256, rope_theta 1e7,
     the output-gate flag, and the linear head dims (#204 + this PR's mtp key)."""
     c = _MC.from_hf(_REAL_HF)
-    assert c.arch == "qwen3_5"
+    # The real Qwen3.5 config carries a vision_config, so it IS a VLM: from_hf routes
+    # it to the multimodal `qwen3_5_vl` builder (which composes THIS text backbone with
+    # the vision tower). The text-backbone axes asserted below are derived identically.
+    assert c.arch == "qwen3_5_vl"
+    assert c.is_multimodal and c.vision_config is not None
     assert c.linear_attention and c.full_attention_interval == 4
     assert [c.attention_kind(i) for i in range(4)] == ["linear", "linear", "linear", "full"]
     assert c.resolved_head_dim() == 256 and c.rotary_dim() == 64

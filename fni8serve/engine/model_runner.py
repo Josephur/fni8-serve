@@ -150,6 +150,7 @@ class EngineRunner:
                     slots=[seq.slot],
                     prefill_start=seq.prefix_matched_len,
                     pixel_values=seq.pixel_values,
+                    image_grid_thw=seq.image_grid_thw,
                 )
                 hidden = self.model(ids, pos, ctx)
                 seq.length = n
@@ -183,6 +184,7 @@ class EngineRunner:
                 slots=[seq.slot],
                 prefill_start=prefix_len,
                 pixel_values=seq.pixel_values,
+                image_grid_thw=seq.image_grid_thw,
                 acc_kv_buffer=acc_buf,
             )
             hidden = self.model(ids, pos, ctx)

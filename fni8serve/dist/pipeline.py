@@ -192,6 +192,7 @@ def _remap_ctx(ctx: ForwardContext, cache, lin_cache=None) -> ForwardContext:
         slot_lengths=ctx.slot_lengths,
         prefill_start=ctx.prefill_start,
         pixel_values=ctx.pixel_values,
+        image_grid_thw=ctx.image_grid_thw,
     )
 
 

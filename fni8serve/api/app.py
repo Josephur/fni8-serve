@@ -132,16 +132,23 @@ def create_app(
         # Issue #151: extract and preprocess image_url content parts
         image_results = extract_images_from_messages(req.messages)
         pixel_values = image_results[0]["pixel_values"] if image_results else None
+        image_grid_thw = (
+            image_results[0].get("image_grid_thw") if image_results else None
+        )
 
         if req.stream:
             return StreamingResponse(
                 _chat_stream(
-                    worker, tokenizer, prompt_ids, params, req.model, pixel_values=pixel_values
+                    worker, tokenizer, prompt_ids, params, req.model,
+                    pixel_values=pixel_values, image_grid_thw=image_grid_thw,
                 ),
                 media_type="text/event-stream",
             )
 
-        output_ids, reason = await _generate(worker, prompt_ids, params, pixel_values=pixel_values)
+        output_ids, reason = await _generate(
+            worker, prompt_ids, params,
+            pixel_values=pixel_values, image_grid_thw=image_grid_thw,
+        )
         text = tokenizer.decode(output_ids, skip_special_tokens=True)
 
         if forced:
@@ -246,10 +253,13 @@ async def _generate(
     prompt_ids: list[int],
     params,
     pixel_values: torch.Tensor | None = None,
+    image_grid_thw: torch.Tensor | None = None,
 ) -> tuple[list[int], str]:
     ids: list[int] = []
     reason = "stop"
-    async for item in worker.stream(prompt_ids, params, pixel_values=pixel_values):
+    async for item in worker.stream(
+        prompt_ids, params, pixel_values=pixel_values, image_grid_thw=image_grid_thw
+    ):
         if isinstance(item, Done):
             reason = item.reason
         else:
@@ -258,10 +268,14 @@ async def _generate(
 
 
 async def _chat_stream(
-    worker, tokenizer, prompt_ids, params, model, pixel_values: torch.Tensor | None = None
+    worker, tokenizer, prompt_ids, params, model,
+    pixel_values: torch.Tensor | None = None,
+    image_grid_thw: torch.Tensor | None = None,
 ) -> AsyncIterator[str]:
     first, prev_text, ids = True, "", []
-    async for item in worker.stream(prompt_ids, params, pixel_values=pixel_values):
+    async for item in worker.stream(
+        prompt_ids, params, pixel_values=pixel_values, image_grid_thw=image_grid_thw
+    ):
         if isinstance(item, Done):
             choice = ChatCompletionChunkChoice(delta=DeltaMessage(), finish_reason=item.reason)
             chunk = ChatCompletionChunk(model=model, choices=[choice])

@@ -247,6 +247,59 @@ def preprocess_qwen2_5_vl(
     return {"pixel_values": pixel_values.squeeze(0), "image_grid_thw": image_grid_thw}
 
 
+# ---------------------------------------------------------------------------
+# Qwen3.5-VL preprocessing
+# ---------------------------------------------------------------------------
+
+# Qwen3.5 vision differs from Qwen2.5-VL: patch_size 16 (not 14), symmetric [0.5]
+# mean/std normalization (not CLIP), and a larger pixel budget. See the shipped
+# `preprocessor_config.json` (size.shortest_edge / longest_edge are pixel counts).
+QWEN3_5_VL_PATCH_SIZE = 16
+QWEN3_5_VL_MIN_PIXELS = 65536  # 256 * 16 * 16
+QWEN3_5_VL_MAX_PIXELS = 16777216
+QWEN3_5_MEAN = (0.5, 0.5, 0.5)
+QWEN3_5_STD = (0.5, 0.5, 0.5)
+
+
+def preprocess_qwen3_5_vl(
+    image: str | bytes | Image.Image | np.ndarray,
+    min_pixels: int = QWEN3_5_VL_MIN_PIXELS,
+    max_pixels: int = QWEN3_5_VL_MAX_PIXELS,
+    patch_size: int = QWEN3_5_VL_PATCH_SIZE,
+    merge_size: int = MERGE_SIZE,
+    temporal_patch_size: int = TEMPORAL_PATCH_SIZE,
+) -> dict[str, torch.Tensor]:
+    """Preprocess an image for Qwen3.5-VL (dynamic resolution, patch 16, [0.5] norm).
+
+    Mirrors ``Qwen2VLImageProcessorFast`` as configured for Qwen3.5. Returns:
+      * ``pixel_values``: ``[num_patches, C * t * p * p]`` float tensor
+      * ``image_grid_thw``: ``[1, 3]`` long tensor ``[temporal, grid_h, grid_w]``
+
+    ``num_patches = grid_h * grid_w``; the number of LLM image-placeholder tokens is
+    ``num_patches // merge_size**2``. Feed both fields into the Qwen3.5-VL wrapper via
+    ``ForwardContext`` (pixel_values + image_grid_thw).
+    """
+    pil = load_image(image)
+    tensor = _pil_to_tensor(pil)  # [C, H, W] uint8
+    H, W = tensor.shape[1], tensor.shape[2]
+    factor = patch_size * merge_size
+    target_h, target_w = smart_resize(
+        H, W, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels
+    )
+    resized = resize_image(tensor, (target_h, target_w))
+    normalized = rescale_and_normalize(
+        resized.unsqueeze(0), mean=QWEN3_5_MEAN, std=QWEN3_5_STD
+    )
+    pixel_values = patchify_qwen2_vl(
+        normalized, patch_size=patch_size, merge_size=merge_size,
+        temporal_patch_size=temporal_patch_size,
+    )
+    grid_h = target_h // patch_size
+    grid_w = target_w // patch_size
+    image_grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
+    return {"pixel_values": pixel_values.squeeze(0), "image_grid_thw": image_grid_thw}
+
+
 def preprocess_llava(
     image: str | bytes | Image.Image | np.ndarray,
     image_size: int = LLAVA_DEFAULT_IMAGE_SIZE,

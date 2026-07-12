@@ -249,7 +249,9 @@ class Qwen3_5ForCausalLM(nn.Module):
     "qwen3_5_text",  # text backbone of the VLM wrapper — published .fni8s (e.g.
     "qwen3_5_text_config",  # Qwen3.5-0.8B-fni8) carry this as their meta arch
     "Qwen3_5ForCausalLM",
-    "Qwen3_5ForConditionalGeneration",
+    # NOTE: `Qwen3_5ForConditionalGeneration` (the raw HF VLM arch) is claimed by
+    # models/qwen3_5_vl.py, which composes THIS text backbone with the vision tower.
+    # A text-only checkpoint routes here via its `qwen3_5_text` meta arch.
     "Qwen3_5TextModel",
 )
 def build_qwen3_5(cfg: ModelConfig, weights: dict) -> Qwen3_5ForCausalLM:

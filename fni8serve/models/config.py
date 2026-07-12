@@ -43,6 +43,7 @@ _MULTIMODAL_ARCHS = frozenset(
 # q_proj at load).
 _HYBRID_LINEAR_DEFAULT_INTERVAL = {
     "qwen3_5_text": 4,
+    "qwen3_5_vl": 4,  # VLM wrapper's text backbone is the same DeltaNet/full hybrid
     "qwen3_6_text": 4,
     "qwen3_next": 4,
 }
@@ -68,6 +69,15 @@ class VisionConfig:
     in_channels: int = 3
     layer_norm_eps: float = 1e-6
     hidden_act: str = "gelu_pytorch_tanh"
+    # Qwen3.5-VL extras (Conv3d patch embed + learned interpolated pos-embed + a
+    # norm→MLP merger that projects to the LLM hidden size). Absent for Qwen2.5-VL.
+    temporal_patch_size: int = 2
+    num_position_embeddings: int = 0  # learned pos-embed table size (Qwen3.5)
+    out_hidden_size: int = 0  # merger output dim (== LLM hidden_size); 0 => hidden_size
+    deepstack_visual_indexes: tuple[int, ...] = ()
+    # The verbatim HF `vision_config` sub-dict — lets a tower reconstruct the exact
+    # upstream config (incl. fields serve doesn't model yet) instead of guessing.
+    raw: dict = field(default_factory=dict)
 
     @property
     def head_dim(self) -> int:
@@ -199,6 +209,14 @@ class ModelConfig:
         if c.get("text_config"):
             c = {**c, **dict(c["text_config"])}
         resolved_arch = arch or model_type or (archs[0] if archs else "unknown")
+        # Qwen3.5 ships as a single `qwen3_5` / `Qwen3_5ForConditionalGeneration` arch
+        # that is a VLM iff a vision tower is configured. Route a raw HF config with a
+        # `vision_config` to the multimodal builder; a text-only `.fni8` (whose meta
+        # arch is `qwen3_5_text`, no vision_config) stays on the text backbone.
+        if resolved_arch in ("qwen3_5", "qwen3.5", "qwen3_5forconditionalgeneration") and hf.get(
+            "vision_config"
+        ):
+            resolved_arch = "qwen3_5_vl"
         n_heads = c["num_attention_heads"]
 
         # ── hybrid linear-attention derivation (Qwen3-Next / Qwen3.5/3.6, MiniMax) ──
@@ -251,6 +269,8 @@ class ModelConfig:
             v_raw = hf.get("vision_config") or {}
             img_tok = hf.get("image_token_id") or hf.get("image_token_index")
             n_layers = v_raw.get("depth") or v_raw.get("num_hidden_layers", 0)
+            # Qwen3.5 vision uses `num_heads`; Qwen2.5-VL / LLaVA use `num_attention_heads`.
+            n_vheads = v_raw.get("num_attention_heads") or v_raw.get("num_heads", 0)
             vision_cfg = (
                 VisionConfig(
                     hidden_size=v_raw.get("hidden_size", 0),
@@ -258,11 +278,16 @@ class ModelConfig:
                     num_layers=n_layers,
                     image_token_id=img_tok or 0,
                     spatial_merge_size=v_raw.get("spatial_merge_size", 1),
-                    num_attention_heads=v_raw.get("num_attention_heads", 0),
+                    num_attention_heads=n_vheads,
                     intermediate_size=v_raw.get("intermediate_size", 0),
                     in_channels=v_raw.get("in_channels", v_raw.get("in_chans", 3)),
                     layer_norm_eps=v_raw.get("layer_norm_eps", 1e-6),
                     hidden_act=v_raw.get("hidden_act", "gelu_pytorch_tanh"),
+                    temporal_patch_size=v_raw.get("temporal_patch_size", 2),
+                    num_position_embeddings=v_raw.get("num_position_embeddings", 0),
+                    out_hidden_size=v_raw.get("out_hidden_size", 0),
+                    deepstack_visual_indexes=tuple(v_raw.get("deepstack_visual_indexes", []) or []),
+                    raw=dict(v_raw),
                 )
                 if v_raw
                 else None

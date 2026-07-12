@@ -30,13 +30,27 @@ class ModelRunner:
         self.lin_cache = RecurrentStateCache()
 
     @torch.inference_mode()
-    def prefill(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """input_ids: [B, S] -> next-token logits [B, vocab]."""
+    def prefill(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """input_ids: [B, S] -> next-token logits [B, vocab]. For a VLM, pass
+        ``pixel_values`` (+ ``image_grid_thw``); the wrapper splices the vision
+        embeddings at the image-placeholder positions during this prefill."""
         B, S = input_ids.shape
         pos = torch.arange(S, device=self.device).unsqueeze(0).expand(B, S)
         self.cache.reset()
         self.lin_cache.reset()
-        ctx = ForwardContext(is_prefill=True, kv_cache=self.cache, lin_cache=self.lin_cache)
+        ctx = ForwardContext(
+            is_prefill=True,
+            kv_cache=self.cache,
+            lin_cache=self.lin_cache,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
         hidden = self.model(input_ids, pos, ctx)
         self.cache.advance(S)
         return self.model.compute_logits(hidden[:, -1])
@@ -52,9 +66,18 @@ class ModelRunner:
         return self.model.compute_logits(hidden[:, -1])
 
     @torch.inference_mode()
-    def generate_greedy(self, prompt_ids: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
+    def generate_greedy(
+        self,
+        prompt_ids: torch.Tensor,
+        max_new_tokens: int,
+        *,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """prompt_ids: [B, S] -> generated token ids [B, max_new_tokens]."""
-        logits = self.prefill(prompt_ids)
+        logits = self.prefill(
+            prompt_ids, pixel_values=pixel_values, image_grid_thw=image_grid_thw
+        )
         tok = logits.argmax(-1, keepdim=True)
         out = [tok]
         for _ in range(max_new_tokens - 1):

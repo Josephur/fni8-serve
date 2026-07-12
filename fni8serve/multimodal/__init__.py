@@ -13,7 +13,7 @@ import urllib.request
 
 from PIL import Image
 
-from .preprocess import preprocess_qwen2_5_vl  # noqa: F401
+from .preprocess import preprocess_qwen2_5_vl, preprocess_qwen3_5_vl  # noqa: F401
 from .projector import build_projector, embed_merge  # noqa: F401
 from .vit import VisionTransformer  # noqa: F401
 

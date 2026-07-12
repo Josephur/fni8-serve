@@ -40,6 +40,7 @@ class Sequence:
     length: int = 0  # KV positions committed for this seq
     prefix_matched_len: int = 0  # length of shared prefix found (0 = none)
     pixel_values: torch.Tensor | None = None  # VLM: [1, 3, H, W] preprocessed image
+    image_grid_thw: torch.Tensor | None = None  # VLM: [num_images, 3] patch grid (t, gh, gw)
 
     @property
     def num_prompt(self) -> int:
