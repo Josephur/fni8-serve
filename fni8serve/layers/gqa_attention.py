@@ -253,27 +253,45 @@ class GQAAttention(nn.Module):
         v_t = v.transpose(1, 2).contiguous()  # [B, Hkv, S, D]
         q_t = q.transpose(1, 2).contiguous()  # [B, H, S, D]
 
+        B = k_t.shape[0]
+
         # Commit every verify token's K/V to the paged store (accepted-token KV).
         if ctx.verify_slot_mapping is not None:
-            B, Hkv, S, D = k_t.shape
+            Hkv, S, D = k_t.shape[1:]
             k_flat = k_t.permute(0, 2, 1, 3).reshape(B * S, Hkv, D)  # token-major
             v_flat = v_t.permute(0, 2, 1, 3).reshape(B * S, Hkv, D)
             cache.write_decode_static(layer_idx, ctx.verify_slot_mapping, k_flat, v_flat)
 
-        # Base token: cache = prefix + base KV
-        k_b, ks_b, v_b, vs_b = cache.build_verify_cache(
-            layer_idx, ctx.slots, ctx.slot_lengths, k_t[:, :, :1], v_t[:, :, :1]
-        )
-        out_base = fni8.attn_int8_verify(q_t[:, :, :1], k_b, ks_b, v_b, vs_b, scale=self.scale)
-
+        # Per-sequence verify attention to avoid zero-padding corruption in
+        # ragged batches.  build_verify_cache pads every row to max_prefix with
+        # zeros, but attn_int8_verify receives no per-row prefix-length mask, so
+        # the zero entries leak into the softmax and corrupt attention for every
+        # row whose prefix is shorter than the maximum.  Processing rows one at a
+        # time guarantees pad_sz == 0 for every row (max_prefix == prefix_len).
+        out_base_list, out_drafts_list = [], []
+        for b in range(B):
+            k_b, ks_b, v_b, vs_b = cache.build_verify_cache(
+                layer_idx, [ctx.slots[b]], [ctx.slot_lengths[b]],
+                k_t[b:b + 1, :, :1], v_t[b:b + 1, :, :1],
+            )
+            out_base_list.append(
+                fni8.attn_int8_verify(
+                    q_t[b:b + 1, :, :1], k_b, ks_b, v_b, vs_b, scale=self.scale,
+                )
+            )
+            if n_drafts > 0:
+                k_d, ks_d, v_d, vs_d = cache.build_verify_cache(
+                    layer_idx, [ctx.slots[b]], [ctx.slot_lengths[b]],
+                    k_t[b:b + 1], v_t[b:b + 1],
+                )
+                out_drafts_list.append(
+                    fni8.attn_int8_verify(
+                        q_t[b:b + 1, :, 1:], k_d, ks_d, v_d, vs_d, scale=self.scale,
+                    )
+                )
+        out_base = torch.cat(out_base_list, dim=0)
         if n_drafts > 0:
-            # Drafts: cache = prefix + base KV + draft KVs
-            k_d, ks_d, v_d, vs_d = cache.build_verify_cache(
-                layer_idx, ctx.slots, ctx.slot_lengths, k_t, v_t
-            )
-            out_drafts = fni8.attn_int8_verify(
-                q_t[:, :, 1:], k_d, ks_d, v_d, vs_d, scale=self.scale
-            )
+            out_drafts = torch.cat(out_drafts_list, dim=0)
             out_t = torch.cat([out_base, out_drafts], dim=2)
         else:
             out_t = out_base
