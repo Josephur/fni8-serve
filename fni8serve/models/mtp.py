@@ -35,6 +35,27 @@ from ..layers.norm import RMSNorm
 from .config import ModelConfig
 
 
+def _fc_to_plain(w):
+    """The MTP fc is used as a PLAIN matmul (`fused @ fc.t()`), so it must be a
+    dense tensor. A quantized checkpoint ships it as a QTensor (per_row_i8 or
+    per_group_i4) which has no `.detach()` — dequantize it to fp16 here. The fc is
+    small and the head runs at most once per draft step, so a dense fc is fine (and
+    for hybrids where spec-decode is guarded off, the head never runs at all)."""
+    if not hasattr(w, "scheme"):
+        return w  # already a dense tensor
+    if w.scheme == "per_row_i8":
+        return (w.data.float() * w.scale.float().unsqueeze(-1)).to(torch.float16)
+    if w.scheme == "per_group_i4":
+        from fni8.quant.lowbit import dequantize_lowbit
+
+        d = w.data  # [N, K/2] uint8, 2 signed nibbles/byte (even col = low nibble)
+        lo = (d & 0xF).to(torch.int16); lo = torch.where(lo >= 8, lo - 16, lo)
+        hi = ((d >> 4) & 0xF).to(torch.int16); hi = torch.where(hi >= 8, hi - 16, hi)
+        codes = torch.stack([lo, hi], dim=-1).reshape(d.shape[0], -1).to(torch.int8)
+        return dequantize_lowbit(codes, w.scale, group_size=w.group_size).to(torch.float16)
+    raise ValueError(f"MTP fc: unsupported quant scheme {w.scheme!r}")
+
+
 class MTPLayer(nn.Module):
     """One MTP depth: two input RMSNorms + fc(2H->H) + a transformer block.
 
@@ -53,7 +74,7 @@ class MTPLayer(nn.Module):
                                           add_unit_offset=off)
         self.pre_fc_norm_embedding = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, emb_norm,
                                              add_unit_offset=off)
-        self.fc = nn.Parameter(fc_weight)                # [hidden, 2*hidden]
+        self.fc = nn.Parameter(_fc_to_plain(fc_weight))  # [hidden, 2*hidden], dense
         self.block = block
 
     def forward(self, prev_hidden, next_token_emb, positions, ctx, layer_idx):
