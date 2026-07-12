@@ -399,3 +399,40 @@ def test_from_hf_dense_model_unaffected_by_derivation():
     assert cfg.linear_attention is False
     assert cfg.full_attention_interval == 0
     assert cfg.attention_kind(0) == "full"
+
+
+def _roundtripped_qwen35_meta(**overrides):
+    """A .fni8 round-tripped meta config for Qwen3.5: it carries the flattened
+    scalars (NOT `layer_types`/`attn_type_list`), and older converters recorded
+    the hybrid pattern as the dataclass defaults (linear_attention=False,
+    full_attention_interval=0) — losing the 3:1 DeltaNet/full layout."""
+    cfg = dict(
+        arch="qwen3_5_text", model_type=None, vocab_size=151936, hidden_size=1024,
+        num_hidden_layers=24, num_attention_heads=16, num_key_value_heads=2,
+        intermediate_size=3072, head_dim=128,
+        linear_attention=False, full_attention_interval=0,  # the lossy round-trip
+    )
+    cfg.update(overrides)
+    return cfg
+
+
+def test_qwen35_roundtripped_meta_recovers_hybrid_pattern():
+    """Regression: a round-tripped Qwen3.5 .fni8 whose meta lost the hybrid pattern
+    must still classify layers 3:1 (DeltaNet linear + every-4th full), not all-full.
+    Pre-fix this returned 'full' for every layer -> KeyError on q_proj at load."""
+    cfg = ModelConfig.from_hf(_roundtripped_qwen35_meta(), arch="qwen3_5_text")
+    kinds = [cfg.attention_kind(i) for i in range(cfg.num_hidden_layers)]
+    # 3 linear : 1 full, full every 4th layer (indices 3,7,11,...).
+    assert kinds[0] == "linear" and kinds[1] == "linear" and kinds[2] == "linear"
+    assert kinds[3] == "full" and kinds[7] == "full"
+    assert kinds.count("full") == 6 and kinds.count("linear") == 18
+
+
+def test_real_layer_types_still_wins_over_family_default():
+    """If the config DOES carry layer_types, it must be honored, not overridden
+    by the family default."""
+    lt = ["linear_attention"] * 24
+    lt[5] = lt[11] = lt[17] = lt[23] = "full_attention"  # a non-default stride-6 layout
+    cfg = ModelConfig.from_hf(_roundtripped_qwen35_meta(layer_types=lt), arch="qwen3_5_text")
+    assert cfg.full_attention_interval == 6
+    assert cfg.attention_kind(5) == "full" and cfg.attention_kind(3) == "linear"

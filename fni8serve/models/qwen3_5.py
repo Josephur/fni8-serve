@@ -60,25 +60,74 @@ def _gated_full_attn(cfg, sd, p, rope):
     )
 
 
+def _la_weight(sd, la, native, *aliases):
+    """Resolve a DeltaNet weight by its serve-native name, falling back to the raw
+    HF names some `.fni8` checkpoints carry un-remapped. Qwen3.5-0.8B ships the
+    *separate*-projection HF layout (`in_proj_qkv/z/b/a`, `conv1d`) that convert.py's
+    remap (written for Qwen3-Next's *fused* `in_proj_qkvz/ba`) doesn't rewrite, so
+    accept both. Pure renames — the int8 weights are identical."""
+    for name in (native, *aliases):
+        key = f"{la}.{name}"
+        if key in sd:
+            return sd[key]
+    raise KeyError(f"{la}.{native} (or aliases {aliases!r})")
+
+
+def _la_dims(sd, la, x):
+    """DeltaNet head dims live in cfg.extra, but a round-tripped `.fni8` meta drops
+    the `extra` overflow, so recover them from the weight shapes when absent. Uses
+    the standard Gated-DeltaNet invariants (num_k_heads == num_v_heads, key_dim ==
+    value_dim for this family): num_v_heads = A_log length, value_dim = per-head norm
+    gain length, and qkv_out = 2*num_k*key_dim + num_v*value_dim pins key_dim."""
+    keys = (
+        "linear_num_key_heads", "linear_num_value_heads",
+        "linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim",
+    )
+    if all(k in x for k in keys):
+        return {k: x[k] for k in keys}  # full config survived — no derivation needed
+
+    def _shape(w):  # weights may be plain tensors or int8 QTensors (no `.shape`)
+        return tuple(getattr(w, "logical_shape", None) or w.shape)
+
+    nv = int(_shape(_la_weight(sd, la, "A_log"))[0])
+    vd = int(_shape(_la_weight(sd, la, "norm.weight"))[0])
+    qkv_out = int(_shape(_la_weight(sd, la, "qkv_proj.weight", "in_proj_qkv.weight"))[0])
+    nk = nv  # this family ties key/value head counts
+    kd = (qkv_out - nv * vd) // (2 * nk)
+    ck = int(_shape(_la_weight(sd, la, "conv_weight", "conv1d.weight"))[-1])
+    return dict(
+        linear_num_key_heads=x.get("linear_num_key_heads", nk),
+        linear_num_value_heads=x.get("linear_num_value_heads", nv),
+        linear_key_head_dim=x.get("linear_key_head_dim", kd),
+        linear_value_head_dim=x.get("linear_value_head_dim", vd),
+        linear_conv_kernel_dim=x.get("linear_conv_kernel_dim", ck),
+    )
+
+
 def _linear_attn(cfg, sd, p):
     x = cfg.extra
     la = f"{p}.linear_attn"
+    d = _la_dims(sd, la, x)
+    # conv1d.weight is [dim, 1, kernel]; the kernel wants [dim, kernel].
+    conv_w = _la_weight(sd, la, "conv_weight", "conv1d.weight")
+    if conv_w.dim() == 3:
+        conv_w = conv_w.squeeze(1)
     return GatedDeltaNetAttention(
         cfg,
-        qkv_proj=to_qtensor(sd[f"{la}.qkv_proj.weight"]),
-        out_proj=to_qtensor(sd[f"{la}.out_proj.weight"]),
-        conv_weight=sd[f"{la}.conv_weight"],
-        a_log=sd[f"{la}.A_log"],
-        dt_bias=sd[f"{la}.dt_bias"],
-        beta_proj=to_qtensor(sd[f"{la}.beta_proj.weight"]),
-        gate_proj=to_qtensor(sd[f"{la}.dt_proj.weight"]),
-        z_proj=to_qtensor(sd[f"{la}.z_proj.weight"]),
-        norm_gain=sd[f"{la}.norm.weight"],
-        num_k_heads=x["linear_num_key_heads"],
-        num_v_heads=x["linear_num_value_heads"],
-        key_dim=x["linear_key_head_dim"],
-        value_dim=x["linear_value_head_dim"],
-        conv_kernel=x.get("linear_conv_kernel_dim", 4),
+        qkv_proj=to_qtensor(_la_weight(sd, la, "qkv_proj.weight", "in_proj_qkv.weight")),
+        out_proj=to_qtensor(_la_weight(sd, la, "out_proj.weight")),
+        conv_weight=conv_w,
+        a_log=_la_weight(sd, la, "A_log"),
+        dt_bias=_la_weight(sd, la, "dt_bias"),
+        beta_proj=to_qtensor(_la_weight(sd, la, "beta_proj.weight", "in_proj_b.weight")),
+        gate_proj=to_qtensor(_la_weight(sd, la, "dt_proj.weight", "in_proj_a.weight")),
+        z_proj=to_qtensor(_la_weight(sd, la, "z_proj.weight", "in_proj_z.weight")),
+        norm_gain=_la_weight(sd, la, "norm.weight"),
+        num_k_heads=d["linear_num_key_heads"],
+        num_v_heads=d["linear_num_value_heads"],
+        key_dim=d["linear_key_head_dim"],
+        value_dim=d["linear_value_head_dim"],
+        conv_kernel=d["linear_conv_kernel_dim"],
     )
 
 

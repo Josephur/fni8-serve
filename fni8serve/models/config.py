@@ -32,6 +32,22 @@ _MULTIMODAL_ARCHS = frozenset(
 )
 
 
+# Gated-DeltaNet hybrid families and their standard full-attention stride (3 linear
+# : 1 full => every 4th layer is full softmax attention). A REAL HF config marks this
+# with `layer_types`/`attn_type_list`, but a round-tripped `.fni8` meta carries only
+# the flattened scalars — and older converters dumped the dataclass defaults
+# (linear_attention=False, full_attention_interval=0), losing the pattern. When the
+# arch is a known hybrid but nothing derived a pattern, fall back to the family stride
+# so the checkpoint still reconstructs its DeltaNet/full layout instead of building
+# every layer as full attention (which KeyErrors on the DeltaNet layers' missing
+# q_proj at load).
+_HYBRID_LINEAR_DEFAULT_INTERVAL = {
+    "qwen3_5_text": 4,
+    "qwen3_6_text": 4,
+    "qwen3_next": 4,
+}
+
+
 @dataclass
 class VisionConfig:
     """Configuration for a vision backbone (ViT / SigLIP) within a VLM.
@@ -211,6 +227,14 @@ class ModelConfig:
             # sits at index (interval-1); recover the stride from that first full layer.
             if full_layers:
                 full_interval = full_layers[0] + 1
+
+        # Family-default fallback for a round-tripped hybrid whose pattern metadata
+        # was lost in conversion (linear_attention=False/interval=0, no layer_types).
+        # A known hybrid arch is a DeltaNet/full hybrid by definition, so apply the
+        # family's standard 3:1 stride rather than misbuild every layer as full attn.
+        if not (has_linear and full_interval) and resolved_arch in _HYBRID_LINEAR_DEFAULT_INTERVAL:
+            has_linear = True
+            full_interval = _HYBRID_LINEAR_DEFAULT_INTERVAL[resolved_arch]
 
         # RoPE knobs may be flat (older configs, round-tripped dumps) or nested under
         # `rope_parameters` (Qwen3.5/3.6). Read the nested dict first, else fall back
