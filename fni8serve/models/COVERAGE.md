@@ -7,27 +7,29 @@ a thin `models/<family>.py` assembly over shared layers, registered with
 Support splits by **attention backend** — that's the axis that decides whether a
 family runs on today's fni8 dp4a kernels or needs a new one.
 
-Legend (**status** column): ✅ concrete + GPU-tested (full decode) · 🟩 registered +
-prefill-tested (decode needs recurrent-state/latent cache) · 🟡 config ready, needs real
-weights · 🟧 scaffold · ⛔ int8 accel needs a new fni8 kernel (fp16 backend works).
+Legend (**status** column): ✅ int8 decode wired end-to-end · 🟩 registered +
+prefill-tested (decode path still torch / needs a kernel) · 🟡 config ready, needs real
+weights · 🟧 scaffold · ⛔ one sub-path still needs a new fni8 kernel (annotated in notes;
+the rest of the family is int8). A cell may pair symbols (e.g. ✅⛔ = int8 decode wired, but
+a named prefill/secondary path is still torch — see notes).
 
 **The `released` column ≠ "decodes".** ✅ under `released` only means a `.fni8` checkpoint
 exists / is published for the family. Whether the family actually **decodes int8 end-to-end
 is governed solely by the `status` column** — only a ✅ status means full int8 decode today
-(🟩 = prefill only; ⛔ = decodes on the fp16 backend, not int8-accelerated). Do not read a
-released-✅ as "supported for generation."
+(🟩 = prefill only; ⛔ = one named sub-path is still torch/fp16, called out in that row's
+notes). Do not read a released-✅ as "supported for generation."
 
 | family | released | attention backend | MLP | status | notes |
 |---|---|---|---|---|---|
 | **Qwen3** dense | ✅ | GQA (full) | SwiGLU | ✅ | QK-norm pre-RoPE, explicit head_dim=128, θ=1e6 |
 | **Qwen3-MoE** | ✅ | GQA (full) | top-k MoE (no shared) | ✅ | softmax→top-k→renorm; 128 experts / top-8 |
 | **Gemma3** (text) | ✅ | GQA (full + **sliding**) | GeGLU | ✅ | 5-local:1-global, dual-θ RoPE, (1+w) norm, √d embed, scale=`qpas^-0.5` |
-| **LFM2 / LFM2-MoE** | ✅ | hybrid **short-conv** + GQA | SwiGLU (w1/w3/w2) | 🟩 | `full_attn_idxs`; double-gated conv(k=3); QK-norm; sigmoid MoE router |
-| **GLM-4.5/4.6** | ✅ | GQA + **partial RoPE 0.5** + QKV-bias | sigmoid MoE + shared | 🟩 | e_score_correction_bias select, routed_scaling 2.5, first-k-dense |
-| **Hunyuan** (A13B) | ✅ | GQA + QK-norm | softmax MoE + shared | 🟩 | `mlp.gate.wg`, `shared_mlp`; CLA (Large) not modeled |
-| **Qwen3-Next / Qwen3.5 / Qwen3.6** | ✅ | **hybrid: Gated DeltaNet (linear) + full** | ultra-sparse MoE + shared | 🟩⛔ | fp16 DeltaNet backend runs; int8 chunked kernel = Track 2 |
-| **DeepSeek-V3/V4** | V3 ✅ | **MLA (latent KV)** | fine MoE + shared | ✅⛔ | fp16 decompress MLA runs prefill + decode (`MLALatentCache`); absorb int8 kernel = Track 2 |
-| **MiniMax-Text** | ✅ | **lightning (linear)** + softmax hybrid | softmax MoE | 🟩⛔ | fp16 lightning backend runs; postnorm α/β scaling; int8 = Track 2 |
+| **LFM2 / LFM2-MoE** | ✅ | hybrid **short-conv** + GQA | SwiGLU (w1/w3/w2) | ✅ | GQA halves decode int8 (`attn_int8_decode`); short-conv stays torch (cheap, not the int8 story); `full_attn_idxs`; double-gated conv(k=3); QK-norm; sigmoid MoE router |
+| **GLM-4.5/4.6** | ✅ | GQA + **partial RoPE 0.5** + QKV-bias | sigmoid MoE + shared | ✅ | GQA → int8 decode wired (`attn_int8_decode`/`attn_paged_decode_cached`); e_score_correction_bias select, routed_scaling 2.5, first-k-dense |
+| **Hunyuan** (A13B) | ✅ | GQA + QK-norm | softmax MoE + shared | ✅ | GQA → int8 decode wired; `mlp.gate.wg`, `shared_mlp`; CLA (Large) not modeled |
+| **Qwen3-Next / Qwen3.5 / Qwen3.6** | ✅ | **hybrid: Gated DeltaNet (linear) + full** | ultra-sparse MoE + shared | ✅⛔ | int8 **decode** wired both halves: gated/full GQA (`attn_int8_decode`) + DeltaNet L==1 step (`fni8.deltanet_recurrent_decode`, auto-degrades). DeltaNet **prefill** recurrence still pure-torch (`recurrent_gated_delta_rule`); int8 chunk kernel unwired = remaining gap |
+| **DeepSeek-V3/V4** | V3 ✅ | **MLA (latent KV)** | fine MoE + shared | ✅ | int8 **absorb decode** wired (`fni8.mla_decode_absorb_int8`, `use_int8_absorb=True` default) — folds `W_UK`/`W_UV`. MLA **prefill** is fp32 einsum **by design** (numerics contract; no int8 MLA-prefill kernel) |
+| **MiniMax-Text** | ✅ | **lightning (linear)** + softmax hybrid | softmax MoE | 🟩⛔ | softmax half → int8 decode wired (GQA). Lightning half: recurrence runs **pure-torch** at prefill AND decode (`lightning_attention`; projections are int8). `fni8.lightning_attn_int8_fwd` exists but is **unwired**, and there is **no graph-capturable lightning decode kernel** — genuine gaps. postnorm α/β scaling |
 | **DiffusionGemma** | ✅ (post-cutoff) | **bidirectional** over canvas | GeGLU MoE | 🟡 | `attn_int8_fwd(causal=False)`; needs DiffusionDecodeStrategy |
 | **Gemma4 / gemma3n** | ✅ | GQA + AltUp/LAuReL/PLE/MatFormer | GeGLU | 🟧 | residual-mixing + per-layer-embeddings are new modules |
 
@@ -74,14 +76,22 @@ one decoder block. Draft `k` tokens, **verify in one causal forward** —
 are built; the accept/verify loop lands with the engine (it needs the main model's
 KV cache).
 
-## The two kernel gaps (fni8 PRs, not serve code)
+## The remaining linear/MLA kernel gaps (fni8 PRs, not serve code)
 
-1. **Linear attention** (Gated DeltaNet / lightning): Qwen3-Next/3.5/3.6, MiniMax.
-   A recurrent/chunked linear-attention kernel — fundamentally different from FA2.
-   Until then those families fp16-fallback the linear layers (correct, slow).
-2. **MLA — multi-head latent attention** (DeepSeek-V3/V4): compressed latent KV.
-   Either a dedicated MLA kernel or decompress-latent→MHA and reuse the dp4a path
-   (loses the KV-compression win). MoE + MTP for DeepSeek are already covered.
+The big decode kernels have **landed and are wired**: MLA int8 **absorb decode**
+(`fni8.mla_decode_absorb_int8`, DeepSeek) and Gated-DeltaNet int8 **decode**
+(`fni8.deltanet_recurrent_decode`, Qwen3-Next/3.5/3.6) both ship and are called from
+`mla_attn.py` / `linear_attn.py`. What is still open:
+
+1. **Gated DeltaNet int8 *prefill*** (Qwen3-Next/3.5/3.6): the L>1 chunked recurrence
+   still runs pure-torch (`recurrent_gated_delta_rule`); the int8 chunk kernel is unwired.
+   Decode is already int8; this is a prefill-only gap.
+2. **Lightning linear attention** (MiniMax): the recurrence runs pure-torch at **both**
+   prefill and decode (`lightning_attention`). `fni8.lightning_attn_int8_fwd` exists but is
+   unwired for prefill, and there is **no graph-capturable lightning *decode* kernel** at
+   all — the genuinely-missing piece.
+3. **MLA int8 *prefill*** (DeepSeek-V3/V4): prefill is an fp32 einsum **by design**
+   (softmax/LSE/PV numerics contract), not a missing kernel. MoE + MTP are already covered.
 
 Diffusion decoding (DiffusionGemma / LLaDA) needs **no new kernel** — bidirectional
 attention is `attn_int8_fwd(causal=False)` — only a `DiffusionDecodeStrategy`

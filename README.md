@@ -38,9 +38,10 @@ the short version:
 | Family | int8 decode (end-to-end) |
 | --- | --- |
 | Qwen3 dense/MoE, Gemma3 | ✅ full prefill + decode |
-| Qwen3-Next / 3.5 (Gated-DeltaNet hybrid) | ✅ decode landed in fni8 v0.1.0-rc3 (fused graph-capturable kernels) |
-| DeepSeek-V3 (MLA) | decodes, but in **fp16** — int8 absorb kernel pending |
-| MiniMax, LFM2, GLM-4.5/4.6, Hunyuan | prefill only; decode pending |
+| GLM-4.5/4.6, Hunyuan, LFM2 | ✅ int8 decode (GQA); LFM2 short-conv stays torch (cheap) |
+| Qwen3-Next / 3.5 / 3.6 (Gated-DeltaNet hybrid) | ✅ int8 decode both halves (GQA + DeltaNet kernel); DeltaNet **prefill** still torch |
+| DeepSeek-V3/V4 (MLA) | ✅ int8 **absorb** decode (default on); MLA **prefill** is fp32 einsum by design |
+| MiniMax-Text (lightning) | softmax half decodes int8; lightning half is torch — int8 prefill unwired, no lightning decode kernel yet |
 
 Multi-GPU (pipeline + MoE-expert parallelism) and MTP speculative decode are wired but
 still maturing. Tensor/FSDP parallelism is unusable here — the PCIe 1.0 x1 link is
