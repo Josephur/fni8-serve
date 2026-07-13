@@ -7,12 +7,43 @@ QTensors for the dp4a GEMM. QKV and gate/up projections are MERGED here (concat 
 the output axis) so the runtime issues fewer, wider matmuls — the same merge the
 offline `.fni8` conversion performs. Norms/embeddings stay fp16.
 """
+
 from __future__ import annotations
+
+import contextlib
 
 import torch
 
 from fni8 import QTensor
 from fni8.quant.core import quantize_int8_rowwise
+
+# When True, the q/k/v and gate/up merge helpers POP their source rows out of the
+# caller's state dict as they consume them, so each un-merged projection is freed the
+# moment it is merged instead of lingering alongside its merged copy for the whole
+# build. On a checkpoint whose weights nearly fill the card (a 27B 4-bit on one 16 GiB
+# GPU) that duplication is the difference between building and OOM-ing. It is OFF by
+# default because popping MUTATES the caller's dict — many callers/tests reuse the same
+# state dict to build a second model (e.g. an engine + a reference runner), and a
+# destructive default would delete rows out from under them (KeyError). The real
+# single-card load path owns a freshly-loaded, use-once dict, so it opts in via
+# `consume_on_merge()`.
+_CONSUME_ON_MERGE = False
+
+
+@contextlib.contextmanager
+def consume_on_merge():
+    """Within this context, `qkv_weight`/`gate_up_weight` POP their source rows from the
+    passed state dict (freeing each projection as it is merged) instead of indexing them
+    (leaving the dict intact). Use it ONLY when the state dict is owned and consumed
+    exactly once — i.e. the production `.fni8` -> `build_model` load path — never around a
+    build whose dict is reused afterwards."""
+    global _CONSUME_ON_MERGE
+    prev = _CONSUME_ON_MERGE
+    _CONSUME_ON_MERGE = True
+    try:
+        yield
+    finally:
+        _CONSUME_ON_MERGE = prev
 
 
 def to_qtensor(w) -> QTensor:
@@ -34,16 +65,34 @@ def merge_qtensor(rows: list) -> QTensor:
         data = torch.cat([r.data for r in rows], dim=0)
         scale = torch.cat([r.scale for r in rows], dim=0)
         r0 = rows[0]
-        return QTensor(data.contiguous(), scale.contiguous(), scheme=r0.scheme,
-                       group_size=r0.group_size, codebook=r0.codebook)
+        return QTensor(
+            data.contiguous(),
+            scale.contiguous(),
+            scheme=r0.scheme,
+            group_size=r0.group_size,
+            codebook=r0.codebook,
+        )
     return to_qtensor(torch.cat(rows, dim=0))
 
 
+def _take_rows(sd: dict, keys: list[str]) -> list:
+    """Fetch each weight from `sd`. Under `consume_on_merge()` this POPS (removes) the
+    row so the un-merged source tensor is freed as soon as the merge's local list goes
+    out of scope — bounding the merge transient on a card-filling checkpoint. Otherwise
+    it INDEXES (non-destructive), leaving the dict intact for callers that reuse it.
+    Each q/k/v/gate/up projection is consumed exactly once per build either way."""
+    if _CONSUME_ON_MERGE:
+        return [sd.pop(k) for k in keys]
+    return [sd[k] for k in keys]
+
+
 def qkv_weight(sd: dict, prefix: str) -> QTensor:
-    return merge_qtensor([sd[f"{prefix}.q_proj.weight"],
-                          sd[f"{prefix}.k_proj.weight"],
-                          sd[f"{prefix}.v_proj.weight"]])
+    return merge_qtensor(
+        _take_rows(
+            sd, [f"{prefix}.q_proj.weight", f"{prefix}.k_proj.weight", f"{prefix}.v_proj.weight"]
+        )
+    )
 
 
 def gate_up_weight(sd: dict, prefix: str) -> QTensor:
-    return merge_qtensor([sd[f"{prefix}.gate_proj.weight"], sd[f"{prefix}.up_proj.weight"]])
+    return merge_qtensor(_take_rows(sd, [f"{prefix}.gate_proj.weight", f"{prefix}.up_proj.weight"]))

@@ -42,14 +42,56 @@ def load_fni8_checkpoint(
         return r.load_many(names, device)
 
 
+EMBED_TOKENS_NAME = "model.embed_tokens.weight"
+
+
+def _quantize_embed_int8(fp16_weight: torch.Tensor) -> QTensor:
+    """Symmetric per-row int8 for an embedding table [vocab, hidden]. Done on the
+    tensor's current device (CPU during load, to avoid ever putting the ~2.4 GiB
+    fp16 table on the GPU). Returns a `per_row_i8` QTensor consumed by
+    `VocabEmbedding` (dequant-on-gather)."""
+    from fni8.quant.core import quantize_int8_rowwise
+
+    q, scale = quantize_int8_rowwise(fp16_weight)  # int8 [V, H], fp32 [V, 1]
+    return QTensor(q.contiguous(), scale.squeeze(-1).contiguous(), scheme="per_row_i8")
+
+
 def load_fni8_state_dict(
-    path: str, *, device: str = "cuda", names: list[str] | None = None, shard: str | None = None
+    path: str,
+    *,
+    device: str = "cuda",
+    names: list[str] | None = None,
+    shard: str | None = None,
+    embed_int8: bool = False,
 ) -> dict:
     """Build-ready state dict: quantized tensors stay QTensor, `raw` tensors (norms,
     embeddings, router gate) are unwrapped to plain fp16 Tensors — exactly what the
     model builders expect (LinearW8A8 takes a QTensor; RMSNorm/Embedding take a
-    Tensor). Feed straight into `build_model(cfg, state_dict)`."""
-    loaded = load_fni8_checkpoint(path, device=device, names=names, shard=shard)
+    Tensor). Feed straight into `build_model(cfg, state_dict)`.
+
+    `embed_int8=True` downcasts `model.embed_tokens.weight` (fp16) to a `per_row_i8`
+    QTensor as it loads — halving the vocab-sized embedding table (~2.4 GiB → ~1.2 GiB
+    for a 27B). The fp16 table is quantized on the *host* and only the int8 result is
+    moved to `device`, so the fp16 copy never occupies GPU memory (the difference
+    between fitting and OOM-ing a 27B 4-bit checkpoint on a single 16 GiB card).
+    `VocabEmbedding` dequantizes per-row on gather; loss is negligible (a lookup, not
+    a matmul). Only applies to a full load (no `names`/`shard` subset)."""
+    if embed_int8 and names is None and shard is None:
+        with FQReader(path) as r:
+            all_names = list(r.names)
+        if EMBED_TOKENS_NAME in all_names:
+            others = [n for n in all_names if n != EMBED_TOKENS_NAME]
+            loaded = load_fni8_checkpoint(path, device=device, names=others)
+            # Load the embedding table to the HOST, quantize there, ship int8 to device.
+            emb_host = load_fni8_checkpoint(path, device="cpu", names=[EMBED_TOKENS_NAME])
+            qt = _quantize_embed_int8(emb_host[EMBED_TOKENS_NAME].data)
+            loaded[EMBED_TOKENS_NAME] = QTensor(
+                qt.data.to(device), qt.scale.to(device), scheme="per_row_i8"
+            )
+        else:
+            loaded = load_fni8_checkpoint(path, device=device)
+    else:
+        loaded = load_fni8_checkpoint(path, device=device, names=names, shard=shard)
     out: dict = {}
     for name, qt in loaded.items():
         out[name] = qt.data if getattr(qt, "scheme", None) == "raw" else qt

@@ -43,8 +43,11 @@ def load_engine(model_path: str, *, device: str = "cuda", max_num_seqs: int = 16
         except Exception:  # frozen dataclass
             import dataclasses
             cfg = dataclasses.replace(cfg, qk_norm=True)
+    # `weights` was just loaded from the `.fni8` file and is used only to build this one
+    # engine, so let the qkv/gate_up merges consume (pop) their source rows as they go --
+    # bounding the merge transient so a single-card 27B fits in 16 GiB.
     return LLMEngine(cfg, weights, device=device, max_num_seqs=max_num_seqs,
-                     max_len=max_len, eos_id=eos_id)
+                     max_len=max_len, eos_id=eos_id, consume_weights=True)
 
 
 def _human_count(n: int) -> str:

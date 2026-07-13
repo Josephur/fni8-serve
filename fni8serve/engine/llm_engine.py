@@ -16,6 +16,7 @@ from ..models.base import ForwardContext
 from ..models.cache import MLALatentCache, RecurrentStateCache
 from ..models.config import ModelConfig
 from ..models.registry import build_model
+from ..models.weights import consume_on_merge
 from .cuda_graph import cuda_graph_enabled_by_env
 from .decode_strategy import DiffusionDecodeStrategy
 from .kv_cache import PagedKVCache
@@ -39,11 +40,21 @@ class LLMEngine:
         num_diffusion_steps: int = 8,
         chunked_prefill_size: int = 0,
         spec_decode: bool | None = None,
+        consume_weights: bool = False,
     ):
         self.cfg = cfg
         self.device = device
         self.eos_id = eos_id
-        self.model = build_model(cfg, weights).to(device).eval()
+        # `consume_weights=True` lets the qkv/gate_up merges POP their source rows out of
+        # `weights` as they build, bounding the merge transient so a card-filling 27B
+        # fits on one 16 GiB GPU. It MUTATES `weights`, so only pass it when the caller
+        # owns the dict and will not reuse it (the `.fni8` load path). Default off keeps
+        # the dict intact for callers that build a second model from it.
+        if consume_weights:
+            with consume_on_merge():
+                self.model = build_model(cfg, weights).to(device).eval()
+        else:
+            self.model = build_model(cfg, weights).to(device).eval()
         self._diffusion_strategy = (
             DiffusionDecodeStrategy(num_steps=num_diffusion_steps)
             if cfg.decode_strategy == "diffusion"

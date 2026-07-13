@@ -7,6 +7,7 @@ numerically sensitive). Gemma scales embeddings by sqrt(hidden_size) after looku
 (small models) or its own weight, and may be int8-quantized (a real GEMM) via a
 `QTensor`, or kept fp16.
 """
+
 from __future__ import annotations
 
 import torch
@@ -19,13 +20,45 @@ from .linear import LinearW8A8
 
 
 class VocabEmbedding(nn.Module):
-    def __init__(self, weight: torch.Tensor, embed_scale: float = 1.0):
+    """Token embedding lookup.
+
+    Accepts either an fp16 `[vocab, hidden]` weight (the default) or a
+    `per_row_i8` `QTensor` — an int8 embedding table with a per-row fp32 scale.
+    The int8 variant halves the (large, vocab-sized) embedding footprint; it is a
+    *gather*, not a matmul, so dequant is a single per-row multiply applied only to
+    the rows actually looked up (loss is negligible — see tests). This is the lever
+    that fits a 27B 4-bit checkpoint (embed alone is ~2.4 GiB fp16) onto one 16 GiB
+    card. Enable it at load time with `load_fni8_state_dict(..., embed_int8=True)`.
+    """
+
+    def __init__(self, weight: QTensor | torch.Tensor, embed_scale: float = 1.0):
         super().__init__()
-        self.weight = nn.Parameter(weight)          # [vocab, hidden] fp16
         self.embed_scale = embed_scale
+        if isinstance(weight, QTensor):
+            if weight.scheme != "per_row_i8":
+                raise ValueError(
+                    f"VocabEmbedding int8 path needs a per_row_i8 QTensor, got {weight.scheme!r}"
+                )
+            # int8 table [vocab, hidden] + fp32 per-row scale [vocab, 1] (kept 2-D so
+            # `F.embedding` gathers a broadcastable [..., 1] scale alongside the rows).
+            self.register_buffer("qweight", weight.data, persistent=False)
+            scale = weight.scale
+            if scale.dim() == 1:
+                scale = scale.unsqueeze(-1)
+            self.register_buffer("qscale", scale.to(torch.float32), persistent=False)
+            self.weight = None
+            self._int8 = True
+        else:
+            self.weight = nn.Parameter(weight)  # [vocab, hidden] fp16
+            self._int8 = False
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        h = F.embedding(input_ids, self.weight)
+        if self._int8:
+            rows = F.embedding(input_ids, self.qweight)  # int8 [..., hidden]
+            scale = F.embedding(input_ids, self.qscale)  # fp32 [..., 1]
+            h = (rows.float() * scale).to(torch.float16)
+        else:
+            h = F.embedding(input_ids, self.weight)
         if self.embed_scale != 1.0:
             h = h * self.embed_scale
         return h
@@ -48,6 +81,6 @@ class LMHead(nn.Module):
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         logits = self.proj(hidden) if self.proj is not None else F.linear(hidden, self.weight)
-        if self.logit_softcap:                       # Gemma-style final-logit soft cap
+        if self.logit_softcap:  # Gemma-style final-logit soft cap
             logits = self.logit_softcap * torch.tanh(logits.float() / self.logit_softcap)
         return logits
