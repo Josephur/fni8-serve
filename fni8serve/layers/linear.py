@@ -66,6 +66,14 @@ class LinearW8A8(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._dp4a_ok(x):
-            return fni8.linear(x, self.weight, bias=self.bias)   # int8/W4A8 dp4a
+            # Store the dp4a result in the ACTIVATION's dtype, not an unconditional
+            # fp16. A bf16-native model (Gemma has documented ~1e4-1e7 "massive
+            # activation" channels) feeds bf16 here; forcing the GEMM output to fp16
+            # silently truncates fp16's 65504 range and overflows those channels to
+            # inf -> NaN (the comfy #115 footgun). bf16 shares fp32's exponent, so an
+            # out_dtype matched to x keeps the whole residual stream finite. The dp4a
+            # kernel only stores fp16/bf16, so fall back to fp16 for any other x dtype.
+            out_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.float16
+            return fni8.linear(x, self.weight, bias=self.bias, out_dtype=out_dtype)  # dp4a
         w = _dequant_weight(self.weight).to(x.dtype)   # SLOW fp16 fallback (NF4 / CPU)
         return torch.nn.functional.linear(x, w, self.bias)
