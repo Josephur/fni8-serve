@@ -248,25 +248,23 @@ class EngineRunner:
 
         * an MTP head exists and every sequence is greedy (temp 0) — the
           accept-longest-greedy-prefix rule is only bit-identical to plain greedy;
-        * the model has NO recurrent layers. The multi-token verify forward advances
-          DeltaNet / lightning / short-conv recurrent state by EVERY drafted token,
-          but only the accepted prefix should count, and the paged-KV canonicalizer
-          can't roll back a running scan (it's position-addressed, the recurrence is
-          not). Verify also isn't wired through the gated / linear mixers at all
-          (``GatedGQAAttention``/``GatedDeltaNetAttention`` ignore ``is_verify`` and
-          the M=1 paged-decode kernel asserts on the S=k+1 verify tensor). So on a
-          hybrid family (Qwen3.5, Qwen3-Next, MiniMax) spec-decode is UNSAFE — fall
-          back to plain decode until a recurrent-aware verify path exists;
         * NO sequence carries an image (``pixel_values``). MTP×vision is the exact
-          interaction that broke in llama.cpp; the vision families here are also the
-          recurrent ones, so this is belt-and-suspenders — a text-only spec path must
-          never run the verify forward over spliced image embeds / image positions.
+          interaction that broke in llama.cpp — a text-only spec path must never run
+          the verify forward over spliced image embeds / image positions.
+
+        Recurrent (DeltaNet / lightning / short-conv) hybrids are NOW SUPPORTED. The
+        multi-token verify forward still advances the recurrent state by every drafted
+        token, but ``_spec_decode_eager`` snapshots the post-base per-slot state, runs
+        verify from it, restores the snapshot, and replays only the accepted tokens
+        through the normal decode path (``_canonicalize_accepted_kv``) to reach the
+        correct committed state — the recurrent analogue of the paged-KV accepted-token
+        canonicalizer. The gated/linear mixers are wired through the verify path too
+        (``GatedGQAAttention``/``GQAAttention._verify_batched``), so the M=1 paged
+        assert no longer fires on the S=k+1 verify tensor.
         """
         if mtp is None:
             return False
         if not all(s.params.temperature == 0.0 for s in batch):
-            return False
-        if self.has_recurrent:
             return False
         if any(s.pixel_values is not None for s in batch):
             return False
@@ -352,7 +350,24 @@ class EngineRunner:
             slot_lengths=[n + 1 for n in lengths],
             verify_slot_mapping=verify_slot_mapping,
         )
+        # Recurrent-state rollback (the DeltaNet / lightning / short-conv analogue of
+        # the paged-KV accepted-token canonicalizer). The base forward above already
+        # advanced each recurrent layer's per-slot state by exactly one token (the
+        # last committed token) — the correct committed state when n_acc == 1. The
+        # verify forward is about to run the S = k+1 draft tokens through the SAME
+        # recurrence, mutating that per-slot state by every DRAFTED token (accepted or
+        # not). Snapshot the post-base state, let verify run (it needs the correct
+        # state to produce correct verify logits — so we DON'T zero it), then restore
+        # the snapshot. The accepted tokens' state is re-committed below by the exact
+        # same ``_canonicalize_accepted_kv`` replay that fixes the full-attn K/V: it
+        # re-runs accepted[0..n_acc-2] through the normal decode path, which advances
+        # each recurrent layer's state one accepted token per round — reaching the
+        # correct committed state (0..length-1) with zero extra machinery. For
+        # n_acc == 1 the restored post-base state is already correct (no replay runs).
+        lin_snapshot = self.lin_cache.snapshot() if self.has_recurrent else None
         hidden_v = self.model(verify_ids, verify_pos, v_ctx)
+        if lin_snapshot is not None:
+            self.lin_cache.restore(lin_snapshot)
         logits_v = self.model.compute_logits(hidden_v)  # [B, S, vocab]
         true_tokens = logits_v.argmax(-1)  # [B, S] — true greedy at each verify slot
 

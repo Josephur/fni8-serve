@@ -536,3 +536,157 @@ def test_mtp_spec_decode_bit_identical_greedy_concurrent():
             f"seq {i}: spec-decode NOT bit-identical to non-spec greedy:\n"
             f"  spec={spec}\n   ref={ref}"
         )
+
+
+# ── MTP spec-decode on the Gated-DeltaNet HYBRID (Qwen3.5) ────────────────
+# The hard case the guard used to forbid: the multi-token verify forward mutates
+# the DeltaNet recurrent state by every drafted token, but only the accepted prefix
+# may commit. The runner snapshots the post-base recurrent state, runs verify from
+# it, restores the snapshot, then replays only the accepted tokens (through the
+# normal decode path) to reach the correct committed state — the recurrent analogue
+# of the paged-KV accepted-token canonicalizer. These tests lock BOTH the gated-attn
+# verify wiring (GatedGQAAttention.is_verify branch) and the recurrent rollback.
+
+
+def _cfg_mtp_hybrid():
+    """A Qwen3.5-shaped hybrid: gated full attention (attn_output_gate) + Gated
+    DeltaNet linear layers + a dense SwiGLU MLP + a single-depth MTP head. head_dim
+    256 mirrors the real 0.8B AND routes the gated verify through the fp16-PV
+    `attn_int8_fwd` fallback (the int8 verify kernel is head-dim {32,64,128} only)."""
+    x = dict(
+        linear_num_key_heads=2, linear_num_value_heads=4,
+        linear_key_head_dim=32, linear_value_head_dim=32, linear_conv_kernel_dim=4,
+    )
+    return ModelConfig(
+        arch="qwen3_5", vocab_size=256, hidden_size=128, num_hidden_layers=3,
+        num_attention_heads=2, num_key_value_heads=1, intermediate_size=256,
+        max_position_embeddings=256, head_dim=256, qk_norm=True,
+        tie_word_embeddings=True, num_mtp_layers=1, linear_attention=True,
+        full_attention_interval=2, extra=x,
+    )
+
+
+def _sd_mtp_hybrid(cfg):
+    def r(*s):
+        return torch.randn(*s, device="cuda", dtype=torch.float16) * 0.5
+
+    H = cfg.hidden_size
+    hd, nh, nkv = cfg.resolved_head_dim(), cfg.num_attention_heads, cfg.num_key_value_heads
+    x = cfg.extra
+    nk, nv = x["linear_num_key_heads"], x["linear_num_value_heads"]
+    kd, vd, ck = x["linear_key_head_dim"], x["linear_value_head_dim"], x["linear_conv_kernel_dim"]
+    qkv_lin = 2 * nk * kd + nv * vd
+
+    def gated_full(p):
+        # gated full-attn layer: fused query|gate q_proj is [2*nh*hd, H].
+        return {
+            f"{p}.self_attn.q_proj.weight": r(2 * nh * hd, H),
+            f"{p}.self_attn.k_proj.weight": r(nkv * hd, H),
+            f"{p}.self_attn.v_proj.weight": r(nkv * hd, H),
+            f"{p}.self_attn.o_proj.weight": r(H, nh * hd),
+            f"{p}.self_attn.q_norm.weight": r(hd),
+            f"{p}.self_attn.k_norm.weight": r(hd),
+            f"{p}.input_layernorm.weight": r(H),
+            f"{p}.post_attention_layernorm.weight": r(H),
+            f"{p}.mlp.gate_proj.weight": r(cfg.intermediate_size, H),
+            f"{p}.mlp.up_proj.weight": r(cfg.intermediate_size, H),
+            f"{p}.mlp.down_proj.weight": r(H, cfg.intermediate_size),
+        }
+
+    sd = {"model.embed_tokens.weight": r(cfg.vocab_size, H), "model.norm.weight": r(H)}
+    for i in range(cfg.num_hidden_layers):
+        p = f"model.layers.{i}"
+        if cfg.attention_kind(i) == "full":
+            sd.update(gated_full(p))
+        else:  # linear (DeltaNet)
+            la = f"{p}.linear_attn"
+            sd[f"{la}.qkv_proj.weight"] = r(qkv_lin, H)
+            sd[f"{la}.out_proj.weight"] = r(H, nv * vd)
+            sd[f"{la}.conv_weight"] = r(qkv_lin, ck)
+            sd[f"{la}.A_log"] = r(nv).float()
+            sd[f"{la}.dt_bias"] = r(nv).float()
+            sd[f"{la}.beta_proj.weight"] = r(nv, H)
+            sd[f"{la}.dt_proj.weight"] = r(nv, H)
+            sd[f"{la}.z_proj.weight"] = r(nv * vd, H)
+            sd[f"{la}.norm.weight"] = r(vd)
+            sd[f"{p}.input_layernorm.weight"] = r(H)
+            sd[f"{p}.post_attention_layernorm.weight"] = r(H)
+            sd[f"{p}.mlp.gate_proj.weight"] = r(cfg.intermediate_size, H)
+            sd[f"{p}.mlp.up_proj.weight"] = r(cfg.intermediate_size, H)
+            sd[f"{p}.mlp.down_proj.weight"] = r(H, cfg.intermediate_size)
+    # Single-depth MTP head (root `mtp.*`, the shipped 0.8B layout): shared fc +
+    # two pre-fc norms + a gated-full-attn decoder block + its own final norm.
+    sd["mtp.fc.weight"] = r(H, 2 * H)
+    sd["mtp.pre_fc_norm_hidden.weight"] = r(H)
+    sd["mtp.pre_fc_norm_embedding.weight"] = r(H)
+    sd["mtp.norm.weight"] = r(H)
+    sd.update(gated_full("mtp.layers.0"))
+    return sd
+
+
+def _drop_mtp(sd):
+    """Non-spec reference sd: strip the MTP head so the engine can't build one
+    (the qwen3_5 builder recovers depth from the WEIGHTS, so cfg alone can't
+    disable it)."""
+    return {k: v for k, v in sd.items() if not k.startswith("mtp.")}
+
+
+def test_mtp_spec_decode_hybrid_bit_identical_greedy():
+    """The load-bearing gate for the DeltaNet hybrid: forced-full-acceptance greedy
+    spec-decode MUST be bit-identical to plain greedy. Exercises the gated-attn
+    verify path AND the recurrent-state snapshot/restore/replay across several
+    committed tokens per step (n_acc >= 2)."""
+    torch.manual_seed(0)
+    cfg = _cfg_mtp_hybrid()
+    sd = _sd_mtp_hybrid(cfg)
+    prompt = [3, 1, 4, 1, 5, 9, 2, 6]
+    params = SamplingParams(temperature=0.0, max_tokens=20)
+
+    eng_ref = LLMEngine(cfg, _drop_mtp(sd), device="cuda", max_num_seqs=2, max_len=64,
+                        enable_cuda_graph=False)
+    assert eng_ref.model.mtp is None
+    out_ref = eng_ref.generate([prompt], params)[0]
+
+    eng_spec = LLMEngine(cfg, sd, device="cuda", max_num_seqs=2, max_len=64,
+                         enable_cuda_graph=False)
+    assert eng_spec.model.mtp is not None
+    naccs = _force_full_acceptance(eng_spec, {tuple(prompt): (len(prompt), out_ref)})
+    out_spec = eng_spec.generate([prompt], params)[0]
+
+    assert max(naccs) >= 2, (
+        f"forced draft never accepted on the hybrid (n_acc stayed 1: {naccs}) — the "
+        f"gated verify logits are wrong (double o_proj / bad gate / recurrent-state leak)"
+    )
+    assert out_spec == out_ref, (
+        f"hybrid spec-decode NOT bit-identical to non-spec greedy:\n  spec={out_spec}\n"
+        f"   ref={out_ref}\n  (DeltaNet recurrent state not rolled back / replayed "
+        f"correctly, or accepted-token K/V not committed)"
+    )
+
+
+def test_mtp_spec_decode_hybrid_bit_identical_concurrent():
+    """Same hybrid bit-identity contract with THREE ragged sequences decoded
+    concurrently — the recurrent snapshot/restore/replay must be correct per slot,
+    not just for a single sequence."""
+    torch.manual_seed(0)
+    cfg = _cfg_mtp_hybrid()
+    sd = _sd_mtp_hybrid(cfg)
+    prompts = [[3, 1, 4, 1, 5, 9, 2, 6], [7, 2, 7, 1, 8], [1, 6, 1, 8, 0, 3]]
+    params = SamplingParams(temperature=0.0, max_tokens=16)
+
+    eng_ref = LLMEngine(cfg, _drop_mtp(sd), device="cuda", max_num_seqs=4, max_len=64,
+                        enable_cuda_graph=False)
+    refs = eng_ref.generate(prompts, params)
+
+    eng_spec = LLMEngine(cfg, sd, device="cuda", max_num_seqs=4, max_len=64,
+                         enable_cuda_graph=False)
+    ref_by_prompt = {tuple(p): (len(p), r) for p, r in zip(prompts, refs)}
+    naccs = _force_full_acceptance(eng_spec, ref_by_prompt)
+    outs = eng_spec.generate(prompts, params)
+
+    assert max(naccs) >= 2, f"forced draft never accepted in the hybrid concurrent batch: {naccs}"
+    for i, (spec, ref) in enumerate(zip(outs, refs)):
+        assert spec == ref, (
+            f"hybrid seq {i}: spec-decode NOT bit-identical to non-spec greedy:\n"
+            f"  spec={spec}\n   ref={ref}"
+        )

@@ -180,6 +180,45 @@ class RecurrentStateCache:
             return self._sset(self._conv_buf, layer_idx, tail)
         self._scatter(self._conv_tail, layer_idx, tail)
 
+    def snapshot(self) -> dict:
+        """Deep-copy every layer's recurrent state + conv tail for the CURRENTLY
+        BOUND slots (``bind(slots)`` must have been called). Returns an opaque token
+        for :meth:`restore`.
+
+        This is the recurrent analogue of the paged-KV accepted-token canonicalizer
+        (#235): speculative decode's verify forward advances DeltaNet / lightning /
+        short-conv state by EVERY drafted token, but only the accepted prefix may
+        commit. The runner snapshots the post-base-forward state, lets verify run,
+        then restores this snapshot and replays only the accepted tokens (through the
+        normal decode path) to reach the correct committed state. The clone is
+        essential — ``get_state`` may return a view into the live buffer/dict, so a
+        bare reference would alias the very state verify is about to overwrite."""
+        snap: dict = {"state": {}, "conv": {}}
+        if self._static:
+            slots = self._active()
+            for lidx, t in self._state_buf.items():
+                snap["state"][lidx] = t[slots].clone()
+            for lidx, t in self._conv_buf.items():
+                snap["conv"][lidx] = t[slots].clone()
+        else:
+            for lidx in {k[1] for k in self._state}:
+                g = self._gather(self._state, lidx)
+                if g is not None:
+                    snap["state"][lidx] = g.clone()
+            for lidx in {k[1] for k in self._conv_tail}:
+                g = self._gather(self._conv_tail, lidx)
+                if g is not None:
+                    snap["conv"][lidx] = g.clone()
+        return snap
+
+    def restore(self, snap: dict) -> None:
+        """Scatter a :meth:`snapshot` back onto the currently-bound slots, discarding
+        any state mutation made since it was taken (the verify forward's)."""
+        for lidx, v in snap["state"].items():
+            self.set_state(lidx, v)
+        for lidx, v in snap["conv"].items():
+            self.set_conv_tail(lidx, v)
+
     def reset(self):
         self._state.clear()
         self._conv_tail.clear()

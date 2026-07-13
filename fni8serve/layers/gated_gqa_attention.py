@@ -155,6 +155,21 @@ class GatedGQAAttention(nn.Module):
             out = out.transpose(1, 2)  # [B,H,S,D] -> [B,S,H,D]
             return self._gate_and_project(out, gate, B, S)
 
+        if getattr(ctx, "is_verify", False):
+            # Spec-decode verify (S = 1 + num_drafts tokens per row). Reuse the shared
+            # ``GQAAttention._verify_batched`` as an unbound method exactly like the
+            # decode path below borrows ``_decode_batched`` — it only touches
+            # attributes both blocks share (``scale``) and ``ctx``/``cache``, and runs
+            # on the QUERY half (``q``); the GATE is held aside and applied after. It
+            # returns RAW ``[B, H, S, D]`` (heads not merged, no o_proj); transpose to
+            # token-major ``[B, S, nh, hd]`` so the SAME ``_gate_and_project`` the
+            # standalone/decode paths use applies the sigmoid output gate PER verify
+            # token before the single o_proj. Committing every verify token's K/V
+            # (accepted-token KV, #235) is done inside ``_verify_batched``.
+            out = GQAAttention._verify_batched(self, q, k, v, ctx, layer_idx)
+            out = out.transpose(1, 2)  # [B,H,S,D] -> [B,S,nh,hd]
+            return self._gate_and_project(out, gate, B, S)
+
         if ctx.slot_lengths is not None or ctx.slot_mapping is not None:
             # Engine paged/continuous-batch decode. Reuse the shared batched-decode
             # kernels verbatim (paged int8 write + one `attn_paged_decode_cached`

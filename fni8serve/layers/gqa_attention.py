@@ -262,6 +262,32 @@ class GQAAttention(nn.Module):
             v_flat = v_t.permute(0, 2, 1, 3).reshape(B * S, Hkv, D)
             cache.write_decode_static(layer_idx, ctx.verify_slot_mapping, k_flat, v_flat)
 
+        # The dedicated int8 verify kernel (`attn_int8_verify`, int8 dp4a PV) only
+        # supports head dim in {32, 64, 128}. Qwen3.5's gated attention runs head
+        # dim 256, so route those through the fp16-PV `attn_int8_fwd` path instead
+        # (D in {32,64,72,80,128,256}) via the same causal zero-pad-Q trick the
+        # chunked-prefill path uses: read the dequantized prefix, append this
+        # forward's K/V, place the S verify queries at the sequence END, and take
+        # the last S outputs. Correctness (not the exact bytes) is what verify
+        # needs — the accepted tokens' K/V is re-committed canonically afterward.
+        D = q_t.shape[-1]
+        S = q_t.shape[2]
+        if D not in (32, 64, 128):
+            outs = []
+            for b in range(B):
+                prefix_len = ctx.slot_lengths[b]
+                kb, vb = cache.read_dense(layer_idx, ctx.slots[b], prefix_len)  # [1,Hkv,P,D]
+                k_all = torch.cat([kb, k_t[b:b + 1]], dim=2)  # [1,Hkv,P+S,D]
+                v_all = torch.cat([vb, v_t[b:b + 1]], dim=2)
+                total = prefix_len + S
+                q_pad = k_all.new_zeros(1, q_t.shape[1], total, D)
+                q_pad[:, :, -S:, :] = q_t[b:b + 1]  # actual queries at the end
+                out_b = fni8.attn_int8_fwd(
+                    q_pad, k_all, v_all, causal=True, scale=self.scale,
+                )
+                outs.append(out_b[:, :, -S:, :])  # [1,Hq,S,D]
+            return torch.cat(outs, dim=0)  # [B, H, S, D]
+
         # Per-sequence verify attention to avoid zero-padding corruption in
         # ragged batches.  build_verify_cache pads every row to max_prefix with
         # zeros, but attn_int8_verify receives no per-row prefix-length mask, so

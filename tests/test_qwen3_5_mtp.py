@@ -2,15 +2,16 @@
 """Qwen3.5 MTP speculative-decode: head wiring + the safety guard.
 
 Two tiers:
-  * CPU-only: the `EngineRunner._spec_decode_allowed` guard predicate. This is the
-    load-bearing safety contract — spec-decode MUST be refused for a hybrid
-    (recurrent DeltaNet) model and for any image-carrying batch, because the
-    multi-token verify forward is unimplemented for the gated/linear mixers and
-    would corrupt DeltaNet recurrent state (and mixing it with vision is the exact
-    interaction that broke in llama.cpp).
+  * CPU-only: the `EngineRunner._spec_decode_allowed` guard predicate. Spec-decode
+    is now SUPPORTED for the recurrent DeltaNet hybrid (greedy, text-only): the
+    verify path is wired through the gated/linear mixers and the runner snapshots +
+    replays the recurrent state so only accepted tokens commit. The guard still
+    refuses non-greedy sampling, a missing head, and — the load-bearing safety
+    contract — ANY image-carrying batch (MTP×vision is the exact interaction that
+    broke in llama.cpp).
   * GPU + checkpoint (skipped otherwise): the real Qwen3.5-0.8B `.fni8` — the MTP
-    head is wired and present, guarded text decode equals plain decode, and an
-    image request stays correct (red -> "red") with the MTP head present.
+    head is wired and present, spec-decode text decode is bit-identical to plain
+    decode, and an image request stays correct (red -> "red") with the head present.
 """
 
 from __future__ import annotations
@@ -44,7 +45,8 @@ class _RecurrentInner(nn.Module):
 
 
 class _HybridModel(nn.Module):
-    """A model carrying a recurrent (DeltaNet-style) mixer — spec-decode unsafe."""
+    """A model carrying a recurrent (DeltaNet-style) mixer — spec-decode is now
+    supported via the runner's recurrent-state snapshot/restore/replay."""
 
     def __init__(self):
         super().__init__()
@@ -81,12 +83,23 @@ def test_guard_refuses_nonzero_temperature():
     assert r._spec_decode_allowed([_seq(temperature=0.7)], _MTP) is False
 
 
-def test_guard_refuses_recurrent_hybrid_model():
-    """Qwen3.5 is a DeltaNet+gated hybrid: the verify forward advances recurrent
-    state by every drafted token with no rollback, so spec-decode must be refused."""
+def test_guard_allows_recurrent_hybrid_model():
+    """Qwen3.5 is a DeltaNet+gated hybrid. The verify forward still advances
+    recurrent state by every drafted token, but the runner now snapshots the
+    post-base state, runs verify from it, restores the snapshot, and replays only
+    the accepted tokens — so greedy text spec-decode is SUPPORTED (was refused
+    before the recurrent-aware verify path existed)."""
     r = _runner(_HybridModel())
     assert r.has_recurrent is True
-    assert r._spec_decode_allowed([_seq()], _MTP) is False
+    assert r._spec_decode_allowed([_seq()], _MTP) is True
+
+
+def test_guard_refuses_recurrent_hybrid_with_image():
+    """The recurrent hybrid IS allowed for text, but an image on any row still
+    disables spec-decode (the MTP×vision guard is independent of recurrence)."""
+    r = _runner(_HybridModel())
+    img = torch.zeros(1, 3, 16, 16)
+    assert r._spec_decode_allowed([_seq(pixel_values=img)], _MTP) is False
 
 
 def test_guard_refuses_image_batch():
@@ -135,15 +148,18 @@ def test_mtp_head_present(qwen35_vl_engine):
     mtp = getattr(eng.runner.model, "mtp", None)
     assert mtp is not None
     assert mtp.num_depths() == 1
-    # This is a hybrid model, so the guard must keep spec-decode OFF.
+    # A hybrid model — spec-decode is now ENGAGED for greedy text (the guard allows
+    # it; the runner rolls back / replays the recurrent state).
     assert eng.runner.has_recurrent is True
+    greedy_text = Sequence(0, [1, 2, 3], SamplingParams(temperature=0.0, max_tokens=8))
+    assert eng.runner._spec_decode_allowed([greedy_text], mtp) is True
 
 
 @gpu_ckpt
-def test_spec_decode_guarded_equals_plain_decode(qwen35_vl_engine):
-    """With the MTP head present but guarded off (hybrid), greedy decode must be
-    bit-identical to decode with the head removed — i.e. the guard truly falls back
-    to plain decode, never engaging the (unsafe) verify path."""
+def test_spec_decode_hybrid_bit_identical_to_plain(qwen35_vl_engine):
+    """With the MTP head present, greedy spec-decode ENGAGES on the hybrid and must
+    be bit-identical to decode with the head removed (plain autoregressive) — the
+    recurrent-state snapshot/replay + gated verify reproduce plain greedy EXACTLY."""
     from transformers import AutoTokenizer
 
     eng, _ = qwen35_vl_engine
