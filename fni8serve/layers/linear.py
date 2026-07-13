@@ -43,6 +43,16 @@ def _dequant_weight(qt: QTensor) -> torch.Tensor:
         out, in_ = vals.shape
         scale = qt.scale.reshape(out, in_ // g, 1)
         return (vals.reshape(out, in_ // g, g) * scale).reshape(out, in_).to(torch.float16)
+    if qt.scheme == "per_group_w3a8":
+        # Uniform 3-bit dp4a MLP (issue #181): int32 Q3_K-style bit-planes [out,(in/32)*3]
+        # -> int8 codes in [-4,3] -> per-group dequant. Fallback only (dp4a is the fast path).
+        from fni8.quant.lowbit import unpack_w3a8_bitplanes
+        in_ = (qt.data.shape[-1] // 3) * 32
+        codes = unpack_w3a8_bitplanes(qt.data, in_)                 # [out, in] int8 [-4,3]
+        g = qt.group_size
+        out = codes.shape[0]
+        scale = qt.scale.reshape(out, in_ // g, 1)
+        return (codes.float().reshape(out, in_ // g, g) * scale).reshape(out, in_).to(torch.float16)
     raise ValueError(f"LinearW8A8 cannot use scheme {qt.scheme!r}")
 
 
@@ -52,8 +62,13 @@ class LinearW8A8(nn.Module):
         self.weight = weight                       # QTensor (int8 or i4), resident dp4a layout
         self.bias = bias
         self.out_features = weight.data.shape[0]
-        # in_features: int8 -> data.shape[1]; i4 packs 2/byte
-        self.in_features = weight.data.shape[1] * (2 if weight.scheme == "per_group_i4" else 1)
+        # in_features: int8 -> data.shape[1]; i4 packs 2/byte; w3a8 packs 32 vals / 3 int32.
+        if weight.scheme == "per_group_i4":
+            self.in_features = weight.data.shape[1] * 2
+        elif weight.scheme == "per_group_w3a8":
+            self.in_features = (weight.data.shape[1] // 3) * 32
+        else:
+            self.in_features = weight.data.shape[1]
 
     def _dp4a_ok(self, x: torch.Tensor) -> bool:
         """dp4a GEMM is CUDA-only and cannot consume NF4 (non-integer codebook)."""
@@ -62,6 +77,8 @@ class LinearW8A8(nn.Module):
         qt = self.weight
         if qt.scheme == "per_row_i8":
             return True
+        if qt.scheme == "per_group_w3a8":
+            return True                              # uniform 3-bit dp4a (issue #181)
         return qt.scheme == "per_group_i4" and qt.codebook == "int4"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

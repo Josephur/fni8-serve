@@ -79,6 +79,37 @@ def quantize_weight_i4(w: torch.Tensor, group_size: int) -> QTensor:
     )
 
 
+def quantize_weight_w3a8(w: torch.Tensor, group_size: int) -> QTensor:
+    """Uniform 3-bit dp4a WEIGHTS (`per_group_w3a8`, issue #181): full asymmetric
+    [-4,3] range, per-group absmax/4 scale, Q3_K-style bit-planes -> int32
+    [O,(I//32)*3] (3.0 bit/wt). The `gemm_decode_w3a8` kernel unpacks each 32-value
+    group -> int8 and dp4a's it at decode PARITY with int4 (not faster) while storing
+    0.75x the bytes — a VRAM / context / batch lever (frees KV context / batch slots
+    before OOM). `group_size` must be a multiple of 32. Lossier than int4 by design,
+    so it is opt-in and only for the MLP gate/up; down_proj keeps its base precision."""
+    from fni8.quant.lowbit import pack_w3a8_bitplanes, quantize_w3a8
+
+    codes, scale = quantize_w3a8(w, group_size=group_size)          # [O,I] int8, [O,I//g]
+    return QTensor(
+        pack_w3a8_bitplanes(codes).contiguous(),                   # int32 [O,(I//32)*3]
+        scale.float().contiguous(),
+        scheme="per_group_w3a8",
+        group_size=group_size,
+        codebook="w3a8",
+    )
+
+
+# MLP gate/up projections — the bulk of the streamed decode weights. The 3-bit MLP
+# lever quantizes ONLY these (early layers); down_proj + late layers keep the base
+# precision (int4/int8) for quality, per the imatrix map (utils/docs).
+_MLP_GATE_UP_SUFFIX = (".gate_proj.weight", ".up_proj.weight",
+                       ".linear_fc1.weight", ".w1.weight", ".w3.weight")
+
+
+def _is_mlp_gate_up(name: str) -> bool:
+    return name.endswith(_MLP_GATE_UP_SUFFIX) and is_quantizable_linear(name)
+
+
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_inv", ".input_scale")
 
 
@@ -87,6 +118,7 @@ def quantize_state_dict(
     *,
     weight_bits: int = 8,
     group_size: int = 128,
+    mlp_gate_up_3bit: bool = False,
     fp8_scales: dict | None = None,
     fp8_block_size: list | None = None,
     fp8_scale_fmt: str | None = None,
@@ -127,7 +159,13 @@ def quantize_state_dict(
                 w = dequantize_fp8(w, sc.detach().cpu(), block_size=fp8_block_size)
         if is_quantizable_linear(name) and w.dim() == 2 and w.shape[-1] % 4 == 0:
             wf = w.float()  # quantize from full precision
-            if weight_bits == 4 and w.shape[-1] % group_size == 0:
+            grouped = w.shape[-1] % group_size == 0
+            # Opt-in issue #181 VRAM lever: MLP gate/up -> uniform 3-bit dp4a
+            # (decode-parity, 0.75x int4 bytes). down_proj + everything else keep
+            # the base precision for quality (per the imatrix mixed-precision map).
+            if mlp_gate_up_3bit and grouped and _is_mlp_gate_up(name):
+                out[name] = quantize_weight_w3a8(wf, group_size)
+            elif weight_bits == 4 and grouped:
                 out[name] = quantize_weight_i4(wf, group_size)
             else:
                 out[name] = quantize_weight_i8(wf)
