@@ -25,6 +25,10 @@ from .linear import LinearW8A8
 from .norm import RMSNorm
 from .rotary import RotaryEmbedding
 
+# NOTE: spec-decode verify attention (``_verify_batched``) no longer uses a dedicated
+# int8 verify kernel — it runs the verify tokens through the SAME paged-decode kernel
+# plain decode uses (bit-identical, head_dim 256 included). No probe / dim gate needed.
+
 
 class GQAAttention(nn.Module):
     def __init__(
@@ -224,102 +228,70 @@ class GQAAttention(nn.Module):
         return (attn @ v).transpose(1, 2).reshape(bs, S, H * D)
 
     def _verify_batched(self, q, k, v, ctx, layer_idx):
-        """Spec-decode verify: S = 1 + num_drafts tokens per batch row. Reads
-        prefix K/V from paged cache, prepends prefix to the current forward's
-        K/V (base + drafts), builds a contiguous int8 cache, and calls
-        ``fni8.attn_int8_verify`` — once for the base token (prefix + itself)
-        and once for the k drafts (prefix + base + preceding drafts).
+        """Spec-decode verify: S = 1 + num_drafts tokens per batch row, attention
+        computed BIT-IDENTICALLY to plain paged decode.
 
-        Also COMMITS every verify token's K/V to the paged store (at the
-        positions in ``ctx.verify_slot_mapping``). This is load-bearing: the
-        engine accepts the longest greedy-matching prefix and advances each
-        sequence's length by ``n_acc``, but only the base token gets its K/V
-        written by the preceding base decode forward. Without persisting the
-        verify tokens here, every INTERMEDIATE accepted token (the first
-        ``n_acc-1``) would leave a permanent hole in the paged cache and the
-        next step would read stale/uninitialised K/V. We write all S positions
-        unconditionally; positions past ``n_acc`` are never read (reads are
-        gated by each row's committed length / ``context_lens``) and are
-        overwritten by the next step, so writing the rejected tail is harmless.
+        The verify forward's GEMMs (qkv / o / mlp) run over all S tokens in ONE
+        weight-read — that is the whole point (one weight-stream amortized over the
+        accepted tokens). Only the ATTENTION must match decode exactly, and it does
+        here: we walk the S verify tokens in causal order, writing each token's K/V to
+        the paged int8 store and reading it back through the SAME
+        ``attn_paged_decode_cached`` kernel plain decode uses. So verify token ``t``
+        attends the committed prefix plus verify tokens ``0..t`` exactly as ``t`` back-
+        to-back decode steps would — every committed token's logits/K/V are then
+        byte-identical to non-spec greedy (no separate verify kernel, no re-decode /
+        canonicalization, no dequant→requant of the prefix). ``attn_paged_decode_cached``
+        already supports head_dim 256, so this needs no dedicated int8 verify kernel.
 
-        Returns the RAW attention output ``[B, H, S, D]`` (heads not merged, no
-        ``o_proj``). The shared forward tail merges heads and applies ``o_proj``
-        exactly once — returning an already-projected tensor here would apply
-        ``o_proj`` twice and scramble the verify logits.
+        Writing all S positions (including the rejected tail past ``n_acc``) is
+        harmless: those positions are never read (reads gate on each row's committed
+        length) and are overwritten by the next step.
+
+        Sliding-window layers (``window_left >= 0``) keep the dequantized-read fallback
+        below — the paged-decode kernel has no window parameter.
+
+        Returns RAW ``[B, H, S, D]`` (heads not merged, no ``o_proj``); the forward
+        tail merges heads and applies ``o_proj`` exactly once.
         """
-        n_drafts = q.shape[1] - 1
         cache = ctx.kv_cache
+        B, S = q.shape[0], q.shape[1]
+        vsm = ctx.verify_slot_mapping.view(B, S)  # [B, S] paged slot per (row, verify pos)
+        slots = ctx.slots
+        prefix = ctx.slot_lengths  # committed prefix length per row (positions 0..L)
+
+        if self.window_left < 0:
+            outs = []  # per t: [B, H, 1, D]
+            for t in range(S):
+                # 1) commit verify token t's K/V at its paged slot (== a decode write).
+                cache.write_decode_static(
+                    layer_idx, vsm[:, t].contiguous(), k[:, t], v[:, t]
+                )
+                # 2) attend query t over prefix + verify tokens 0..t (context length
+                #    prefix + t + 1); write position = prefix + t, exactly as the t-th
+                #    consecutive decode step would see it.
+                lengths_t = [p + t for p in prefix]
+                q_t = q[:, t : t + 1].transpose(1, 2)  # [B,1,H,D] -> [B,H,1,D]
+                outs.append(cache.decode_attn(layer_idx, q_t, slots, lengths_t, scale=self.scale))
+            return torch.cat(outs, dim=2)  # [B, H, S, D]
+
+        # Sliding-window fallback: dequantized read + causal zero-pad-Q attn_int8_fwd
+        # per row (attn_paged_decode_cached has no window param). Commit K/V first.
         k_t = k.transpose(1, 2).contiguous()  # [B, Hkv, S, D]
-        v_t = v.transpose(1, 2).contiguous()  # [B, Hkv, S, D]
+        v_t = v.transpose(1, 2).contiguous()
         q_t = q.transpose(1, 2).contiguous()  # [B, H, S, D]
-
-        B = k_t.shape[0]
-
-        # Commit every verify token's K/V to the paged store (accepted-token KV).
-        if ctx.verify_slot_mapping is not None:
-            Hkv, S, D = k_t.shape[1:]
-            k_flat = k_t.permute(0, 2, 1, 3).reshape(B * S, Hkv, D)  # token-major
-            v_flat = v_t.permute(0, 2, 1, 3).reshape(B * S, Hkv, D)
-            cache.write_decode_static(layer_idx, ctx.verify_slot_mapping, k_flat, v_flat)
-
-        # The dedicated int8 verify kernel (`attn_int8_verify`, int8 dp4a PV) only
-        # supports head dim in {32, 64, 128}. Qwen3.5's gated attention runs head
-        # dim 256, so route those through the fp16-PV `attn_int8_fwd` path instead
-        # (D in {32,64,72,80,128,256}) via the same causal zero-pad-Q trick the
-        # chunked-prefill path uses: read the dequantized prefix, append this
-        # forward's K/V, place the S verify queries at the sequence END, and take
-        # the last S outputs. Correctness (not the exact bytes) is what verify
-        # needs — the accepted tokens' K/V is re-committed canonically afterward.
         D = q_t.shape[-1]
-        S = q_t.shape[2]
-        if D not in (32, 64, 128):
-            outs = []
-            for b in range(B):
-                prefix_len = ctx.slot_lengths[b]
-                kb, vb = cache.read_dense(layer_idx, ctx.slots[b], prefix_len)  # [1,Hkv,P,D]
-                k_all = torch.cat([kb, k_t[b:b + 1]], dim=2)  # [1,Hkv,P+S,D]
-                v_all = torch.cat([vb, v_t[b:b + 1]], dim=2)
-                total = prefix_len + S
-                q_pad = k_all.new_zeros(1, q_t.shape[1], total, D)
-                q_pad[:, :, -S:, :] = q_t[b:b + 1]  # actual queries at the end
-                out_b = fni8.attn_int8_fwd(
-                    q_pad, k_all, v_all, causal=True, scale=self.scale,
-                )
-                outs.append(out_b[:, :, -S:, :])  # [1,Hq,S,D]
-            return torch.cat(outs, dim=0)  # [B, H, S, D]
-
-        # Per-sequence verify attention to avoid zero-padding corruption in
-        # ragged batches.  build_verify_cache pads every row to max_prefix with
-        # zeros, but attn_int8_verify receives no per-row prefix-length mask, so
-        # the zero entries leak into the softmax and corrupt attention for every
-        # row whose prefix is shorter than the maximum.  Processing rows one at a
-        # time guarantees pad_sz == 0 for every row (max_prefix == prefix_len).
-        out_base_list, out_drafts_list = [], []
+        Hkv = k_t.shape[1]
+        k_flat = k_t.permute(0, 2, 1, 3).reshape(B * S, Hkv, D)
+        v_flat = v_t.permute(0, 2, 1, 3).reshape(B * S, Hkv, D)
+        cache.write_decode_static(layer_idx, ctx.verify_slot_mapping, k_flat, v_flat)
+        outs = []
         for b in range(B):
-            k_b, ks_b, v_b, vs_b = cache.build_verify_cache(
-                layer_idx, [ctx.slots[b]], [ctx.slot_lengths[b]],
-                k_t[b:b + 1, :, :1], v_t[b:b + 1, :, :1],
-            )
-            out_base_list.append(
-                fni8.attn_int8_verify(
-                    q_t[b:b + 1, :, :1], k_b, ks_b, v_b, vs_b, scale=self.scale,
-                )
-            )
-            if n_drafts > 0:
-                k_d, ks_d, v_d, vs_d = cache.build_verify_cache(
-                    layer_idx, [ctx.slots[b]], [ctx.slot_lengths[b]],
-                    k_t[b:b + 1], v_t[b:b + 1],
-                )
-                out_drafts_list.append(
-                    fni8.attn_int8_verify(
-                        q_t[b:b + 1, :, 1:], k_d, ks_d, v_d, vs_d, scale=self.scale,
-                    )
-                )
-        out_base = torch.cat(out_base_list, dim=0)
-        if n_drafts > 0:
-            out_drafts = torch.cat(out_drafts_list, dim=0)
-            out_t = torch.cat([out_base, out_drafts], dim=2)
-        else:
-            out_t = out_base
-
-        return out_t  # [B, H, S, D]; heads merged + o_proj'd once by the forward tail
+            kb, vb = cache.read_dense(layer_idx, slots[b], prefix[b], window=self.window_left)
+            k_all = torch.cat([kb, k_t[b:b + 1]], dim=2)
+            v_all = torch.cat([vb, v_t[b:b + 1]], dim=2)
+            total = k_all.shape[2]
+            q_pad = k_all.new_zeros(1, q_t.shape[1], total, D)
+            q_pad[:, :, -S:, :] = q_t[b:b + 1]
+            out_b = fni8.attn_int8_fwd(q_pad, k_all, v_all, causal=True, scale=self.scale)
+            outs.append(out_b[:, :, -S:, :])
+        return torch.cat(outs, dim=0)  # [B, H, S, D]

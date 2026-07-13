@@ -41,6 +41,15 @@ class Sequence:
     prefix_matched_len: int = 0  # length of shared prefix found (0 = none)
     pixel_values: torch.Tensor | None = None  # VLM: [1, 3, H, W] preprocessed image
     image_grid_thw: torch.Tensor | None = None  # VLM: [num_images, 3] patch grid (t, gh, gw)
+    # -- speculative-decode pipelining (spec loop, task 1c) -------------------
+    # Carried between spec steps so the base forward is skipped after a sequence's
+    # first spec step: `_spec_base_tok` = token@(length+1) (the first verify token),
+    # `_spec_base_hidden` = h_main@length [H] (the full-model hidden that predicted
+    # it). Both come from the PRIOR step's verify (true_tokens / hidden_v at the last
+    # accepted slot) — the pipelining that removes the redundant per-step base
+    # weight-stream. None until the first step establishes them (or after a preempt).
+    spec_base_tok: int | None = None
+    spec_base_hidden: "torch.Tensor | None" = None
 
     @property
     def num_prompt(self) -> int:

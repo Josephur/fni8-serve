@@ -37,12 +37,16 @@ def _l2norm(x: torch.Tensor) -> torch.Tensor:
     return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
-def recurrent_gated_delta_rule(q, k, v, beta, g, state=None):
+def recurrent_gated_delta_rule(q, k, v, beta, g, state=None, return_traj=False):
     """Gated delta rule, scalar form. q,k: [B,H,L,Dk] (pre-L2-normed), v: [B,H,L,Dv],
     beta: [B,H,L] in (0,1], g: [B,H,L] = log(alpha) (<=0). `state`: optional
     [B,H,Dv,Dk] fp32 initial S (carried in from a prior call for decode); defaults
     to zero (prefill / stateless). Returns (o [B,H,L,Dv], state_final [B,H,Dv,Dk])
-    so a caller can carry `S` across chunked/decode calls instead of losing it."""
+    so a caller can carry `S` across chunked/decode calls instead of losing it.
+
+    `return_traj` (spec-decode verify, task d): also return `state_traj`
+    [B,L,H,Dv,Dk] = the state S AFTER each token t, so the caller can commit the
+    state after any prefix length without re-running the recurrence."""
     B, H, L, Dk = q.shape
     Dv = v.shape[-1]
     S = (
@@ -53,6 +57,7 @@ def recurrent_gated_delta_rule(q, k, v, beta, g, state=None):
     alpha = g.exp().float()
     qf, kf, vf, bf = q.float(), k.float(), v.float(), beta.float()
     out = torch.empty(B, H, L, Dv, dtype=torch.float32, device=q.device)
+    traj = torch.empty(B, L, H, Dv, Dk, dtype=torch.float32, device=q.device) if return_traj else None
     for t in range(L):
         kt, vt, qt = kf[:, :, t], vf[:, :, t], qf[:, :, t]  # [B,H,D]
         at = alpha[:, :, t][..., None, None]  # [B,H,1,1]
@@ -62,6 +67,10 @@ def recurrent_gated_delta_rule(q, k, v, beta, g, state=None):
         write = (bt * vt)[..., None] * kt[..., None, :]
         S = at * S - erase + write
         out[:, :, t] = torch.einsum("bhvk,bhk->bhv", S, qt)  # o_t = S_t q_t
+        if return_traj:
+            traj[:, t] = S
+    if return_traj:
+        return out.to(v.dtype), S, traj
     return out.to(v.dtype), S
 
 
@@ -115,6 +124,7 @@ class GatedDeltaNetAttention(nn.Module):
     """
 
     is_recurrent = True  # carries per-slot decode state via ctx.lin_cache
+    spec_capture = True  # records verify-token state trajectory (runner task d)
 
     def __init__(
         self,
@@ -150,11 +160,15 @@ class GatedDeltaNetAttention(nn.Module):
         self.dt_bias = nn.Parameter(dt_bias)
         self.norm = RMSNorm(value_dim, cfg.rms_norm_eps, norm_gain)
 
-    def _conv(self, x, tail=None):
+    def _conv(self, x, tail=None, return_traj=False):
         """Causal depthwise conv1d(k) + SiLU. x: [B, L, Wc]. `tail`: optional
         [B, K-1, Wc] trailing raw (pre-conv) window from the previous call — carries
         decode history in instead of zero-padding, which would forget it every step.
-        Returns (activated [B, L, Wc], new_tail [B, K-1, Wc])."""
+        Returns (activated [B, L, Wc], new_tail [B, K-1, Wc]).
+
+        `return_traj` (spec-decode verify, task d): also return `tail_traj`
+        [B, L, K-1, Wc] = the conv tail AFTER each token t, so the caller can commit
+        the tail matching any accepted prefix length."""
         B, L, W = x.shape
         K = self.conv_kernel
         if tail is None:
@@ -163,17 +177,56 @@ class GatedDeltaNetAttention(nn.Module):
         # conv1d+SiLU kernel replaces cat/conv1d/slice/silu and is
         # CUDA-graph-capturable. Same math as the eager branch below (validated
         # bit-close, cos 1.0). Falls back to eager for prefill / CPU / older fni8.
-        if _DND_CONV and L == 1 and x.is_cuda and K <= 8:
+        if _DND_CONV and L == 1 and x.is_cuda and K <= 8 and not return_traj:
             out2d, new_tail = fni8.causal_conv1d_silu_decode(
                 x.reshape(B, W), self.conv_weight, tail
             )
             return out2d.reshape(B, 1, W), new_tail
         xt = torch.cat([tail, x], dim=1)  # [B,K-1+L,Wc]
         new_tail = xt[:, -(K - 1) :] if K > 1 else x.new_zeros(B, 0, W)
-        xt = F.conv1d(xt.transpose(1, 2), self.conv_weight.unsqueeze(1), groups=W)
-        return F.silu(xt.transpose(1, 2)), new_tail
+        y = F.silu(F.conv1d(xt.transpose(1, 2), self.conv_weight.unsqueeze(1), groups=W).transpose(1, 2))
+        if return_traj:
+            # tail AFTER token t = the K-1 raw inputs ending at t: xt[:, t+1 : t+K].
+            KM = K - 1
+            tail_traj = (
+                torch.stack([xt[:, t + 1 : t + 1 + KM] for t in range(L)], dim=1)
+                if KM > 0
+                else x.new_zeros(B, L, 0, W)
+            )  # [B, L, K-1, Wc]
+            return y, new_tail, tail_traj
+        return y, new_tail
 
     def forward(self, hidden, positions, ctx, layer_idx):
+        cache = ctx.lin_cache if ctx is not None else None
+        # Spec-decode verify (task d): to commit a recurrent state BYTE-IDENTICAL to
+        # plain decode, process the S verify tokens as S CONSECUTIVE L=1 decode steps
+        # — the exact same fused conv / recurrence / gated-norm kernels non-spec decode
+        # runs (the eager L>1 path is only bit-*close*, which flips tie-breaks on some
+        # wheels/GPUs). Snapshot the state + conv tail after each token so the runner
+        # can commit the state after any accepted prefix length with no re-decode. The
+        # batched attention layers still run once over [B,S]; only these recurrent
+        # layers loop (their projections are a small fraction of the model).
+        if cache is not None and getattr(cache, "capturing_verify", False):
+            B, L, _ = hidden.shape
+            outs, st_traj, tl_traj = [], [], []
+            cache._vcap = False  # the per-token _run calls are ordinary L=1 decode steps
+            try:
+                for t in range(L):
+                    pos_t = positions[:, t : t + 1] if getattr(positions, "dim", lambda: 0)() == 2 else positions
+                    outs.append(self._run(hidden[:, t : t + 1], pos_t, ctx, layer_idx))
+                    st_traj.append(cache.get_state(layer_idx))  # [B, ...] copy, after token t
+                    tl_traj.append(cache.get_conv_tail(layer_idx))
+            finally:
+                cache._vcap = True
+            state_traj = torch.stack(st_traj, dim=1) if st_traj[0] is not None else None
+            conv_traj = torch.stack(tl_traj, dim=1) if tl_traj[0] is not None else None
+            cache.record_verify_traj(layer_idx, state_traj, conv_traj)
+            return torch.cat(outs, dim=1)
+        return self._run(hidden, positions, ctx, layer_idx)
+
+    def _run(self, hidden, positions, ctx, layer_idx):
+        """One DeltaNet forward over L tokens (L==1 → fused decode kernels; L>1 → eager
+        prefill recurrence). Reads/updates the per-slot recurrent state + conv tail."""
         B, L, _ = hidden.shape
         cache = ctx.lin_cache if ctx is not None else None
         conv_tail = cache.get_conv_tail(layer_idx) if cache is not None else None
@@ -269,6 +322,7 @@ class ShortConv(nn.Module):
     with (B,C,x) = in_proj(h).chunk(3). in_proj/out_proj on dp4a; conv is depthwise k=3."""
 
     is_recurrent = True  # carries per-slot decode conv-tail via ctx.lin_cache
+    spec_capture = True  # records verify-token conv-tail trajectory (runner task d)
 
     def __init__(self, dim: int, *, in_proj: QTensor, out_proj: QTensor, conv_weight, kernel=3):
         super().__init__()
@@ -278,11 +332,12 @@ class ShortConv(nn.Module):
         self.out_proj = LinearW8A8(out_proj)
         self.register_buffer("conv_weight", conv_weight, persistent=False)  # [dim, 1, k]
 
-    def _conv(self, u, tail=None):
+    def _conv(self, u, tail=None, return_traj=False):
         """Causal depthwise conv1d(k) over the last dimension of `u` [B,D,L]. `tail`:
         optional [B,D,K-1] trailing window from the previous call — carries decode
         history in instead of zero-padding. Returns (activated [B,L,D], new_tail
-        [B,D,K-1])."""
+        [B,D,K-1]). `return_traj`: also return the per-token tail trajectory
+        [B, L, D, K-1] (spec-decode verify, task d)."""
         B, D, L = u.shape
         K = self.kernel
         if tail is None:
@@ -290,6 +345,14 @@ class ShortConv(nn.Module):
         u_ext = torch.cat([tail, u], dim=-1)  # [B,D,K-1+L]
         new_tail = u_ext[:, :, -(K - 1) :] if K > 1 else u.new_zeros(B, D, 0)
         y = F.conv1d(u_ext, self.conv_weight, groups=D).transpose(1, 2)
+        if return_traj:
+            KM = K - 1
+            tail_traj = (
+                torch.stack([u_ext[:, :, t + 1 : t + 1 + KM] for t in range(L)], dim=1)
+                if KM > 0
+                else u.new_zeros(B, L, D, 0)
+            )  # [B, L, D, K-1]
+            return y, new_tail, tail_traj
         return y, new_tail
 
     def forward(self, x, positions=None, ctx=None, layer_idx=0):
@@ -298,8 +361,14 @@ class ShortConv(nn.Module):
         Bg, Cg, xg = bcx.chunk(3, dim=-1)
         u = (Bg * xg).transpose(1, 2)  # [B,D,L]
         cache = ctx.lin_cache if ctx is not None else None
+        capture = cache is not None and getattr(cache, "capturing_verify", False)
         tail = cache.get_conv_tail(layer_idx) if cache is not None else None
-        y, new_tail = self._conv(u, tail)
+        if capture:
+            y, new_tail, tail_traj = self._conv(u, tail, return_traj=True)
+            # State-free layer: record only the conv-tail trajectory ([B,L,D,K-1]).
+            cache.record_verify_traj(layer_idx, None, tail_traj)
+        else:
+            y, new_tail = self._conv(u, tail)
         if cache is not None:
             cache.set_conv_tail(layer_idx, new_tail)
         return self.out_proj(Cg * y)

@@ -172,9 +172,15 @@ def _qwen3_5_mtp_decoder(cfg, prefix, sd, rope):
     ``qwen3.py::_qwen3_mtp_decoder`` but uses ``GatedGQAAttention`` (fused
     query|gate ``q_proj``) and the qk_unit_offset q/k-norm.
 
-    Attention is CACHE-FREE (``GQAAttention._draft_attn`` on the query half): MTP
-    drafting must never touch the main model's paged KV cache OR — critically for
-    this hybrid family — the DeltaNet recurrent state carried in ``ctx.lin_cache``.
+    The attention is dense/fp16 (``GQAAttention._draft_attn`` on the query half — the
+    int8 paged-decode kernel is head-dim {32,64,128} only, this family is 256) and
+    NEVER touches the main model's paged KV cache OR the DeltaNet recurrent state in
+    ``ctx.lin_cache``. The block is split into ``project`` (fused qkv+gate, qk-norm,
+    RoPE) and ``attend`` (dense attention over an externally supplied K/V + gate +
+    o_proj + residual) so the engine can give the draft a PREFIX K/V cache — the
+    head's own K/V over the committed context, primed at prefill and each accepted
+    step (mirrors qengine's inline nextn head; Haru-neo/qengine, Apache-2.0). Without
+    it the draft attends only its own single token and predicts noise (~1% accept).
     """
     attn = _gated_full_attn(cfg, sd, prefix, rope)
 
@@ -192,21 +198,37 @@ def _qwen3_5_mtp_decoder(cfg, prefix, sd, rope):
                 gate_up_weight(sd, f"{prefix}.mlp"),
                 to_qtensor(sd[f"{prefix}.mlp.down_proj.weight"]), act=cfg.hidden_act)
 
-        def forward(self, x, positions, ctx, residual):
-            B, S, _ = x.shape
-            if residual is None:
-                residual, h = x, self.input_layernorm(x)
-            else:
-                h, residual = self.input_layernorm(x, residual)
+        def project(self, x, positions):
+            """fc-output hidden ``x`` [B,S,H] -> (q, gate, k, v, residual), q/k RoPE'd,
+            qk-norm applied. ``k``/``v`` are token-major [B,S,nkv,hd] ready to append to
+            the MTP prefix-KV cache; ``residual`` (== ``x``, the block-entry residual)
+            is threaded into :meth:`attend`."""
+            residual, h = x, self.input_layernorm(x)
             a = self.self_attn
             q, gate, k, v = a._project(h)  # gated projection + qk-norm (pre-RoPE)
             q, k = a.rope(positions, q, k)
+            return q, gate, k, v, residual
+
+        def attend(self, q, gate, k_all, v_all, residual, B, S):
+            """Dense attention of the S query tokens over ``k_all``/``v_all`` (the
+            prefix-KV cache PLUS this step's K/V, token-major [B,N,nkv,hd]), then the
+            sigmoid output gate, o_proj, and BOTH residual adds. Returns the full block
+            hidden [B,S,H] (attn-residual + mlp), so the head's final norm sees the
+            complete residual stream — the earlier code dropped the post-MLP residual."""
+            a = self.self_attn
             out = GQAAttention._draft_attn(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=a.scale)
+                q.transpose(1, 2), k_all.transpose(1, 2), v_all.transpose(1, 2), scale=a.scale)
             out = out.view(B, S, a.nh, a.hd)
             h = a._gate_and_project(out, gate, B, S)  # sigmoid gate + o_proj
             h, residual = self.post_attention_layernorm(h, residual)
-            return self.mlp(h), residual
+            return self.mlp(h) + residual
+
+        def forward(self, x, positions, ctx, residual):
+            # Cache-free single-token path (fallback / non-prefix-KV callers). residual
+            # arg kept for signature parity; MTP always enters with residual=None.
+            B, S, _ = x.shape
+            q, gate, k, v, res = self.project(x, positions)
+            return self.attend(q, gate, k, v, res, B, S), None
 
     return _MTPBlock()
 

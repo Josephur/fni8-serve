@@ -16,6 +16,13 @@ Attributions
 * Depends on `fni8` (the CUDA/dp4a attention kernels + `.fni8` weight format +
   transport codec), BSD-3-Clause, Copyright (c) 2026 fni8 authors.
 
+* The MTP speculative-decode draft head's PREFIX-KV mechanism (the draft attends the
+  head's own K/V over the committed context, primed at prefill and each accepted step)
+  was studied from qengine's inline nextn head (https://github.com/Haru-neo/qengine,
+  `src/mtp_head.cuh`), Apache License 2.0, Copyright (c) Haru-neo. This project
+  re-implements the approach in Python over its own paged engine; it does not vendor
+  qengine source.
+
 * `fni8serve.tool_calls`' Hermes-style `<tool_call>` tag convention was studied
   from vLLM's `hermes_tool_parser.py` (https://github.com/vllm-project/vllm),
   Apache License 2.0, Copyright (c) vLLM contributors. This project reimplements

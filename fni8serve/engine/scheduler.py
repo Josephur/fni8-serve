@@ -69,6 +69,10 @@ class Scheduler:
         preempted.length = 0
         preempted.slot = -1
         preempted.prefix_matched_len = 0
+        # Drop the spec-decode pipelining carry: it names positions in the freed KV
+        # cache, which are recomputed from scratch on re-admission.
+        preempted.spec_base_tok = None
+        preempted.spec_base_hidden = None
         preempted.status = Status.WAITING
         self.waiting.append(preempted)
 

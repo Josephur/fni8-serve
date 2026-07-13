@@ -89,6 +89,17 @@ class RecurrentStateCache:
         self._state_buf: dict[int, torch.Tensor] = {}
         self._conv_buf: dict[int, torch.Tensor] = {}
         self._row_idx: torch.Tensor | None = None  # device Long[B] row->slot, or None
+        # -- spec-decode verify-trajectory capture (task d) ---------------------
+        # During a verify forward the recurrence runs L=k+1 tokens in ONE call, but
+        # only the accepted prefix (a per-row count) may commit. Instead of the old
+        # snapshot→verify→restore→replay-accepted dance (which re-streamed the model
+        # weights to re-advance the state), the DeltaNet layer records the PER-TOKEN
+        # state (and conv tail) trajectory here; after acceptance the runner commits,
+        # per row, exactly the state after that row's last accepted token — no
+        # re-decode. `_vcap` gates recording; `_vtraj[layer]` holds (state[B,L,...],
+        # conv[B,L,...]) for the bound slots.
+        self._vcap = False
+        self._vtraj: dict[int, tuple[torch.Tensor, torch.Tensor | None]] = {}
 
     def enable_static_buffers(self, num_slots: int) -> None:
         """Switch to fixed-address per-slot buffers (graph-capturable). Must be
@@ -219,11 +230,64 @@ class RecurrentStateCache:
         for lidx, v in snap["conv"].items():
             self.set_conv_tail(lidx, v)
 
+    # -- spec-decode verify-trajectory capture (task d) -----------------------
+
+    def begin_verify_capture(self) -> None:
+        """Arm per-token trajectory recording for the next verify forward. The
+        DeltaNet / lightning layers check :attr:`capturing_verify` and record their
+        full state (and conv tail) trajectory via :meth:`record_verify_traj`."""
+        self._vcap = True
+        self._vtraj = {}
+
+    @property
+    def capturing_verify(self) -> bool:
+        return self._vcap
+
+    def record_verify_traj(
+        self, layer_idx: int, state_traj: torch.Tensor | None, conv_traj: torch.Tensor | None
+    ) -> None:
+        """Store one recurrent layer's per-token trajectory over the verify tokens.
+        ``state_traj`` is [B, L, ...] = the recurrent state AFTER each of the L verify
+        tokens (row-aligned to the bound slots), or None for a state-free layer;
+        ``conv_traj`` is the matching conv tail [B, L, ...] (or None if the layer has
+        no conv). At least one is non-None."""
+        self._vtraj[layer_idx] = (state_traj, conv_traj)
+
+    @staticmethod
+    def _pick(traj: torch.Tensor, row_last: list[int]) -> torch.Tensor:
+        """Gather ``traj[b, row_last[b]]`` -> [B, ...] on ``traj``'s device."""
+        rows = torch.arange(traj.shape[0], device=traj.device)
+        idx = torch.tensor(row_last, device=traj.device)
+        return traj[rows, idx]
+
+    def commit_verify(self, row_last: list[int]) -> None:
+        """Commit, per bound row ``b``, the recurrent state (and/or conv tail) AFTER
+        that row's last accepted verify token ``row_last[b]`` (a 0-based index into the
+        trajectory). Scatters into the per-slot committed store exactly as a normal
+        decode step's ``set_state`` / ``set_conv_tail`` would — reaching the correct
+        committed state with no re-decode. Clears the capture afterward."""
+        for lidx, (state_traj, conv_traj) in self._vtraj.items():
+            if state_traj is not None:
+                self.set_state(lidx, self._pick(state_traj, row_last))
+            if conv_traj is not None:
+                self.set_conv_tail(lidx, self._pick(conv_traj, row_last))
+        self.end_verify_capture()
+
+    def verify_captured_layers(self) -> int:
+        """Number of recurrent layers that recorded a trajectory this verify."""
+        return len(self._vtraj)
+
+    def end_verify_capture(self) -> None:
+        self._vcap = False
+        self._vtraj = {}
+
     def reset(self):
         self._state.clear()
         self._conv_tail.clear()
         self._slots = None
         self._row_idx = None
+        self._vcap = False
+        self._vtraj = {}
         if self._static:
             for buf in (self._state_buf, self._conv_buf):
                 for t in buf.values():
@@ -323,3 +387,62 @@ class MLALatentCache:
 
     def advance(self, n: int = 1):
         self.length += n
+
+
+class MTPKVCache:
+    """Per-slot fp16 KV store for the MTP speculative-draft head's OWN attention.
+
+    The MTP draft head is a separate transformer layer from the backbone, so it needs
+    its OWN K/V over the committed context — the backbone's paged cache holds the
+    backbone layers' K/V, never the head's. Mirrors qengine's inline nextn head, which
+    keeps a dedicated ``kv_k``/``kv_v`` (Haru-neo/qengine, Apache-2.0). Kept in fp16
+    (not the backbone's int8 paged store) because the draft is a small dense
+    single-query attention and the int8 paged-decode kernel is head-dim {32,64,128}
+    only (this family is 256); fp16 also keeps draft quality (accept rate) up.
+
+    Stored per slot as ``k``/``v`` [L, nkv, hd] where MTP-position ``i`` (0-based) holds
+    the K/V projected from ``(h_main[i], emb(token[i+1]))`` at RoPE position ``i``. The
+    store is ALWAYS authoritative (only committed tokens are ever
+    appended — the base token is always accepted and drafts are re-projected from the
+    verified hidden states), so no speculative rollback is needed.
+    """
+
+    def __init__(self):
+        self._k: dict[int, torch.Tensor] = {}
+        self._v: dict[int, torch.Tensor] = {}
+
+    def clear_slot(self, slot: int) -> None:
+        self._k.pop(slot, None)
+        self._v.pop(slot, None)
+
+    def length(self, slot: int) -> int:
+        t = self._k.get(slot)
+        return 0 if t is None else t.shape[0]
+
+    def reset_slot(self, slot: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Replace a slot's whole prefix (prefill priming). k, v: [L, nkv, hd]."""
+        self._k[slot] = k.contiguous()
+        self._v[slot] = v.contiguous()
+
+    def append(self, slot: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Append ``m`` positions. k, v: [m, nkv, hd]."""
+        if slot not in self._k:
+            self._k[slot] = k.contiguous()
+            self._v[slot] = v.contiguous()
+        else:
+            self._k[slot] = torch.cat([self._k[slot], k], dim=0)
+            self._v[slot] = torch.cat([self._v[slot], v], dim=0)
+
+    def truncate(self, slot: int, length: int) -> None:
+        """Keep only the first ``length`` positions (discard speculative tail)."""
+        if slot in self._k and self._k[slot].shape[0] > length:
+            self._k[slot] = self._k[slot][:length].contiguous()
+            self._v[slot] = self._v[slot][:length].contiguous()
+
+    def read(self, slot: int):
+        """Return (k, v) as [1, L, nkv, hd] ready to concat with the current token's
+        K/V, or (None, None) if the slot has no primed prefix."""
+        t = self._k.get(slot)
+        if t is None:
+            return None, None
+        return t.unsqueeze(0), self._v[slot].unsqueeze(0)

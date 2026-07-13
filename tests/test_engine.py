@@ -438,21 +438,26 @@ def _force_full_acceptance(eng_spec, ref_by_prompt):
     holder: dict = {}
     naccs: list[int] = []
 
-    def forced_draft(last_hidden, last_token, positions, ctx):
-        batch = holder["batch"]
-        toks = []
-        for b in range(positions.shape[0]):
-            P, ref = ref_by_prompt[tuple(batch[b].prompt_ids)]
-            # positions[b, 0] is this sequence's current KV length L; after prefill
-            # L == P and len(output_ids) == 1, and both advance in lockstep, so the
-            # token that should follow the base token is ref[L - P + 2].
-            idx = int(positions[b, 0].item()) - P + 2
-            toks.append(ref[idx] if 0 <= idx < len(ref) else 0)
-        return [torch.tensor(toks, device=last_hidden.device, dtype=torch.long).view(-1, 1)]
-
-    eng_spec.model.mtp.draft_greedy = forced_draft
-
     runner = eng_spec.runner
+    runner._spec_enabled = True  # spec-decode is opt-in/off by default; force it on here
+
+    def forced_compute_drafts(mtp, base_hidden, base_tok, lengths, slots, batch):
+        # Force each row's drafts to the true greedy continuation (up to _spec_k
+        # tokens) so every draft is accepted and the real verify/commit + multi-token
+        # accept path is exercised. Patches the single draft seam ``_compute_drafts``
+        # (new signature: per-row draft LISTS) so it forces the restructured loop too.
+        out = []
+        for b in range(len(batch)):
+            P, ref = ref_by_prompt[tuple(batch[b].prompt_ids)]
+            # length L = lengths[b]; base_tok is token@(L+1) = ref[L+1-P]; the drafts
+            # are the continuation token@(L+2+t) = ref[L+2-P+t].
+            start = int(lengths[b]) + 2 - P
+            dl = [int(ref[start + t]) for t in range(runner._spec_k) if 0 <= start + t < len(ref)]
+            out.append(dl if dl else [0])
+        return out
+
+    runner._compute_drafts = forced_compute_drafts
+
     orig = runner._spec_decode_eager
 
     def wrapped(batch, mtp):
