@@ -189,6 +189,65 @@ def test_deltanet_block_runs():
     assert y.shape == (1, 6, 128) and torch.isfinite(y).all()
 
 
+def _build_deltanet_block_128():
+    """A 128/128-head DeltaNet block with a z-gate — the shape the fully-fused
+    decode kernel (`fni8.deltanet_fused_decode`, Dk==Dv==128) targets."""
+    import fni8
+    from fni8 import QTensor
+
+    from fni8serve.models.config import ModelConfig
+
+    torch.manual_seed(0)
+    H, nk, nv, kd, vd = 256, 4, 16, 128, 128
+    cfg = ModelConfig(arch="qwen3_next", vocab_size=32, hidden_size=H, num_hidden_layers=1,
+                      num_attention_heads=8, num_key_value_heads=4, intermediate_size=64,
+                      max_position_embeddings=64, head_dim=32)
+
+    def qt(o, i):
+        w = torch.randn(o, i, device="cuda", dtype=torch.float16) * 0.05
+        s = w.abs().amax(-1, keepdim=True).clamp_min(1e-6) / 127
+        return QTensor(torch.round(w / s).clamp_(-127, 127).to(torch.int8),
+                       s.squeeze(-1).float(), scheme="per_row_i8")
+
+    return GatedDeltaNetAttention(
+        cfg, qkv_proj=qt(2 * nk * kd + nv * vd, H), out_proj=qt(H, nv * vd),
+        conv_weight=torch.randn(2 * nk * kd + nv * vd, 4, device="cuda", dtype=torch.float16),
+        a_log=torch.randn(nv, device="cuda") * 0.5, dt_bias=torch.randn(nv, device="cuda"),
+        beta_proj=qt(nv, H), gate_proj=qt(nv, H),
+        norm_gain=torch.randn(vd, device="cuda", dtype=torch.float16) * 0.1,
+        num_k_heads=nk, num_v_heads=nv, key_dim=kd, value_dim=vd,
+        z_proj=qt(nv * vd, H)).cuda()
+
+
+@pytest.mark.skipif(not CUDA, reason="the fused decode kernel needs a Volta GPU")
+def test_fused_decode_step_matches_eager(monkeypatch):
+    """The fully-fused `deltanet_fused_decode` decode step (L==1, Dk==Dv==128) must
+    reproduce the eager per-token chain it replaces (`_l2norm` + q-scale + GQA expand
+    + gate/beta + `deltanet_recurrent_decode` + `gated_rmsnorm_decode`) — that chain is
+    the kernel's numeric oracle. Toggle the `_DND_STEP` dispatch flag to compare the two
+    dispatch branches on the same weights and input."""
+    import fni8
+
+    from fni8serve.layers import linear_attn as la
+
+    if not getattr(la, "_DND_STEP", False):
+        pytest.skip("installed fni8 predates deltanet_fused_decode")
+
+    blk = _build_deltanet_block_128()
+    x = torch.randn(1, 1, 256, device="cuda", dtype=torch.float16)  # L==1 decode token
+
+    y_fused = blk(x, None, None, 0)
+    monkeypatch.setattr(la, "_DND_STEP", False)  # force the eager op-sequence fallback
+    y_eager = blk(x, None, None, 0)
+
+    yf, ye = y_fused.float().flatten(), y_eager.float().flatten()
+    cos = torch.dot(yf, ye) / (yf.norm() * ye.norm() + 1e-12)
+    rel_l1 = (yf - ye).abs().sum() / (ye.abs().sum() + 1e-12)
+    assert cos.item() >= 0.9999, f"cos={cos.item()}"
+    assert rel_l1.item() <= 1e-3, f"rel_l1={rel_l1.item()}"
+    assert y_fused.shape == (1, 1, 256) and torch.isfinite(y_fused).all()
+
+
 @pytest.mark.skipif(not CUDA, reason="the projections use the dp4a GEMM")
 def test_decode_recurrence_output_stays_fp32(monkeypatch):
     """Regression guard for the redundant-cast removal: at decode (L==1) the fused

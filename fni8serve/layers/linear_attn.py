@@ -89,6 +89,18 @@ _DND_DECODE = os.environ.get("FNI8_DND_DECODE", "1") != "0" and hasattr(
 _DND_FUSED = os.environ.get("FNI8_DND_FUSED", "1") != "0"
 _DND_CONV = _DND_FUSED and hasattr(fni8, "causal_conv1d_silu_decode")
 _DND_GNORM = _DND_FUSED and hasattr(fni8, "gated_rmsnorm_decode")
+# ONE-launch fully-fused DeltaNet decode step: L2-norm(q,k) + GQA expand +
+# sigmoid(beta) + g=-softplus(dt+dt_bias)*exp(A_log) + delta-rule recurrence +
+# gated output RMSNorm (silu(z)*o), collapsing the ~15-19 tiny glue ops the
+# eager chain runs per layer into a single graph-capturable kernel. Its OWN
+# kill-switch (FNI8_DND_STEP=0) on top of the shared FNI8_DND_FUSED, so the
+# per-token step fusion can be A/B'd independently of the conv/gnorm fusions;
+# also auto-degrades on an fni8 that predates the op.
+_DND_STEP = (
+    os.environ.get("FNI8_DND_STEP", "1") != "0"
+    and _DND_FUSED
+    and hasattr(fni8, "deltanet_fused_decode")
+)
 
 
 def _gated_delta_rule(q, k, v, beta, g, state, L):
@@ -224,6 +236,36 @@ class GatedDeltaNetAttention(nn.Module):
             return torch.cat(outs, dim=1)
         return self._run(hidden, positions, ctx, layer_idx)
 
+    def _fused_decode_step(self, hidden, q, k, v, cache, layer_idx, B):
+        """One `fni8.deltanet_fused_decode` launch for the L==1 / 128-128 decode step:
+        absorbs L2-norm(q,k), GQA expand, sigmoid(beta), g=-softplus(dt+dt_bias)*
+        exp(A_log), the delta-rule recurrence, and the gated output RMSNorm (silu(z)*o).
+        Byte-for-byte the same fp32 math as the eager chain in `_run` (its numeric
+        oracle, cos >= 0.9999); the win is launch-count / HBM reduction. q_scale =
+        1/sqrt(kd) lands on the *normalised* query inside the kernel — a pre-scale would
+        be divided straight out by the kernel's internal L2-norm. `q`/`k`/`v` are the
+        raw post-conv splits [B, 1, nk*kd] / [B, 1, nv*vd]."""
+        state = cache.get_state(layer_idx) if cache is not None else None
+        qf = q.reshape(B, self.nk, 1, self.kd).float()
+        kf = k.reshape(B, self.nk, 1, self.kd).float()
+        vf = v.reshape(B, self.nv, 1, self.vd).float()
+        dt_f = self.gate_proj(hidden).reshape(B, self.nv, 1).float()   # raw dt logits
+        bl_f = self.beta_proj(hidden).reshape(B, self.nv, 1).float()   # raw beta logits
+        zf = None
+        if hasattr(self, "z_proj"):
+            zf = self.z_proj(hidden).reshape(B, self.nv, 1, self.vd).float()
+        o, state = fni8.deltanet_fused_decode(
+            qf, kf, vf, dt_f, bl_f, self.A_log.float(), self.dt_bias.float(),
+            self.norm.weight.float(), z=zf, initial_state=state,
+            q_scale=float(self.kd) ** -0.5, eps=float(self.norm.eps),
+        )
+        if cache is not None:
+            cache.set_state(layer_idx, state)
+        # out is [B, nv, 1, vd] head-major & contiguous → flattens directly to
+        # [B, 1, nv*vd], the same layout the eager `o.reshape(B, L, nv*vd)` yields.
+        o = o.reshape(B, 1, self.nv * self.vd)
+        return self.out_proj(o.to(hidden.dtype))
+
     def _run(self, hidden, positions, ctx, layer_idx):
         """One DeltaNet forward over L tokens (L==1 → fused decode kernels; L>1 → eager
         prefill recurrence). Reads/updates the per-slot recurrent state + conv tail."""
@@ -235,6 +277,11 @@ class GatedDeltaNetAttention(nn.Module):
             cache.set_conv_tail(layer_idx, conv_tail)
         qk = self.nk * self.kd
         q, k, v = qkv.split([qk, qk, self.nv * self.vd], dim=-1)
+        # Fully-fused decode fast path (L==1, CUDA, Dk==Dv==128): ONE launch for the
+        # whole glue. Byte-for-byte the eager chain below, which stays the fallback +
+        # oracle; auto-degrades for prefill / CPU / other dims / an older fni8.
+        if _DND_STEP and L == 1 and hidden.is_cuda and self.kd == 128 and self.vd == 128:
+            return self._fused_decode_step(hidden, q, k, v, cache, layer_idx, B)
         # HF gated-delta-rule scales the (l2-normed) query by 1/sqrt(head_k_dim) before
         # the readout (`query = query * scale`). Applied here (not inside the shared
         # recurrence, which stays a pure delta rule) since it is a per-model readout
