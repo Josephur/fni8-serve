@@ -13,6 +13,7 @@ from fni8serve.layers.linear_attn import (
     GatedDeltaNetAttention,
     ShortConv,
     _l2norm,
+    _lightning_attn_dispatch,
     lightning_attention,
     lightning_slopes,
     recurrent_gated_delta_rule,
@@ -284,3 +285,54 @@ def test_decode_recurrence_output_stays_fp32(monkeypatch):
 
     cos = torch.nn.functional.cosine_similarity(y_new.flatten(), y_old.flatten(), dim=0)
     assert cos.item() >= 0.9999, f"decode block output drifted after round-trip removal: cos={cos.item()}"
+
+
+@pytest.mark.skipif(not CUDA, reason="the int8 kernel needs a Volta GPU")
+def test_lightning_int8_cos_vs_fp16(monkeypatch):
+    """Correctness gate: the int8 lightning attention prefill must match the fp32
+    scalar reference within cos >= 0.99 and rel-L1 <= 5e-2 for the decay-free case
+    (slopes=0). The kernel implements the un-gated recurrence ``S_t = S_{t-1} +
+    v_t k_t^T``; MiniMax ALiBi slopes force the fp32 fallback in the dispatch.
+    This is the acceptance criterion from fni8 #159 (lightning_attn_int8 kernel)."""
+    import fni8serve.layers.linear_attn as la
+
+    if not getattr(la, "_LTN_INT8", False):
+        pytest.skip("installed fni8 predates lightning_attn_int8_fwd")
+
+    torch.manual_seed(42)
+    B, H, L, Dk, Dv = 2, 4, 8, 64, 64
+    q = torch.randn(B, H, L, Dk, device="cuda", dtype=torch.float32)
+    k = torch.randn(B, H, L, Dk, device="cuda", dtype=torch.float32)
+    v = torch.randn(B, H, L, Dv, device="cuda", dtype=torch.float32)
+    slopes_zero = torch.zeros(H, device="cuda")
+
+    o_int8, _ = la._lightning_attn_dispatch(q, k, v, slopes_zero)
+    monkeypatch.setattr(la, "_LTN_INT8", False)
+    o_ref, _ = la._lightning_attn_dispatch(q, k, v, slopes_zero)
+
+    o_i = o_int8.float().flatten()
+    o_r = o_ref.float().flatten()
+    cos = torch.dot(o_i, o_r) / (o_i.norm() * o_r.norm() + 1e-12)
+    rel_l1 = (o_i - o_r).abs().sum() / (o_r.abs().sum() + 1e-12)
+    assert cos.item() >= 0.99, f"int8 lightning attention cos={cos.item()} — below 0.99 gate"
+    assert rel_l1.item() <= 5e-2, f"int8 lightning attention rel_l1={rel_l1.item()} — above 5e-2 gate"
+    assert o_int8.shape == o_ref.shape and torch.isfinite(o_int8).all()
+
+
+def test_lightning_int8_skipped_with_slopes(monkeypatch):
+    """With ALiBi slopes (non-zero) the int8 dispatch must fall through to fp32 —
+    the kernel does the un-gated recurrence, so it cannot match the decayed output."""
+    if not CUDA:
+        pytest.skip("requires CUDA")
+    import fni8serve.layers.linear_attn as la
+
+    torch.manual_seed(42)
+    B, H, L, Dk, Dv = 2, 4, 5, 8, 8
+    q = torch.randn(B, H, L, Dk, device="cuda", dtype=torch.float16)
+    k = torch.randn(B, H, L, Dk, device="cuda", dtype=torch.float16)
+    v = torch.randn(B, H, L, Dv, device="cuda", dtype=torch.float16)
+    slopes_nz = lightning_slopes(H).to("cuda")
+
+    o_dispatch, _ = _lightning_attn_dispatch(q, k, v, slopes_nz)
+    o_ref, _ = lightning_attention(q, k, v, slopes_nz)
+    assert torch.allclose(o_dispatch.float(), o_ref.float(), rtol=1e-4, atol=1e-4)

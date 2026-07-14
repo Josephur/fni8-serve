@@ -29,7 +29,7 @@ notes). Do not read a released-✅ as "supported for generation."
 | **Hunyuan** (A13B) | ✅ | GQA + QK-norm | softmax MoE + shared | ✅ | GQA → int8 decode wired; `mlp.gate.wg`, `shared_mlp`; CLA (Large) not modeled |
 | **Qwen3-Next / Qwen3.5 / Qwen3.6** | ✅ | **hybrid: Gated DeltaNet (linear) + full** | ultra-sparse MoE + shared | ✅⛔ | int8 **decode** wired both halves: gated/full GQA (`attn_int8_decode`) + DeltaNet L==1 step (`fni8.deltanet_recurrent_decode`, auto-degrades). DeltaNet **prefill** recurrence still pure-torch (`recurrent_gated_delta_rule`); int8 chunk kernel unwired = remaining gap |
 | **DeepSeek-V3/V4** | V3 ✅ | **MLA (latent KV)** | fine MoE + shared | ✅ | int8 **absorb decode** wired (`fni8.mla_decode_absorb_int8`, `use_int8_absorb=True` default) — folds `W_UK`/`W_UV`. MLA **prefill** is fp32 einsum **by design** (numerics contract; no int8 MLA-prefill kernel) |
-| **MiniMax-Text** | ✅ | **lightning (linear)** + softmax hybrid | softmax MoE | 🟩⛔ | softmax half → int8 decode wired (GQA). Lightning half: recurrence runs **pure-torch** at prefill AND decode (`lightning_attention`; projections are int8). `fni8.lightning_attn_int8_fwd` exists but is **unwired**, and there is **no graph-capturable lightning decode kernel** — genuine gaps. postnorm α/β scaling |
+| **MiniMax-Text** | ✅ | **lightning (linear)** + softmax hybrid | softmax MoE | ✅⛔ | softmax half → int8 decode wired (GQA). Lightning half: prefill → int8 dispatch wired (`fni8.lightning_attn_int8_fwd` via `_lightning_attn_dispatch`; activates for decay-free case, correctness gate cos at least 0.99 vs fp32 ref). MiniMax ALiBi slopes produce non-trivial per-head decay — int8 kernel is un-gated (decay-free), so MiniMax prefill falls through to fp32 scalar reference. Decode L==1 always fp32 (no graph-capturable lightning decode kernel). postnorm alpha/beta scaling |
 | **DiffusionGemma** | ✅ (post-cutoff) | **bidirectional** over canvas | GeGLU MoE | 🟡 | `attn_int8_fwd(causal=False)`; needs DiffusionDecodeStrategy |
 | **Gemma4 / gemma3n** | ✅ | GQA + AltUp/LAuReL/PLE/MatFormer | GeGLU | 🟧 | residual-mixing + per-layer-embeddings are new modules |
 
@@ -86,10 +86,10 @@ The big decode kernels have **landed and are wired**: MLA int8 **absorb decode**
 1. **Gated DeltaNet int8 *prefill*** (Qwen3-Next/3.5/3.6): the L>1 chunked recurrence
    still runs pure-torch (`recurrent_gated_delta_rule`); the int8 chunk kernel is unwired.
    Decode is already int8; this is a prefill-only gap.
-2. **Lightning linear attention** (MiniMax): the recurrence runs pure-torch at **both**
-   prefill and decode (`lightning_attention`). `fni8.lightning_attn_int8_fwd` exists but is
-   unwired for prefill, and there is **no graph-capturable lightning *decode* kernel** at
-   all — the genuinely-missing piece.
+2. **Lightning linear attention** (MiniMax): prefill dispatch wired (`fni8.lightning_attn_int8_fwd`,
+   `_lightning_attn_dispatch`); kernel is **un-gated** (decay-free), so MiniMax ALiBi slopes
+   force fp32 fallback. Decode L==1 still fp32 (**no graph-capturable lightning decode kernel**
+   — the genuinely-missing piece).
 3. **MLA int8 *prefill*** (DeepSeek-V3/V4): prefill is an fp32 einsum **by design**
    (softmax/LSE/PV numerics contract), not a missing kernel. MoE + MTP are already covered.
 

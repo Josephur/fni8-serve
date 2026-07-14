@@ -15,7 +15,12 @@ import torch.nn as nn
 
 from ..layers.embedding import LMHead, VocabEmbedding
 from ..layers.gqa_attention import GQAAttention
-from ..layers.linear_attn import LinearW8A8, RMSNorm, lightning_attention, lightning_slopes
+from ..layers.linear_attn import (
+    LinearW8A8,
+    RMSNorm,
+    _lightning_attn_dispatch,
+    lightning_slopes,
+)
 from ..layers.rotary import RotaryEmbedding
 from .base import ForwardContext
 from .config import ModelConfig
@@ -41,8 +46,9 @@ class LightningAttention(nn.Module):
         cache = ctx.lin_cache if ctx is not None else None
         state = cache.get_state(layer_idx) if cache is not None else None
         q, k, v = self.qkv_proj(x).view(B, L, 3, self.nh, self.hd).unbind(2)
-        o, state = lightning_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-                                       self.slopes, state=state)
+        o, state = _lightning_attn_dispatch(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            self.slopes, state=state)
         if cache is not None:
             cache.set_state(layer_idx, state)
         o = o.transpose(1, 2).reshape(B, L, self.nh * self.hd)

@@ -74,6 +74,14 @@ def recurrent_gated_delta_rule(q, k, v, beta, g, state=None, return_traj=False):
     return out.to(v.dtype), S
 
 
+# Kill-switch for MiniMax lightning attention int8 dp4a kernel. Default on;
+# auto-degrades to the fp32 scalar reference if the installed fni8 predates the
+# kernel. The kernel accelerates prefill (L>1); decode (L==1) always uses the
+# fp32 reference (no graph-capturable lightning decode kernel — COVERAGE.md).
+_LTN_INT8 = os.environ.get("FNI8_LTN_INT8", "1") != "0" and hasattr(
+    fni8, "lightning_attn_int8_fwd"
+)
+
 # Kill-switch (default on); auto-degrades to the eager reference if the installed
 # fni8 predates the decode kernel, so this stays correct on an older prebuilt fni8.
 _DND_DECODE = os.environ.get("FNI8_DND_DECODE", "1") != "0" and hasattr(
@@ -356,6 +364,25 @@ def lightning_attention(q, k, v, slopes, state=None):
         S = ratio * S + vf[:, :, t][..., :, None] * kf[:, :, t][..., None, :]  # k^T v outer
         out[:, :, t] = torch.einsum("bhvk,bhk->bhv", S, qf[:, :, t])
     return out.to(v.dtype), S
+
+
+def _lightning_attn_dispatch(q, k, v, slopes, state=None):
+    """Dispatch to ``fni8.lightning_attn_int8_fwd`` for prefill (L>1, CUDA, kernel
+    available), falling back to the fp32 scalar reference otherwise (decode L==1,
+    older fni8, or env FNI8_LTN_INT8=0). Returns ``(o, state_final)`` — the same
+    signature as :func:`lightning_attention` so callers are unchanged.
+
+    The int8 kernel implements the UN-GATED (decay-free) recurrence:
+    ``S_t = S_{t-1} + v_t k_t^T``. MiniMax ALiBi slopes produce per-head decay
+    ratios, so for non-trivial slopes the fp32 reference is always used (the
+    reparameterisation ``q'_t = ratio^t q_t, k'_t = ratio^{-t} k_t`` is exact in
+    fp32 but underflows/overflows in int8 for real prefill lengths). When slopes
+    are all approx 1.0 (decay-free models, or unit tests) the int8 dp4a kernel fires."""
+    L = q.shape[2]
+    if _LTN_INT8 and L > 1 and q.is_cuda and slopes.abs().max().item() < 1e-6:
+        o, state = fni8.lightning_attn_int8_fwd(q.float(), k.float(), v.float(), initial_state=state)
+        return o, state
+    return lightning_attention(q, k, v, slopes, state=state)
 
 
 def lightning_slopes(num_heads: int, device="cpu") -> torch.Tensor:
