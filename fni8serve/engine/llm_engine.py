@@ -181,8 +181,20 @@ class LLMEngine:
     def generate(
         self, prompts: list[list[int]], params: SamplingParams | None = None
     ) -> list[list[int]]:
-        """Offline batched generation: returns the output token ids per prompt."""
+        """Offline batched generation: returns the output token ids per prompt.
+
+        Auto-forgets each collected Sequence from `_out` before returning: offline
+        callers loop on `generate()` and never call `forget()` themselves, so without
+        this every completed request's Sequence (prompt + output ids) would be pinned
+        in `_out` for the life of the process — unbounded host-memory growth. The
+        long-lived API path (`add_request` + explicit `forget`) is unaffected: it
+        does not go through `generate()`."""
         ids = [self.add_request(p, params) for p in prompts]
         while self.scheduler.has_work():
             self.step()
-        return [self._out[i].output_ids for i in ids]
+        # Materialise the outputs, then drop the Sequences from `_out`. The returned
+        # lists stay alive via these references after their Sequence is forgotten.
+        outputs = [self._out[i].output_ids for i in ids]
+        for i in ids:
+            self.forget(i)
+        return outputs

@@ -83,7 +83,9 @@ def create_app(
     extract `tool_calls` from free-form generation when `tool_choice` is `"auto"`
     (the default once `tools` is set) -- irrelevant for a forced `tool_choice`,
     which is schema-constrained instead (see `request_helpers.forced_tool_message`)."""
-    app = FastAPI(title="fni8-serve", version="0.0.1")
+    from .. import __version__
+
+    app = FastAPI(title="fni8-serve", version=__version__)
     # Telemetry (issue #182). Create a collector if the caller didn't supply one so
     # `GET /metrics` always works; wire it to the engine (KV cache) and the worker
     # (per-request TTFT / latency). Hot-loop recording is sync-free -- see metrics.py.

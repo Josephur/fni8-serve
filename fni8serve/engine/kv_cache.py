@@ -419,6 +419,8 @@ class PagedKVCache:
         block_size: int = 16,
         num_blocks: int | None = None,
         max_prefix_entries: int | None = None,
+        max_prefix_blocks: int | None = None,
+        max_prefix_block_fraction: float = 0.5,
     ):
         self.block_size = block_size
         self.num_layers = num_layers
@@ -448,6 +450,27 @@ class PagedKVCache:
         self._prefix_trie: dict = {"_lru": 0}
         self._max_prefix_entries = max_prefix_entries
         self._prefix_entry_count = 0
+        # HBM budget on the prefix cache (issue: unbounded prefix-cache retention).
+        # A long-running server serving mostly-unique prompts would otherwise pin KV
+        # blocks in the radix trie forever — completed requests free their OWN slot
+        # refs, but the trie's refs persist until an LRU eviction that (with
+        # `max_prefix_entries=None`) never triggered, so the pool could be exhausted.
+        # We bound the retention by the number of PHYSICAL BLOCKS the prefix cache is
+        # allowed to pin (block bytes + trie metadata scale with block count), NOT
+        # just an entry count. Default: half the pool, computed from `num_blocks` so
+        # it is always non-None. `max_prefix_blocks` overrides the fraction.
+        # `_prefix_block_refs[blk]` counts how many prefix ENTRIES reference `blk`
+        # (distinct pinned blocks = `len(self._prefix_block_refs)`); a block also held
+        # by a live in-flight slot keeps a positive `_block_refcount` and is never
+        # freed by prefix eviction — eviction only drops the completed-but-cached
+        # trie entry's reference.
+        if max_prefix_blocks is not None:
+            self._max_prefix_blocks: int | None = max_prefix_blocks
+        elif max_prefix_block_fraction is not None:
+            self._max_prefix_blocks = max(1, int(self.num_blocks * max_prefix_block_fraction))
+        else:
+            self._max_prefix_blocks = None
+        self._prefix_block_refs: dict[int, int] = {}
         # Pinned host staging for the CUDA-graph decode hot path (issue #183): the
         # per-step slot-mapping / block-table used to be rebuilt with
         # `torch.tensor(list, device=cuda)` (a blocking pageable H2D) then D2D-copied
@@ -517,9 +540,10 @@ class PagedKVCache:
         self._prefix_trie["_lru"] = self._prefix_trie.get("_lru", 0) + 1
         return self._prefix_trie["_lru"]
 
-    def _evict_one_prefix(self):
+    def _evict_one_prefix(self) -> bool:
         """Find the prefix entry with the oldest LRU timestamp and evict it.
-        Releases block refcounts and cleans up orphaned trie nodes."""
+        Releases block refcounts and cleans up orphaned trie nodes. Returns True if
+        an entry was evicted, False if the trie held no evictable entry."""
         oldest = None
         oldest_lru = None
 
@@ -538,11 +562,20 @@ class PagedKVCache:
 
         _walk(self._prefix_trie, [])
         if oldest is None:
-            return
+            return False
         path, node = oldest
         entry = node.pop("_entry", None)
         if entry is not None:
             for blk in entry["blocks"]:
+                # Drop this entry's prefix-cache reference on the block (budget
+                # accounting). A block still referenced by a live in-flight slot or
+                # another prefix entry keeps a positive `_block_refcount` below and
+                # is NOT returned to the free pool.
+                pc = self._prefix_block_refs.get(blk, 0) - 1
+                if pc <= 0:
+                    self._prefix_block_refs.pop(blk, None)
+                else:
+                    self._prefix_block_refs[blk] = pc
                 c = self._block_refcount.get(blk, 1) - 1
                 if c <= 0:
                     self._block_refcount.pop(blk, None)
@@ -556,6 +589,32 @@ class PagedKVCache:
             for p in path[:-1]:
                 parent = parent.get(p, {})
             parent.pop(path[-1], None)
+        return True
+
+    def _enforce_prefix_budget(self) -> None:
+        """Evict oldest (LRU) prefix entries until the pinned-block budget holds.
+        Bounds HBM pinned by the completed-prefix cache so a stream of unique prompts
+        cannot exhaust the block pool. Live in-flight blocks are never freed here —
+        eviction only releases the trie's own references (see `_evict_one_prefix`)."""
+        if self._max_prefix_blocks is None:
+            return
+        # Each iteration removes exactly one trie entry, so the loop always makes
+        # progress and terminates once the trie is empty (blocks -> 0) even if some
+        # nested inner entries share blocks with an outer entry not yet evicted.
+        while len(self._prefix_block_refs) > self._max_prefix_blocks:
+            if not self._evict_one_prefix():
+                break
+
+    @property
+    def pinned_prefix_blocks(self) -> int:
+        """Distinct physical blocks currently pinned by the prefix (radix) cache."""
+        return len(self._prefix_block_refs)
+
+    def prefix_block_bytes(self) -> int:
+        """HBM bytes pinned by the prefix cache across all layers (K+V int8 +
+        fp32 scales). Drives the block budget and telemetry."""
+        bb = KVEviction.block_bytes(self.num_kv_heads, self.block_size, self.head_dim)
+        return len(self._prefix_block_refs) * self.num_layers * bb
 
     def store_prefix(self, token_ids: list[int], slot: int):
         """Store a completed prefix in the radix trie for future lookups.
@@ -587,10 +646,15 @@ class PagedKVCache:
                     }
                     for blk in full_blocks[:nb]:
                         self._block_refcount[blk] = self._block_refcount.get(blk, 1) + 1
+                        self._prefix_block_refs[blk] = self._prefix_block_refs.get(blk, 0) + 1
                     self._prefix_entry_count += 1
                 else:
                     # Entry already exists — bump its LRU timestamp
                     node["_entry"]["lru"] = lru_now
+        # Bound HBM pinned by the completed-prefix cache (block-BYTES budget, not
+        # only entry count). Runs after the whole prefix is stored so the entries we
+        # just added (highest LRU) are evicted last.
+        self._enforce_prefix_budget()
 
     def lookup_prefix(self, token_ids: list[int]) -> tuple[int, list[int]]:
         """Find the longest block-aligned matching prefix.
