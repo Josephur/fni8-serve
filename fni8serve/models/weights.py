@@ -62,9 +62,29 @@ def merge_qtensor(rows: list) -> QTensor:
     int4 data AND the per-row scales along the row axis (each output row keeps its
     own scale, so the fused weight is exact)."""
     if isinstance(rows[0], QTensor):
+        r0 = rows[0]
+        # Native GGUF k-quant rows: each row is independently k-quantized (super-blocks
+        # run along the IN dim), so concatenating rows on the output axis is exact —
+        # BUT only when every row shares one k-quant type (same codebook + bytes/row).
+        # A GGUF imatrix menu often ships MIXED types across a merged group (e.g. q,k at
+        # Q4_K but the sensitive v at Q6_K); those can't concat, so dequant each to fp16
+        # and merge as one per_row_i8 (the benign-requant fallback).
+        if r0.scheme == "gguf_kquant":
+            widths = {r.data.shape[1] for r in rows}
+            codes = {r.codebook for r in rows}
+            if len(widths) == 1 and len(codes) == 1:
+                return QTensor(
+                    torch.cat([r.data for r in rows], dim=0).contiguous(),
+                    None,
+                    scheme="gguf_kquant",
+                    group_size=r0.group_size,
+                    codebook=r0.codebook,
+                )
+            from ..gguf_native import dequant_kquant
+
+            return to_qtensor(torch.cat([dequant_kquant(r) for r in rows], dim=0))
         data = torch.cat([r.data for r in rows], dim=0)
         scale = torch.cat([r.scale for r in rows], dim=0)
-        r0 = rows[0]
         return QTensor(
             data.contiguous(),
             scale.contiguous(),

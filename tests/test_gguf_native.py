@@ -18,10 +18,10 @@ If the GGUFs are not present the model tests skip (they live outside the repo).
 
 from __future__ import annotations
 
-import json
 import os
 
 import pytest
+import torch
 
 from fni8serve.gguf_native import gguf_config, gguf_dit_config
 
@@ -134,6 +134,62 @@ def test_gguf_config_moe_gating_asserted_not_defaulted():
     if cfg.num_experts > 0:
         # if experts exist, the gate func MUST be explicitly resolved into extra
         assert "expert_gating_func" in cfg.extra, "MoE config left gating func defaulted"
+
+
+@pytest.mark.correctness
+@requires_qwen3
+def test_gguf_state_dict_schemes_native():
+    """PR-2: k-quant weights land RESIDENT as native `gguf_kquant` (raw bytes, no
+    transcode); norms/embeddings stay fp16 Tensors — the shapes the builders expect."""
+    from fni8 import QTensor
+
+    from fni8serve.gguf_native import gguf_state_dict
+
+    sd = gguf_state_dict(_QWEN3_8B, device="cpu")
+    # a Q4_K linear (o_proj) → native gguf_kquant raw bytes
+    o = sd["model.layers.0.self_attn.o_proj.weight"]
+    assert isinstance(o, QTensor) and o.scheme == "gguf_kquant" and o.codebook == "q4_k"
+    assert o.scale is None and o.data.dtype == torch.uint8
+    # QTensor invariant: [out, n_superblocks*144] (Q4_K type_size=144), no paired scale
+    assert o.data.dim() == 2 and o.data.shape[1] % 144 == 0
+    # a Q6_K linear (ffn_down) → native gguf_kquant q6_k
+    d = sd["model.layers.0.mlp.down_proj.weight"]
+    assert isinstance(d, QTensor) and d.scheme == "gguf_kquant" and d.codebook == "q6_k"
+    # norms + embedding stay fp16 Tensors (not QTensors)
+    assert not isinstance(sd["model.layers.0.input_layernorm.weight"], QTensor)
+    assert sd["model.embed_tokens.weight"].dtype == torch.float16
+
+
+@pytest.mark.perf
+@requires_qwen3
+def test_linear_gguf_kquant_matches_dequant():
+    """PR-2 proof: LinearW8A8 over a native `gguf_kquant` weight matches a full-
+    precision dequant reference at cos≥0.99 — the Q4_K fused dp4a path AND the
+    Q5_K/Q6_K dequant fallback. Needs a CUDA device."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from fni8 import QTensor
+
+    from fni8serve.gguf_native import dequant_kquant, gguf_state_dict
+    from fni8serve.layers.linear import LinearW8A8
+
+    # load on CPU (the full 8B doesn't fit alongside other jobs), move only the two
+    # tested weights to CUDA — keeps this a targeted per-linear correctness probe.
+    sd = gguf_state_dict(_QWEN3_8B, device="cpu")
+    torch.manual_seed(0)
+    for name in ("model.layers.0.self_attn.o_proj.weight", "model.layers.0.mlp.down_proj.weight"):
+        src = sd[name]
+        qt = QTensor(
+            src.data.cuda(), None, scheme="gguf_kquant", codebook=src.codebook, group_size=256
+        )
+        lin = LinearW8A8(qt).cuda()
+        x = torch.randn(4, lin.in_features, device="cuda", dtype=torch.float16)
+        y = lin(x)
+        ref = torch.nn.functional.linear(x, dequant_kquant(qt).to(x.dtype))
+        cos = torch.nn.functional.cosine_similarity(
+            y.float().flatten(), ref.float().flatten(), dim=0
+        ).item()
+        assert cos >= 0.99, f"{name} ({qt.codebook}) cos={cos:.4f} < 0.99"
 
 
 @pytest.mark.correctness

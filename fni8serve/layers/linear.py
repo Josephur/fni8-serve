@@ -24,6 +24,17 @@ try:  # NF4 codebook for 4-bit weight reconstruction (present in fni8)
 except Exception:  # pragma: no cover
     NF4_CODEBOOK = None
 
+# Does the installed fni8 build carry the FUSED native-GGUF k-quant dp4a kernel
+# (fni8.linear → linear_q4k, MIGRATION P0)? It is the other agent's keystone and may
+# not be in every fni8 build yet. When absent, `gguf_kquant` weights take the exact
+# dequant-matmul fallback below (numerically correct, just not yet accelerated).
+try:
+    import inspect as _inspect
+
+    _FNI8_HAS_Q4K = "gguf_kquant" in _inspect.getsource(fni8.ops.linear)
+except Exception:  # pragma: no cover
+    _FNI8_HAS_Q4K = False
+
 
 def _dequant_weight(qt: QTensor) -> torch.Tensor:
     """Reconstruct an fp16 weight [out, in] from a stored QTensor (fallback path)."""
@@ -53,6 +64,13 @@ def _dequant_weight(qt: QTensor) -> torch.Tensor:
         out = codes.shape[0]
         scale = qt.scale.reshape(out, in_ // g, 1)
         return (codes.float().reshape(out, in_ // g, g) * scale).reshape(out, in_).to(torch.float16)
+    if qt.scheme == "gguf_kquant":
+        # Native GGUF k-quant with no fused dp4a kernel yet (Q5_K/Q6_K) or on CPU:
+        # dequant the raw bytes via llama.cpp's own block dequant (byte-faithful, no
+        # re-quant) and run an fp16 matmul. Numerically correct until the P0 kernel.
+        from ..gguf_native import dequant_kquant
+
+        return dequant_kquant(qt)
     raise ValueError(f"LinearW8A8 cannot use scheme {qt.scheme!r}")
 
 
@@ -67,6 +85,10 @@ class LinearW8A8(nn.Module):
             self.in_features = weight.data.shape[1] * 2
         elif weight.scheme == "per_group_w3a8":
             self.in_features = (weight.data.shape[1] // 3) * 32
+        elif weight.scheme == "gguf_kquant":
+            # raw k-quant bytes [out, n_superblocks*type_size]; in = n_superblocks*256
+            _TS = {"q4_k": 144, "q5_k": 176, "q6_k": 210}[weight.codebook]
+            self.in_features = (weight.data.shape[1] // _TS) * 256
         else:
             self.in_features = weight.data.shape[1]
 
@@ -79,6 +101,11 @@ class LinearW8A8(nn.Module):
             return True
         if qt.scheme == "per_group_w3a8":
             return True                              # uniform 3-bit dp4a (issue #181)
+        # Native GGUF k-quant: only Q4_K has a fused dp4a kernel today (fni8.linear ->
+        # linear_q4k). Q5_K/Q6_K fall through to the dequant fallback until their
+        # kernels land (MIGRATION P0); both are numerically correct meanwhile.
+        if qt.scheme == "gguf_kquant":
+            return qt.codebook == "q4_k" and _FNI8_HAS_Q4K
         return qt.scheme == "per_group_i4" and qt.codebook == "int4"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

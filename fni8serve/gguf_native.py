@@ -25,8 +25,24 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
+import torch
+
+from fni8 import QTensor
+
 from .models.config import ModelConfig
 from .models.registry import _resolve
+
+# ── GGUF k-quant type tag ↔ our `gguf_kquant` codebook + block byte size ──────
+# type_size (bytes per 256-value super-block) is fixed by the GGML layout; the raw
+# GGUF bytes are already stored [out, n_superblocks*type_size], exactly the shape a
+# `gguf_kquant` QTensor wants (verified against gguf.constants.GGML_QUANT_SIZES).
+_KQUANT = {
+    "Q4_K": ("q4_k", 144),
+    "Q5_K": ("q5_k", 176),
+    "Q6_K": ("q6_k", 210),
+}
+_FLOAT_TYPES = {"F32", "F16", "BF16"}
 
 # ── GGUF `general.architecture` string → our registry builder key ────────────
 # The GGUF arch strings (llama.cpp `LLM_ARCH_*` names, `gguf-py/gguf/constants.py`
@@ -261,6 +277,70 @@ def gguf_config(path: str) -> ModelConfig:
             "fni8.moe.* KV or an arch-hardcoded gate."
         )
     return cfg
+
+
+def dequant_kquant(qt: QTensor) -> torch.Tensor:
+    """Dequantize a `gguf_kquant` QTensor's raw bytes back to an fp16 `[out, in]`
+    weight, via llama.cpp's own block dequant. Used by the LinearW8A8 fallback (for
+    k-quant types with no fused dp4a kernel yet — Q5_K/Q6_K — and CPU tensors) and by
+    the mixed-type merge path. Byte-faithful: no re-quant, just the native dequant."""
+    from gguf import GGMLQuantizationType, dequantize
+
+    tag = {"q4_k": "Q4_K", "q5_k": "Q5_K", "q6_k": "Q6_K"}[qt.codebook]
+    arr = qt.data.detach().cpu().numpy()  # uint8 [out, n_superblocks*type_size]
+    deq = dequantize(arr, GGMLQuantizationType[tag]).astype(np.float32)  # [out, in]
+    return torch.from_numpy(np.ascontiguousarray(deq)).to(qt.data.device).half()
+
+
+def gguf_state_dict(path: str, *, device: str = "cuda") -> dict:
+    """Load a GGUF's tensors as a build-ready state dict, RESIDENT and native — no
+    dequant→requant transcode of the k-quant weights (MIGRATION §3a):
+
+      Q4_K/Q5_K/Q6_K  → `gguf_kquant` QTensor holding the RAW GGUF bytes (the fused
+                        dp4a kernel unpacks in-kernel; Q4_K is live, Q5_K/Q6_K use
+                        the LinearW8A8 dequant fallback until their kernels land).
+      Q8_0            → `per_row_i8` (already int8 blocks; dequant→per-row-int8 is
+                        near-lossless — the one benign requant, source is 8-bit).
+      F32/F16/BF16    → raw fp16 Tensor (norms, router gate, embeddings).
+
+    Names are translated GGUF→HF by `gguf_import.gguf_name_to_hf`. Non-linear tensors
+    (norms/router/embeddings, per `convert.is_quantizable_linear`) are returned as
+    plain fp16 Tensors — exactly what the builders expect (LinearW8A8 wants a QTensor,
+    RMSNorm/VocabEmbedding want a Tensor), matching `loader.load_fni8_state_dict`."""
+    from gguf import GGMLQuantizationType, GGUFReader, dequantize
+
+    from .convert import is_quantizable_linear
+    from .gguf_import import gguf_name_to_hf
+
+    reader = GGUFReader(path)
+    out: dict = {}
+    for t in reader.tensors:
+        hf = gguf_name_to_hf(t.name)
+        if hf is None:
+            continue  # unmapped (e.g. an SSM/MoE tensor pending the P3 remap)
+        gtype = GGMLQuantizationType(t.tensor_type).name
+        quantizable = is_quantizable_linear(hf)
+
+        if quantizable and gtype in _KQUANT:
+            code, tsz = _KQUANT[gtype]
+            data = torch.from_numpy(np.ascontiguousarray(t.data).copy()).to(device)  # uint8 [out, n_sb*tsz]
+            out[hf] = QTensor(data, None, scheme="gguf_kquant", codebook=code, group_size=256)
+        elif quantizable and gtype == "Q8_0":
+            deq = dequantize(t.data, GGMLQuantizationType.Q8_0).astype(np.float32)
+            w = torch.from_numpy(np.ascontiguousarray(deq)).to(device)
+            from fni8.quant.core import quantize_int8_rowwise
+
+            q, s = quantize_int8_rowwise(w)
+            out[hf] = QTensor(q.contiguous(), s.squeeze(-1).float().contiguous(), scheme="per_row_i8")
+        else:
+            # float weights + all non-linear (norms/router/embeddings) → fp16 Tensor.
+            if gtype in _FLOAT_TYPES:
+                w = torch.from_numpy(np.ascontiguousarray(t.data).copy()).to(device).half()
+            else:  # a quantized non-linear (rare) — dequant to fp16
+                deq = dequantize(t.data, GGMLQuantizationType(t.tensor_type)).astype(np.float32)
+                w = torch.from_numpy(np.ascontiguousarray(deq)).to(device).half()
+            out[hf] = w
+    return out
 
 
 def gguf_dit_config(path: str) -> dict:
