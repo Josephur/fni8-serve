@@ -292,7 +292,9 @@ def dequant_kquant(qt: QTensor) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(deq)).to(qt.data.device).half()
 
 
-def gguf_state_dict(path: str, *, device: str = "cuda") -> dict:
+def gguf_state_dict(
+    path: str, *, device: str = "cuda", native_types: tuple[str, ...] = ("Q4_K", "Q5_K", "Q6_K")
+) -> dict:
     """Load a GGUF's tensors as a build-ready state dict, RESIDENT and native — no
     dequant→requant transcode of the k-quant weights (MIGRATION §3a):
 
@@ -306,11 +308,26 @@ def gguf_state_dict(path: str, *, device: str = "cuda") -> dict:
     Names are translated GGUF→HF by `gguf_import.gguf_name_to_hf`. Non-linear tensors
     (norms/router/embeddings, per `convert.is_quantizable_linear`) are returned as
     plain fp16 Tensors — exactly what the builders expect (LinearW8A8 wants a QTensor,
-    RMSNorm/VocabEmbedding want a Tensor), matching `loader.load_fni8_state_dict`."""
+    RMSNorm/VocabEmbedding want a Tensor), matching `loader.load_fni8_state_dict`.
+
+    `native_types` selects which k-quant types stay RESIDENT as raw `gguf_kquant`
+    bytes (default: all three — the native no-transcode residency PR-2 delivers). A
+    type NOT in the set is dequantized to fp16 and re-quantized to `per_row_i8` for
+    the proven dp4a W8A8 path. `load_gguf_engine` narrows this to the k-quant types
+    whose FUSED dp4a kernel is actually built (MIGRATION P0), so decode runs fast on
+    real dp4a today and flips to native residency automatically as the kernels land —
+    the LinearW8A8 dequant fallback is per-forward and far too slow for a full model."""
     from gguf import GGMLQuantizationType, GGUFReader, dequantize
 
     from .convert import is_quantizable_linear
     from .gguf_import import gguf_name_to_hf
+
+    def _to_per_row_i8(np_fp32) -> QTensor:
+        from fni8.quant.core import quantize_int8_rowwise
+
+        w = torch.from_numpy(np.ascontiguousarray(np_fp32)).to(device)
+        q, s = quantize_int8_rowwise(w)
+        return QTensor(q.contiguous(), s.squeeze(-1).float().contiguous(), scheme="per_row_i8")
 
     reader = GGUFReader(path)
     out: dict = {}
@@ -321,17 +338,16 @@ def gguf_state_dict(path: str, *, device: str = "cuda") -> dict:
         gtype = GGMLQuantizationType(t.tensor_type).name
         quantizable = is_quantizable_linear(hf)
 
-        if quantizable and gtype in _KQUANT:
-            code, tsz = _KQUANT[gtype]
-            data = torch.from_numpy(np.ascontiguousarray(t.data).copy()).to(device)  # uint8 [out, n_sb*tsz]
+        if quantizable and gtype in _KQUANT and gtype in native_types:
+            code, _tsz = _KQUANT[gtype]
+            data = torch.from_numpy(np.ascontiguousarray(t.data).copy()).to(device)  # uint8 [out,·]
             out[hf] = QTensor(data, None, scheme="gguf_kquant", codebook=code, group_size=256)
+        elif quantizable and gtype in _KQUANT:  # k-quant with no fused kernel → int8 dp4a
+            out[hf] = _to_per_row_i8(
+                dequantize(t.data, GGMLQuantizationType[gtype]).astype(np.float32)
+            )
         elif quantizable and gtype == "Q8_0":
-            deq = dequantize(t.data, GGMLQuantizationType.Q8_0).astype(np.float32)
-            w = torch.from_numpy(np.ascontiguousarray(deq)).to(device)
-            from fni8.quant.core import quantize_int8_rowwise
-
-            q, s = quantize_int8_rowwise(w)
-            out[hf] = QTensor(q.contiguous(), s.squeeze(-1).float().contiguous(), scheme="per_row_i8")
+            out[hf] = _to_per_row_i8(dequantize(t.data, GGMLQuantizationType.Q8_0).astype(np.float32))
         else:
             # float weights + all non-linear (norms/router/embeddings) → fp16 Tensor.
             if gtype in _FLOAT_TYPES:
@@ -341,6 +357,52 @@ def gguf_state_dict(path: str, *, device: str = "cuda") -> dict:
                 w = torch.from_numpy(np.ascontiguousarray(deq)).to(device).half()
             out[hf] = w
     return out
+
+
+def _gguf_eos_id(path: str) -> int | None:
+    """Read the GGUF tokenizer's EOS id (`tokenizer.ggml.eos_token_id`) so decode can
+    stop naturally, mirroring the `.fni8` load path's `eos_id`."""
+    from gguf import GGUFReader
+
+    f = GGUFReader(path).fields.get("tokenizer.ggml.eos_token_id")
+    return None if f is None else int(_field_value(f))
+
+
+def load_gguf_engine(
+    path: str,
+    *,
+    device: str = "cuda",
+    max_num_seqs: int = 16,
+    max_len: int = 2048,
+    eos_id: int | None = None,
+):
+    """Build an `LLMEngine` straight from a `.gguf` — the P1 milestone: end-to-end
+    single-stream decode with ZERO `.fni8`. Mirrors `api.server.load_engine`'s `.fni8`
+    seam: `gguf_config` + `gguf_state_dict` → `LLMEngine`, over the unchanged,
+    format-agnostic builders + engine."""
+    import dataclasses
+
+    from .engine import LLMEngine
+    from .layers.linear import _FNI8_HAS_Q4K
+
+    cfg = gguf_config(path)
+    # Keep k-quant weights RESIDENT (native gguf_kquant) only for types whose fused
+    # dp4a kernel is built; otherwise dequant→per_row_i8 so decode runs on real dp4a
+    # NOW (the per-forward dequant fallback is far too slow for a whole model).
+    native_types = ("Q4_K",) if _FNI8_HAS_Q4K else ()
+    weights = gguf_state_dict(path, device=device, native_types=native_types)
+
+    # qk_norm is detect-from-tensors (no GGUF KV for it): Qwen3/Gemma3 carry per-head
+    # q_norm/k_norm and skipping them feeds un-normalized Q/K into RoPE → garbage.
+    # Same guard api.server.load_engine applies on the .fni8 path.
+    if not getattr(cfg, "qk_norm", False) and any(".q_norm.weight" in n for n in weights):
+        cfg = dataclasses.replace(cfg, qk_norm=True)
+
+    if eos_id is None:
+        eos_id = _gguf_eos_id(path)
+    return LLMEngine(
+        cfg, weights, device=device, max_num_seqs=max_num_seqs, max_len=max_len, eos_id=eos_id
+    )
 
 
 def gguf_dit_config(path: str) -> dict:

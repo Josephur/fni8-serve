@@ -192,6 +192,37 @@ def test_linear_gguf_kquant_matches_dequant():
         assert cos >= 0.99, f"{name} ({qt.codebook}) cos={cos:.4f} < 0.99"
 
 
+@pytest.mark.perf
+@requires_qwen3
+def test_gguf_e2e_greedy_decode_zero_fni8():
+    """PR-3 / the P1 milestone: greedily decode from a REAL GGUF LLM through the full
+    fni8-serve engine (prefill + paged-KV decode) with ZERO `.fni8` — no .fni8 file,
+    no .fni8 loader touched. Assert it runs end-to-end, the output is deterministic,
+    and every emitted id is in-vocab. Needs a CUDA device with room for an 8B."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    import time
+
+    from fni8serve.engine.sequence import SamplingParams
+    from fni8serve.gguf_native import load_gguf_engine
+
+    eng = load_gguf_engine(_QWEN3_8B, device="cuda", max_num_seqs=2, max_len=256)
+    assert eng.cfg.vocab_size > 150000
+    prompt = [3838, 374, 279, 6722, 315, 9625, 30]  # arbitrary in-vocab Qwen3 ids
+    n = 16
+    params = SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True)  # greedy
+
+    t0 = time.perf_counter()
+    out1 = eng.generate([prompt], params)[0]
+    dt = time.perf_counter() - t0
+    out2 = eng.generate([prompt], params)[0]
+
+    assert len(out1) == n, f"expected {n} decoded tokens, got {len(out1)}"
+    assert out1 == out2, "greedy decode must be deterministic across runs"
+    assert all(0 <= t < eng.cfg.vocab_size for t in out1), "decoded ids out of vocab range"
+    print(f"\n[e2e] Qwen3-8B GGUF greedy decode: {out1}  ({n / dt:.1f} tok/s incl. prefill)")
+
+
 @pytest.mark.correctness
 @requires_ltx
 def test_dit_config_blob_parses():

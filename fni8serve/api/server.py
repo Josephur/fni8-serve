@@ -27,6 +27,15 @@ from .app import create_app
 def load_engine(model_path: str, *, device: str = "cuda", max_num_seqs: int = 16,
                 max_len: int = 2048, eos_id: int | None = None) -> LLMEngine:
     """Architecture is auto-detected from the checkpoint; see the README Quickstart."""
+    # Suffix branch: a `.gguf` loads NATIVELY (GGUF-KV → ModelConfig + resident
+    # k-quant weights, no `.fni8`); anything else takes the legacy `.fni8` path. Both
+    # formats coexist through the migration — no `.fni8` code is removed here (P5).
+    if model_path.endswith(".gguf"):
+        from ..gguf_native import load_gguf_engine
+
+        return load_gguf_engine(
+            model_path, device=device, max_num_seqs=max_num_seqs, max_len=max_len, eos_id=eos_id
+        )
     info = checkpoint_info(model_path)
     meta_cfg = info["meta"]["config"]
     # Honor the arch stored at conversion time. The meta config is a ModelConfig dump
