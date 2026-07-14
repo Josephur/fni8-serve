@@ -336,3 +336,69 @@ def test_lightning_int8_skipped_with_slopes(monkeypatch):
     o_dispatch, _ = _lightning_attn_dispatch(q, k, v, slopes_nz)
     o_ref, _ = lightning_attention(q, k, v, slopes_nz)
     assert torch.allclose(o_dispatch.float(), o_ref.float(), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not CUDA, reason="the int8 chunk prefill kernel needs a GPU")
+def test_prefill_int8_flag_auto_degrades():
+    """The `_DND_PREFILL_INT8` flag must exist and default to OFF — the ungated
+    kernel is an approximation for gated models (erase term missing), so opt-in
+    with FNI8_DND_PREFILL_INT8=1. Auto-degrades: kernel absent → always False."""
+    import fni8
+    import fni8serve.layers.linear_attn as la
+
+    assert hasattr(la, "_DND_PREFILL_INT8"), "flag must exist as a module attribute"
+    assert isinstance(la._DND_PREFILL_INT8, bool), "flag must be bool"
+    # Default is off; kernel presence is checked by the flag's own hasattr gate
+    if hasattr(fni8, "deltanet_chunk_int8_fwd"):
+        # Kernels present but env default is "0" → flag is False
+        assert la._DND_PREFILL_INT8 is False, (
+            "flag must default to off even when kernels are present"
+        )
+
+
+@pytest.mark.skipif(not CUDA, reason="the int8 chunk prefill kernel needs a GPU")
+def test_prefill_int8_matches_eager(monkeypatch):
+    """The int8 chunked prefill kernel (`fni8.deltanet_chunk_int8_fwd`, L>1, CUDA,
+    Dk/Dv<=128) must reproduce the torch recurrence oracle within int8 tolerance bars
+    (SQNR/cosine similarity, NOT allclose). The eager per-token chain —
+    `recurrent_gated_delta_rule` — is the kernel's numeric oracle."""
+    import fni8
+    import fni8serve.layers.linear_attn as la
+
+    if not hasattr(fni8, "deltanet_chunk_int8_fwd"):
+        pytest.skip("installed fni8 predates deltanet_chunk_int8_fwd")
+
+    from fni8 import QTensor
+    from fni8serve.models.config import ModelConfig
+
+    torch.manual_seed(42)
+    B, L, nk, nv, kd, vd, H = 1, 8, 2, 4, 16, 16, 64
+    cfg = ModelConfig(arch="qwen3_next", vocab_size=32, hidden_size=H,
+                      num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
+                      intermediate_size=64, max_position_embeddings=64, head_dim=32)
+
+    def qt(o, i):
+        w = torch.randn(o, i, device="cuda", dtype=torch.float16) * 0.05
+        s = w.abs().amax(-1, keepdim=True).clamp_min(1e-6) / 127
+        return QTensor(torch.round(w / s).clamp_(-127, 127).to(torch.int8),
+                       s.squeeze(-1).float(), scheme="per_row_i8")
+
+    blk = GatedDeltaNetAttention(
+        cfg, qkv_proj=qt(2 * nk * kd + nv * vd, H), out_proj=qt(H, nv * vd),
+        conv_weight=torch.randn(2 * nk * kd + nv * vd, 4, device="cuda", dtype=torch.float16),
+        a_log=torch.randn(nv, device="cuda") * 0.5, dt_bias=torch.randn(nv, device="cuda"),
+        beta_proj=qt(nv, H), gate_proj=qt(nv, H),
+        norm_gain=torch.randn(vd, device="cuda", dtype=torch.float16) * 0.1,
+        num_k_heads=nk, num_v_heads=nv, key_dim=kd, value_dim=vd).cuda()
+
+    x = torch.randn(B, L, H, device="cuda", dtype=torch.float16)
+
+    monkeypatch.setattr(la, "_DND_PREFILL_INT8", True)
+    y_int8 = blk(x, None, None, 0)
+    monkeypatch.setattr(la, "_DND_PREFILL_INT8", False)
+    y_eager = blk(x, None, None, 0)
+
+    yf, ye = y_int8.float().flatten(), y_eager.float().flatten()
+    cos = torch.dot(yf, ye) / (yf.norm() * ye.norm() + 1e-12)
+    assert cos.item() >= 0.99, f"int8 prefill cos vs eager below bar: cos={cos.item()}"
+    assert y_int8.shape == (B, L, H) and torch.isfinite(y_int8).all()

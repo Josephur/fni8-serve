@@ -110,6 +110,15 @@ _DND_STEP = (
     and hasattr(fni8, "deltanet_fused_decode")
 )
 
+# int8 chunked prefill for Gated DeltaNet (L>1). DEFAULT OFF — the kernel is
+# ungated (S_t = S_{t-1} + v_t k_t^T); for GATED delta nets (Qwen3-Next/3.5/3.6)
+# the erase term is missing, so this is an approximation that can shift greedy
+# argmax. Opt-in with FNI8_DND_PREFILL_INT8=1 for near-ungated models; auto-
+# degrades if the installed fni8 predates the chunk kernel.
+_DND_PREFILL_INT8 = os.environ.get("FNI8_DND_PREFILL_INT8", "0") == "1" and hasattr(
+    fni8, "deltanet_chunk_int8_fwd"
+)
+
 
 def _gated_delta_rule(q, k, v, beta, g, state, L):
     """Dispatch the gated delta rule. For the single-token decode step (L==1, CUDA,
@@ -117,9 +126,14 @@ def _gated_delta_rule(q, k, v, beta, g, state, L):
     the eager reference above (validated bit-close against it, cos 1.0), but it
     collapses the ~5 tiny eager ops into ONE launch AND is CUDA-graph-capturable
     (register state, no cudaFuncSetAttribute), so it replays inside the engine's
-    graphed decode instead of forcing an eager fallback. Eager reference otherwise
-    (prefill L>1, CPU, head dims > 128, or FNI8_DND_DECODE=0). The kernel takes
-    alpha=exp(g).
+    graphed decode instead of forcing an eager fallback. For the multi-token prefill
+    step (L>1, CUDA, Dk/Dv<=128) `fni8.deltanet_chunk_int8_fwd` — an int8 dp4a
+    ungated chunked delta-rule kernel where state S, values V, and residuals stay
+    fp32 (never quantized) while only the Q·K dot products use dp4a int8 — is
+    available but DEFAULT OFF (opt-in with FNI8_DND_PREFILL_INT8=1). The kernel is
+    ungated (no erase term); for GATED delta nets it is an approximation that can
+    shift greedy argmax. Alpha/beta gating is absorbed into v via cumulative-alpha
+    scaling before the call when enabled.
 
     Decode returns the readout `o` in fp32 (the kernel's native accumulate dtype).
     The gated RMSNorm in the caller upcasts to fp32 anyway, so downcasting to v.dtype
@@ -131,6 +145,19 @@ def _gated_delta_rule(q, k, v, beta, g, state, L):
         o, state = fni8.deltanet_recurrent_decode(
             q.float(), k.float(), v.float(), g.exp().float(), beta.float(), initial_state=state
         )
+        return o, state
+    if _DND_PREFILL_INT8 and L > 1 and q.is_cuda and q.shape[-1] <= 128 and v.shape[-1] <= 128:
+        alpha = g.exp().float()                                 # [B,nv,L]
+        A = torch.cumprod(alpha.clamp_min(1e-30), dim=-1)       # cumulative decay
+        bf = beta.float()                                       # [B,nv,L]
+        vf = v.float()                                          # [B,nv,L,Dv]
+        v_scaled = (bf.unsqueeze(-1) * vf) / A.unsqueeze(-1).clamp_min(1e-30)
+        o, state = fni8.deltanet_chunk_int8_fwd(
+            q.float(), k.float(), v_scaled, initial_state=state
+        )
+        o = o * A.unsqueeze(-1)                                 # [B,nv,L,Dv]
+        if state is not None:
+            state = state * A[:, :, -1:].unsqueeze(-1)
         return o, state
     return recurrent_gated_delta_rule(q, k, v, beta, g, state=state)
 

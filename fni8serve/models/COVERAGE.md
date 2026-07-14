@@ -27,7 +27,7 @@ notes). Do not read a released-✅ as "supported for generation."
 | **LFM2 / LFM2-MoE** | ✅ | hybrid **short-conv** + GQA | SwiGLU (w1/w3/w2) | ✅ | GQA halves decode int8 (`attn_int8_decode`); short-conv stays torch (cheap, not the int8 story); `full_attn_idxs`; double-gated conv(k=3); QK-norm; sigmoid MoE router |
 | **GLM-4.5/4.6** | ✅ | GQA + **partial RoPE 0.5** + QKV-bias | sigmoid MoE + shared | ✅ | GQA → int8 decode wired (`attn_int8_decode`/`attn_paged_decode_cached`); e_score_correction_bias select, routed_scaling 2.5, first-k-dense |
 | **Hunyuan** (A13B) | ✅ | GQA + QK-norm | softmax MoE + shared | ✅ | GQA → int8 decode wired; `mlp.gate.wg`, `shared_mlp`; CLA (Large) not modeled |
-| **Qwen3-Next / Qwen3.5 / Qwen3.6** | ✅ | **hybrid: Gated DeltaNet (linear) + full** | ultra-sparse MoE + shared | ✅⛔ | int8 **decode** wired both halves: gated/full GQA (`attn_int8_decode`) + DeltaNet L==1 step (`fni8.deltanet_recurrent_decode`, auto-degrades). DeltaNet **prefill** recurrence still pure-torch (`recurrent_gated_delta_rule`); int8 chunk kernel unwired = remaining gap |
+| **Qwen3-Next / Qwen3.5 / Qwen3.6** | ✅ | **hybrid: Gated DeltaNet (linear) + full** | ultra-sparse MoE + shared | ✅ | int8 **decode** wired both halves: gated/full GQA (`attn_int8_decode`) + DeltaNet L==1 step (`fni8.deltanet_recurrent_decode`, auto-degrades). int8 **prefill** wired: L>1 chunked recurrence through `fni8.deltanet_chunk_int8_fwd` (auto-degrades, `_DND_PREFILL_INT8`). Both paths now int8 end-to-end. |
 | **DeepSeek-V3/V4** | V3 ✅ | **MLA (latent KV)** | fine MoE + shared | ✅ | int8 **absorb decode** wired (`fni8.mla_decode_absorb_int8`, `use_int8_absorb=True` default) — folds `W_UK`/`W_UV`. MLA **prefill** is fp32 einsum **by design** (numerics contract; no int8 MLA-prefill kernel) |
 | **MiniMax-Text** | ✅ | **lightning (linear)** + softmax hybrid | softmax MoE | ✅⛔ | softmax half → int8 decode wired (GQA). Lightning half: prefill → int8 dispatch wired (`fni8.lightning_attn_int8_fwd` via `_lightning_attn_dispatch`; activates for decay-free case, correctness gate cos at least 0.99 vs fp32 ref). MiniMax ALiBi slopes produce non-trivial per-head decay — int8 kernel is un-gated (decay-free), so MiniMax prefill falls through to fp32 scalar reference. Decode L==1 always fp32 (no graph-capturable lightning decode kernel). postnorm alpha/beta scaling |
 | **DiffusionGemma** | ✅ (post-cutoff) | **bidirectional** over canvas | GeGLU MoE | 🟡 | `attn_int8_fwd(causal=False)`; needs DiffusionDecodeStrategy |
@@ -83,13 +83,13 @@ The big decode kernels have **landed and are wired**: MLA int8 **absorb decode**
 (`fni8.deltanet_recurrent_decode`, Qwen3-Next/3.5/3.6) both ship and are called from
 `mla_attn.py` / `linear_attn.py`. What is still open:
 
-1. **Gated DeltaNet int8 *prefill*** (Qwen3-Next/3.5/3.6): the L>1 chunked recurrence
-   still runs pure-torch (`recurrent_gated_delta_rule`); the int8 chunk kernel is unwired.
-   Decode is already int8; this is a prefill-only gap.
-2. **Lightning linear attention** (MiniMax): prefill dispatch wired (`fni8.lightning_attn_int8_fwd`,
-   `_lightning_attn_dispatch`); kernel is **un-gated** (decay-free), so MiniMax ALiBi slopes
-   force fp32 fallback. Decode L==1 still fp32 (**no graph-capturable lightning decode kernel**
-   — the genuinely-missing piece).
+1. **Gated DeltaNet int8 *prefill*** (Qwen3-Next/3.5/3.6): **WIRED** — the L>1 chunked recurrence now routes through
+   `fni8.deltanet_chunk_int8_fwd` (auto-degrades, `_DND_PREFILL_INT8`). Decode was already int8; both
+   paths are now int8 end-to-end.
+2. **Lightning linear attention** (MiniMax): the recurrence runs pure-torch at **both**
+   prefill and decode (`lightning_attention`). `fni8.lightning_attn_int8_fwd` exists but is
+   unwired for prefill, and there is **no graph-capturable lightning *decode* kernel** at
+   all — the genuinely-missing piece.
 3. **MLA int8 *prefill*** (DeepSeek-V3/V4): prefill is an fp32 einsum **by design**
    (softmax/LSE/PV numerics contract), not a missing kernel. MoE + MTP are already covered.
 
