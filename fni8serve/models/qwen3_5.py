@@ -338,7 +338,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         super().__init__()
         self.config = cfg
         sd = _unwrap_vlm_text_backbone(sd)
-        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"])
+        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"], out_dtype=cfg.act_dtype())
         rope = RotaryEmbedding(
             cfg.resolved_head_dim(),
             cfg.max_position_embeddings,

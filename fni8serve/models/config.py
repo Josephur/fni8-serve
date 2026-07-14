@@ -147,6 +147,15 @@ class ModelConfig:
     # quantization intent (how weights were stored in the .fni8)
     weight_bits: int = 8
 
+    # activation/residual-stream compute dtype. Mirrors the checkpoint's HF
+    # `torch_dtype`. bf16-native models (Gemma3, most Qwen3) carry "massive
+    # activation" residual channels that reach ~1e4-1e7 — well past fp16's 65504
+    # ceiling — so their forward MUST run the residual stream in bf16 (fp32's
+    # exponent range) or it overflows to inf->NaN mid-stack (issue #260, the same
+    # fp16-truncation bug class as comfy #115 / serve #256). fp16-native
+    # checkpoints stay fp16. Softmax/LSE/norm stay fp32 regardless (never quantized).
+    torch_dtype: str = "float16"
+
     # multimodal vision-language fields (populated from VLM configs only)
     is_multimodal: bool = False
     vision_config: VisionConfig | None = None
@@ -164,6 +173,17 @@ class ModelConfig:
 
     def is_moe(self) -> bool:
         return self.num_experts > 0
+
+    def act_dtype(self):
+        """Torch dtype for the activation/residual stream. bf16 for bf16-native
+        checkpoints (their massive-activation channels overflow fp16), else fp16.
+        The int8 dp4a matmuls are unaffected (activations are quantized to int8
+        regardless); only the store/residual dtype tracks this — perf-neutral on
+        this fleet (bf16 elementwise uses the healthy half2 CUDA-core pipe, not the
+        dead tensor cores). Softmax/LSE/norm reductions still run in fp32."""
+        import torch
+
+        return torch.bfloat16 if str(self.torch_dtype).endswith("bfloat16") else torch.float16
 
     def layer_is_global(self, layer_idx: int) -> bool:
         """Full-attention layer? True for dense models; for Gemma3 sliding-window
@@ -310,6 +330,7 @@ class ModelConfig:
             rope_theta=rope_theta,
             rope_local_theta=c.get("rope_local_base_freq"),
             tie_word_embeddings=c.get("tie_word_embeddings", False),
+            torch_dtype=str(c.get("torch_dtype", "float16")),
             qk_norm=c.get("qk_norm", False),
             qkv_bias=c.get("attention_bias", False),
             partial_rotary_factor=partial_rotary,
@@ -364,6 +385,7 @@ _KNOWN_HF_KEYS = {
     "full_attention_interval",  # derived into the linear_attention/interval scalars
     "rope_local_base_freq",
     "tie_word_embeddings",
+    "torch_dtype",  # -> activation/residual-stream dtype (bf16 overflow guard, #260)
     "attention_bias",
     "qk_norm",
     "query_pre_attn_scalar",

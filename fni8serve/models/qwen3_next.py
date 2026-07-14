@@ -169,7 +169,7 @@ class Qwen3NextForCausalLM(nn.Module):
     def __init__(self, cfg: ModelConfig, sd: dict):
         super().__init__()
         self.config = cfg
-        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"])
+        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"], out_dtype=cfg.act_dtype())
         rope = RotaryEmbedding(
             cfg.resolved_head_dim(),
             cfg.max_position_embeddings,

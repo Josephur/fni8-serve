@@ -111,7 +111,7 @@ class DeepseekForCausalLM(nn.Module):
     def __init__(self, cfg: ModelConfig, sd: dict):
         super().__init__()
         self.config = cfg
-        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"])
+        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"], out_dtype=cfg.act_dtype())
         self.layers = nn.ModuleList(
             [DeepseekDecoderLayer(cfg, i, sd) for i in range(cfg.num_hidden_layers)]
         )

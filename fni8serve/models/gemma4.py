@@ -354,7 +354,7 @@ class Gemma4Model(nn.Module):
         self.config = cfg
         H = cfg.hidden_size
         scale = cfg.embed_scale or (H**0.5)
-        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"], embed_scale=scale)
+        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"], embed_scale=scale, out_dtype=cfg.act_dtype())
 
         # Dual RoPE
         rope_theta = cfg.rope_theta

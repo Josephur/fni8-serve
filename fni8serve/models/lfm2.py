@@ -122,7 +122,7 @@ class Lfm2ForCausalLM(nn.Module):
         attn_idxs = set(cfg.extra.get("full_attn_idxs") or [])
         if not attn_idxs and cfg.extra.get("layer_types"):
             attn_idxs = {i for i, t in enumerate(cfg.extra["layer_types"]) if t == "full_attention"}
-        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"])
+        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"], out_dtype=cfg.act_dtype())
         rope = RotaryEmbedding(
             cfg.resolved_head_dim(), cfg.max_position_embeddings, base=cfg.rope_theta
         )

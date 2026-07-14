@@ -85,7 +85,7 @@ class Qwen3Model(nn.Module):
         super().__init__()
         self.config = cfg
         self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"],
-                                           embed_scale=cfg.embed_scale or 1.0)
+                                           embed_scale=cfg.embed_scale or 1.0, out_dtype=cfg.act_dtype())
         rope = RotaryEmbedding(cfg.resolved_head_dim(), cfg.max_position_embeddings,
                                base=cfg.rope_theta, rotary_dim=cfg.rotary_dim())
         self.layers = nn.ModuleList(

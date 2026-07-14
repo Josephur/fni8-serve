@@ -100,7 +100,7 @@ class MiniMaxForCausalLM(nn.Module):
     def __init__(self, cfg, sd):
         super().__init__()
         self.config = cfg
-        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"])
+        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"], out_dtype=cfg.act_dtype())
         rope = RotaryEmbedding(cfg.resolved_head_dim(), cfg.max_position_embeddings,
                                base=cfg.rope_theta, rotary_dim=cfg.rotary_dim())
         self.layers = nn.ModuleList([MiniMaxDecoderLayer(cfg, i, sd, rope) for i in range(cfg.num_hidden_layers)])

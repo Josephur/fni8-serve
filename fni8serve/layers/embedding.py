@@ -31,9 +31,14 @@ class VocabEmbedding(nn.Module):
     card. Enable it at load time with `load_fni8_state_dict(..., embed_int8=True)`.
     """
 
-    def __init__(self, weight: QTensor | torch.Tensor, embed_scale: float = 1.0):
+    def __init__(self, weight: QTensor | torch.Tensor, embed_scale: float = 1.0,
+                 out_dtype: torch.dtype = torch.float16):
         super().__init__()
         self.embed_scale = embed_scale
+        # Dtype of the residual stream this embedding seeds. bf16-native models
+        # (Gemma3 etc.) must run bf16 (fp32's exponent range) or their massive
+        # residual channels overflow fp16's 65504 ceiling a few layers in (#260).
+        self.out_dtype = out_dtype
         if isinstance(weight, QTensor):
             if weight.scheme != "per_row_i8":
                 raise ValueError(
@@ -56,9 +61,9 @@ class VocabEmbedding(nn.Module):
         if self._int8:
             rows = F.embedding(input_ids, self.qweight)  # int8 [..., hidden]
             scale = F.embedding(input_ids, self.qscale)  # fp32 [..., 1]
-            h = (rows.float() * scale).to(torch.float16)
+            h = (rows.float() * scale).to(self.out_dtype)
         else:
-            h = F.embedding(input_ids, self.weight)
+            h = F.embedding(input_ids, self.weight).to(self.out_dtype)
         if self.embed_scale != 1.0:
             h = h * self.embed_scale
         return h

@@ -69,7 +69,7 @@ class DiffusionGemmaModel(nn.Module):
         super().__init__()
         self.config = cfg
         scale = cfg.embed_scale or (cfg.hidden_size ** 0.5)
-        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"], embed_scale=scale)
+        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"], embed_scale=scale, out_dtype=cfg.act_dtype())
         rope_global = RotaryEmbedding(cfg.resolved_head_dim(), cfg.max_position_embeddings,
                                       base=cfg.rope_theta)
         rope_local = RotaryEmbedding(cfg.resolved_head_dim(), cfg.max_position_embeddings,

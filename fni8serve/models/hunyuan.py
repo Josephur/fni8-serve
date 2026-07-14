@@ -145,7 +145,7 @@ class HunyuanForCausalLM(nn.Module):
         super().__init__()
         self.config = cfg
         self.cla_group_size = cfg.extra.get("cla_group_size", 1)
-        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"])
+        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"], out_dtype=cfg.act_dtype())
         rope = RotaryEmbedding(cfg.resolved_head_dim(), cfg.max_position_embeddings, base=cfg.rope_theta)
         layers = []
         for i in range(cfg.num_hidden_layers):
