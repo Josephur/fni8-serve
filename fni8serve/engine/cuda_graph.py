@@ -136,6 +136,219 @@ class _CapturedGraph:
         self.slot_idx_host = slot_idx_host
 
 
+class _CapturedVerify:
+    __slots__ = (
+        "graph", "ids", "pos", "verify_slot_mapping", "block_table", "context_lens",
+        "hidden", "true_tokens", "batch_bucket", "context_bucket",
+        "ids_host", "pos_host", "context_lens_host", "vsm_host",
+        "slot_idx", "slot_idx_host", "vtraj",
+    )
+
+    def __init__(self, **kw):
+        for k in self.__slots__:
+            setattr(self, k, kw.get(k))
+
+
+class GraphedVerify:
+    """CUDA-graph capture/replay for the spec-decode VERIFY forward — the sibling of
+    :class:`GraphedDecode` that makes MTP + fused-DeltaNet spec-decode compose with
+    graphs (issue #259). Base decode is graphed (~1 launch/step) but the spec verify
+    ran 100% eager, so on this dispatch-bound fleet every spec mode was a NET SLOWDOWN
+    graphs-on (#266: cascade 0.84×, mtp 0.72×) despite high acceptance + bit-identical
+    output. This captures the multi-token verify forward at a FIXED draft length so the
+    per-step launch overhead collapses to one ``cudaGraphLaunch``.
+
+    What is captured (the dominant, shape-static GPU work): the verify forward over
+    ``S = spec_k + 1`` tokens (every row padded to the full ``spec_k`` drafts, so S is a
+    compile-time constant), including all qkv/o/mlp GEMMs, the paged verify attention
+    (``GQAAttention._verify_batched``'s static branch), the per-token DeltaNet /
+    short-conv recurrence + its per-token state trajectory, ``compute_logits`` over all
+    S positions, and the greedy ``argmax`` per position. Reuses the decode graph's
+    contract exactly: persistent device input buffers refreshed via ``copy_`` before
+    replay, a fixed ``max_context_len`` bucket int (no ``.item()`` sync), and the
+    fixed-address per-slot recurrent-state buffers (``bind_graph``).
+
+    What stays eager (truly variable / host-side, off the captured critical path):
+    drafting (n-gram / MTP), the accept-longest-greedy-prefix loop (host argmax
+    compare), EOS/budget truncation, the MTP prefix-KV extension, and the final
+    recurrent-state COMMIT by accept length — the last reads the captured trajectory
+    (fixed-address graph-pool tensors) and scatters, per row, the state after that
+    row's last accepted token, exactly as the eager path does.
+
+    Bit-identity: the captured verify uses the SAME kernels and the SAME per-position
+    context lengths as the eager verify, so accepted tokens + committed K/V + committed
+    recurrent state are byte-identical (guarded by tests/test_graph_verify.py)."""
+
+    def __init__(self, graphed_decode: "GraphedDecode"):
+        self.gd = graphed_decode
+        self.model = graphed_decode.model
+        self.cache = graphed_decode.cache
+        self.lin_cache = graphed_decode.lin_cache
+        self.device = graphed_decode.device
+        self.has_recurrent = graphed_decode.has_recurrent
+        self.batch_buckets = graphed_decode.batch_buckets
+        self.context_bucket_size = graphed_decode.context_bucket_size
+        self.max_graphs = graphed_decode.max_graphs
+        self.supported = graphed_decode.supported
+        self._graphs: dict[tuple[int, int, int], _CapturedVerify] = {}
+
+    # -- public entry point ------------------------------------------------
+    def try_run(self, batch, verify_ids, verify_pos, lengths):
+        """Replay (capturing on first hit) the verify forward for ``batch``.
+
+        ``verify_ids``/``verify_pos``: python ``[B][S]`` lists (base token + spec_k
+        drafts, padded to a fixed S) and their absolute positions. ``lengths``:
+        committed length per row (``seq.length``). Returns ``(hidden_v[:B] [B,S,H],
+        true_tokens[:B] [B,S])`` with the recurrent verify trajectory bound onto
+        ``lin_cache`` for the runner's subsequent ``commit_verify`` — or ``None`` if this
+        step can't be served from a graph (unsupported model, batch over the widest
+        bucket, or the graph cap hit), so the caller falls back to the eager verify."""
+        if not self.supported or not batch:
+            return None
+        B = len(batch)
+        batch_bucket = _next_bucket(self.batch_buckets, B)
+        if batch_bucket is None:
+            return None
+        S = len(verify_ids[0])  # base token + fixed spec_k drafts (compile-time per key)
+        max_real_ctx = max(lengths) + 1 + S
+        cap = self.cache.max_blocks_per_seq * self.cache.block_size
+        context_bucket = min(_round_up(max_real_ctx, self.context_bucket_size), cap)
+        if max_real_ctx > cap:
+            return None  # verify would overrun the paged capacity — let eager handle it
+        key = (batch_bucket, context_bucket, S)
+        g = self._graphs.get(key)
+        if g is None:
+            if len(self._graphs) >= self.max_graphs:
+                return None
+            g = self._capture(batch_bucket, context_bucket, S)
+            self._graphs[key] = g
+            log.info(
+                "cuda-graph verify: captured bucket batch=%d max_context=%d S=%d (%d graphs)",
+                batch_bucket, context_bucket, S, len(self._graphs),
+            )
+        self._fill_inputs(g, batch, verify_ids, verify_pos, lengths)
+        g.graph.replay()
+        # Bind the captured recurrent trajectory + rebind eager (python-slot) so the
+        # runner's commit_verify(row_last) scatters the accepted-length state onto the
+        # real slots. bind() clears the graph row-index the replay used.
+        if self.has_recurrent and g.vtraj is not None:
+            self.lin_cache._vtraj = g.vtraj
+            self.lin_cache._vcap = True
+            self.lin_cache.bind([s.slot for s in batch])
+        return g.hidden[:B], g.true_tokens[:B]
+
+    # -- capture ------------------------------------------------------------
+    def _capture(self, batch_bucket: int, context_bucket: int, S: int) -> _CapturedVerify:
+        cache = self.cache
+        scratch = self.gd._scratch()
+        cache.ensure_capacity([scratch], [S + 1])
+        dev = self.device
+
+        ids = torch.zeros(batch_bucket, S, dtype=torch.long, device=dev)
+        pos = torch.zeros(batch_bucket, S, dtype=torch.long, device=dev)
+        flat_slots = [scratch] * (batch_bucket * S)
+        flat_pos = [t for _ in range(batch_bucket) for t in range(S)]
+        verify_slot_mapping = cache.slot_mapping_for(flat_slots, flat_pos)  # [Bmax*S]
+        block_table = cache.block_table([scratch] * batch_bucket)
+        context_lens = torch.ones(batch_bucket, dtype=torch.int32, device=dev)
+
+        slot_idx = slot_idx_host = None
+        if self.has_recurrent and self.lin_cache is not None:
+            slot_idx = torch.full((batch_bucket,), scratch, dtype=torch.long, device=dev)
+            slot_idx_host = torch.empty(batch_bucket, dtype=torch.long,
+                                        pin_memory=(dev != "cpu"))
+            self.lin_cache.bind_graph(slot_idx)
+
+        def _ctx():
+            return ForwardContext(
+                is_prefill=False, is_verify=True, kv_cache=cache,
+                lin_cache=self.lin_cache if self.has_recurrent else None,
+                slots=[scratch] * batch_bucket,
+                slot_lengths=[1] * batch_bucket,
+                verify_slot_mapping=verify_slot_mapping,
+                block_tables=block_table, context_lens=context_lens,
+                max_context_len=context_bucket,
+            )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(_WARMUP_ITERS):
+                with torch.inference_mode():
+                    if self.has_recurrent:
+                        self.lin_cache.begin_verify_capture()
+                    hidden = self.model(ids, pos, _ctx())
+                    self.model.compute_logits(hidden).argmax(-1)
+                    if self.has_recurrent:
+                        self.lin_cache.end_verify_capture()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        if self.has_recurrent:
+            self.lin_cache.begin_verify_capture()
+        with torch.inference_mode(), torch.cuda.graph(graph):
+            hidden = self.model(ids, pos, _ctx())
+            logits = self.model.compute_logits(hidden)  # [Bmax, S, vocab]
+            true_tokens = logits.argmax(-1)  # [Bmax, S]
+        vtraj = None
+        if self.has_recurrent:
+            vtraj = dict(self.lin_cache._vtraj)  # fixed-address graph-pool trajectory
+            self.lin_cache._vcap = False
+
+        pin = dev != "cpu"
+        return _CapturedVerify(
+            graph=graph, ids=ids, pos=pos, verify_slot_mapping=verify_slot_mapping,
+            block_table=block_table, context_lens=context_lens,
+            hidden=hidden, true_tokens=true_tokens,
+            batch_bucket=batch_bucket, context_bucket=context_bucket,
+            ids_host=torch.empty(batch_bucket, S, dtype=torch.long, pin_memory=pin),
+            pos_host=torch.empty(batch_bucket, S, dtype=torch.long, pin_memory=pin),
+            context_lens_host=torch.empty(batch_bucket, dtype=torch.int32, pin_memory=pin),
+            vsm_host=torch.empty(batch_bucket * S, dtype=torch.int32, pin_memory=pin),
+            slot_idx=slot_idx, slot_idx_host=slot_idx_host, vtraj=vtraj,
+        )
+
+    # -- per-step input refresh (eager, before replay) ---------------------
+    def _fill_inputs(self, g: _CapturedVerify, batch, verify_ids, verify_pos, lengths):
+        cache, S = self.cache, g.ids.shape[1]
+        B, Bmax = len(batch), g.batch_bucket
+        scratch = self.gd._scratch()
+        pad = Bmax - B
+        real_slots = [s.slot for s in batch]
+        cache.ensure_capacity(real_slots, [n + 1 + S for n in lengths])
+
+        # ids / pos: real rows carry the verify tokens/positions; pad rows are inert.
+        g.ids_host[:B].copy_(torch.tensor(verify_ids, dtype=torch.long))
+        g.pos_host[:B].copy_(torch.tensor(verify_pos, dtype=torch.long))
+        g.context_lens_host[:B].copy_(torch.tensor([n + 1 for n in lengths], dtype=torch.int32))
+        if pad:
+            g.ids_host[B:].zero_()
+            g.pos_host[B:].zero_()
+            g.context_lens_host[B:].fill_(1)
+        g.ids.copy_(g.ids_host, non_blocking=True)
+        g.pos.copy_(g.pos_host, non_blocking=True)
+        g.context_lens.copy_(g.context_lens_host, non_blocking=True)
+
+        # verify_slot_mapping [Bmax*S]: (row b, verify pos t) -> paged slot for position
+        # length[b]+1+t; pad rows map every position onto the scratch slot.
+        flat_slots, flat_pos = [], []
+        for b in range(B):
+            base = lengths[b] + 1
+            flat_slots.extend([real_slots[b]] * S)
+            flat_pos.extend(base + t for t in range(S))
+        for _ in range(pad):
+            flat_slots.extend([scratch] * S)
+            flat_pos.extend(range(S))
+        cache.fill_slot_mapping(g.verify_slot_mapping, flat_slots, flat_pos)
+        cache.fill_block_table(g.block_table, real_slots + [scratch] * pad)
+
+        if g.slot_idx is not None:
+            g.slot_idx_host.copy_(torch.tensor(real_slots + [scratch] * pad, dtype=torch.long))
+            g.slot_idx.copy_(g.slot_idx_host, non_blocking=True)
+            self.lin_cache.bind_graph(g.slot_idx)
+
+
 class GraphedDecode:
     """Lazily captures one CUDA graph per (batch_bucket, context_bucket) bucket
     pair, replays on an exact match, and returns None (caller falls back to

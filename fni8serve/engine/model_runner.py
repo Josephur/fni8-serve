@@ -18,7 +18,7 @@ import torch
 from ..layers.sampler import Sampler
 from ..models.base import ForwardContext
 from ..models.cache import MTPKVCache, RecurrentStateCache
-from .cuda_graph import GraphedDecode, cuda_graph_enabled_by_env
+from .cuda_graph import GraphedDecode, GraphedVerify, cuda_graph_enabled_by_env
 from .drafters import NgramDrafter, cascade_draft, drafter_config
 from .sequence import Sequence
 
@@ -107,6 +107,25 @@ class EngineRunner:
             GraphedDecode(model, cache, device=device, lin_cache=self.lin_cache)
             if enable_cuda_graph
             else None
+        )
+        # Spec-decode verify runs 100% eager by default (#259) — the per-step launch
+        # overhead makes every spec mode a NET SLOWDOWN graphs-on despite high accept
+        # (#266). `GraphedVerify` captures the fixed-draft-length verify forward the
+        # same way `GraphedDecode` captures base decode, so the acceptance-length win
+        # stacks on top of graphs instead of being eaten by dispatch. Created whenever
+        # graphs are on + the model is capturable (it stays inert unless spec-decode
+        # actually runs, so it is decoupled from `_spec_enabled`, which the bench /
+        # server can flip AFTER construction); `FNI8SERVE_VERIFY_GRAPH=0` forces the
+        # eager verify (the two are byte-identical — tests/test_graph_verify.py). It
+        # captures one graph per (batch, context, draft-length) bucket, so a changed
+        # `_spec_k` just triggers a fresh capture.
+        self._verify_graph_enabled = (
+            self.graphed is not None
+            and self.graphed.supported
+            and os.environ.get("FNI8SERVE_VERIFY_GRAPH", "1") not in ("0", "false", "False")
+        )
+        self.graphed_verify = (
+            GraphedVerify(self.graphed) if self._verify_graph_enabled else None
         )
         # Persistent host/device staging for the per-step sampling params (issue #183):
         # `temps`/`top_p` used to be rebuilt every step with `torch.tensor(list,
@@ -436,40 +455,57 @@ class EngineRunner:
         # -- 2. Draft: cascade (n-gram first, MTP head fallback) ----------------
         # Per-row variable-length drafts; the verify tensor is sized to the longest.
         draft_lists = self._compute_drafts(mtp, base_hidden, base_tok, lengths, slots, batch)
-        k_step = max(1, max(len(d) for d in draft_lists))
+        # Graphed verify captures ONE fixed shape, so pad every row to the full spec_k
+        # (S = spec_k+1 constant) when it's active; else size to the longest real draft
+        # (rejected pads are harmless either way — the accept loop only walks each row's
+        # REAL drafts). Result-identical: the extra pad positions never get accepted.
         actual_len = [len(d) for d in draft_lists]
-        S = k_step + 1  # verify tokens: base_tok + k_step drafts (rejected pads harmless)
-        pad = 0
-        drafts_mat = [
-            (d + [pad] * (k_step - len(d))) for d in draft_lists
-        ]  # [B][k_step]
+        # Graphed verify captures ONE fixed S per (batch, context, S) bucket, so the
+        # verify width must be shape-static — but forcing the full spec_k every step
+        # wastes compute the graph can't hide when acceptance is low: a spec_k+1-wide
+        # verify to emit ~1 token REGRESSES prose (measured ngram 0.41×→0.32× at fixed
+        # K=6) even though it wins high-acceptance structured. So bucket the width UP to
+        # the actual longest draft THIS step (a handful of reusable S-graphs {2,3,5,7}),
+        # matching eager's variable width while staying capturable: MTP (draft 1) and
+        # low-hit prose n-gram collapse to S=2, structured cascade keeps S=spec_k+1.
+        k_step = (
+            self._draft_bucket(max(1, max(actual_len)))
+            if self.graphed_verify is not None
+            else max(1, max(actual_len))
+        )
+        S = k_step + 1  # verify tokens: base_tok + k_step drafts
+        drafts_mat = [(d + [0] * (k_step - len(d))) for d in draft_lists]  # [B][k_step]
 
         # -- 3. Verify forward: [base_tok, draft_1..k] in ONE causal pass -------
-        verify_ids = torch.tensor(
-            [[int(base_tok[b])] + drafts_mat[b] for b in range(B)], device=device
-        )  # [B, S]
-        verify_pos = torch.tensor(
-            [[lengths[b] + 1 + t for t in range(S)] for b in range(B)], device=device
-        )
-        self.cache.ensure_capacity(slots, [n + 1 + S for n in lengths])
-        flat_slots, flat_positions = [], []
-        for b in range(B):
-            base = lengths[b] + 1
-            for t in range(S):
-                flat_slots.append(slots[b])
-                flat_positions.append(base + t)
-        verify_slot_mapping = self.cache.slot_mapping_for(flat_slots, flat_positions)
-        v_ctx = ForwardContext(
-            is_prefill=False, is_verify=True, kv_cache=self.cache, lin_cache=self.lin_cache,
-            slots=slots, slot_lengths=[n + 1 for n in lengths],
-            verify_slot_mapping=verify_slot_mapping,
-        )
-        if self.has_recurrent:
-            self.lin_cache.bind(slots)
-            self.lin_cache.begin_verify_capture()
-        hidden_v = self.model(verify_ids, verify_pos, v_ctx)  # [B, S, H]
-        logits_v = self.model.compute_logits(hidden_v)  # [B, S, vocab]
-        true_tokens = logits_v.argmax(-1)  # [B, S] — true greedy at each verify slot
+        verify_ids_l = [[int(base_tok[b])] + drafts_mat[b] for b in range(B)]  # [B][S]
+        verify_pos_l = [[lengths[b] + 1 + t for t in range(S)] for b in range(B)]
+        hidden_v = true_tokens = None
+        if self.graphed_verify is not None:
+            res = self.graphed_verify.try_run(batch, verify_ids_l, verify_pos_l, lengths)
+            if res is not None:
+                hidden_v, true_tokens = res  # KV writes + recurrent traj done in-graph
+        if hidden_v is None:  # eager verify (graph miss / disabled)
+            verify_ids = torch.tensor(verify_ids_l, device=device)  # [B, S]
+            verify_pos = torch.tensor(verify_pos_l, device=device)
+            self.cache.ensure_capacity(slots, [n + 1 + S for n in lengths])
+            flat_slots, flat_positions = [], []
+            for b in range(B):
+                base = lengths[b] + 1
+                for t in range(S):
+                    flat_slots.append(slots[b])
+                    flat_positions.append(base + t)
+            verify_slot_mapping = self.cache.slot_mapping_for(flat_slots, flat_positions)
+            v_ctx = ForwardContext(
+                is_prefill=False, is_verify=True, kv_cache=self.cache, lin_cache=self.lin_cache,
+                slots=slots, slot_lengths=[n + 1 for n in lengths],
+                verify_slot_mapping=verify_slot_mapping,
+            )
+            if self.has_recurrent:
+                self.lin_cache.bind(slots)
+                self.lin_cache.begin_verify_capture()
+            hidden_v = self.model(verify_ids, verify_pos, v_ctx)  # [B, S, H]
+            logits_v = self.model.compute_logits(hidden_v)  # [B, S, vocab]
+            true_tokens = logits_v.argmax(-1)  # [B, S] — true greedy at each verify slot
 
         # -- 4. Accept longest greedy prefix + commit (no re-decode) ------------
         row_last = []  # per-row 0-based index of the last accepted verify slot
@@ -535,6 +571,19 @@ class EngineRunner:
         if self.has_recurrent:
             self.lin_cache.commit_verify(row_last)
         self.spec_stats["steps"] += 1
+
+    def _draft_bucket(self, n: int) -> int:
+        """Round a step's longest real draft ``n`` UP to a small fixed set of verify
+        widths so the graphed verify reuses a handful of captured S-graphs instead of
+        one-per-length. The top bucket is always ``self._spec_k`` (drafts are capped
+        there), so ``n`` is never truncated; ``_spec_k`` is read live because the
+        server/bench can retune it after construction."""
+        for b in (1, 2, 4, 8, 16, 32):
+            if b >= self._spec_k:
+                break
+            if n <= b:
+                return b
+        return self._spec_k
 
     def _truncate_emit(self, seq: Sequence, emit: list[int]) -> list[int]:
         """Trim a step's emitted tokens so greedy spec-decode matches plain greedy:

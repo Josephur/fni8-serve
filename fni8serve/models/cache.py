@@ -255,8 +255,14 @@ class RecurrentStateCache:
 
     @staticmethod
     def _pick(traj: torch.Tensor, row_last: list[int]) -> torch.Tensor:
-        """Gather ``traj[b, row_last[b]]`` -> [B, ...] on ``traj``'s device."""
-        rows = torch.arange(traj.shape[0], device=traj.device)
+        """Gather ``traj[b, row_last[b]]`` -> [B, ...] on ``traj``'s device, for the
+        first ``len(row_last)`` rows. When the verify forward is CUDA-graph-captured
+        the trajectory is recorded over the padded batch bucket (``traj.shape[0]`` ==
+        Bmax), but only the ``B`` REAL rows are committed — index the leading B rows so
+        a padded bucket commits exactly its real sequences (Bmax==B in the eager path,
+        so this is a no-op there)."""
+        n = len(row_last)
+        rows = torch.arange(n, device=traj.device)
         idx = torch.tensor(row_last, device=traj.device)
         return traj[rows, idx]
 

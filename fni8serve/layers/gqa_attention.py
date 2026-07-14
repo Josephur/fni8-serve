@@ -259,6 +259,36 @@ class GQAAttention(nn.Module):
         slots = ctx.slots
         prefix = ctx.slot_lengths  # committed prefix length per row (positions 0..L)
 
+        # CUDA-graph-capturable verify (engine/cuda_graph.py `GraphedVerify`): when the
+        # runner supplies persistent device `block_tables`/`context_lens` + a
+        # compile-time `max_context_len` bucket (exactly the decode-graph contract),
+        # walk the S verify tokens through the SAME static paged-decode primitives the
+        # graphed decode uses — no python-list `slots`/`lengths`, no `.item()` sync — so
+        # the whole verify forward is capturable. `context_lens` is the committed prefix
+        # length per row (L+1); verify token t writes at that row's slot for position
+        # L+1+t and then attends context length (L+1)+(t+1) — a device-tensor add by the
+        # loop-constant `t+1` (S is fixed, so this loop is unrolled at capture). Bit-
+        # identical to the eager list path below (same kernels, same context lengths).
+        if getattr(ctx, "block_tables", None) is not None and self.window_left < 0:
+            outs = []
+            for t in range(S):
+                cache.write_decode_static(
+                    layer_idx, vsm[:, t].contiguous(), k[:, t], v[:, t]
+                )
+                ctx_len_t = ctx.context_lens + (t + 1)  # [B] int32, in-graph add
+                q_t = q[:, t : t + 1].transpose(1, 2)  # [B,1,H,D] -> [B,H,1,D]
+                outs.append(
+                    cache.decode_attn_static(
+                        layer_idx,
+                        q_t,
+                        ctx.block_tables,
+                        ctx_len_t,
+                        ctx.max_context_len,
+                        scale=self.scale,
+                    )
+                )
+            return torch.cat(outs, dim=2)  # [B, H, S, D]
+
         if self.window_left < 0:
             outs = []  # per t: [B, H, 1, D]
             for t in range(S):
