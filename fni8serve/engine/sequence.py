@@ -39,6 +39,7 @@ class Sequence:
     output_ids: list[int] = field(default_factory=list)
     length: int = 0  # KV positions committed for this seq
     prefix_matched_len: int = 0  # length of shared prefix found (0 = none)
+    max_len: int | None = None  # engine context window; decode stops before it (S2)
     pixel_values: torch.Tensor | None = None  # VLM: [1, 3, H, W] preprocessed image
     image_grid_thw: torch.Tensor | None = None  # VLM: [num_images, 3] patch grid (t, gh, gw)
     # -- speculative-decode pipelining (spec loop, task 1c) -------------------
@@ -65,6 +66,10 @@ class Sequence:
 
     def finish_reason(self, eos_id: int | None) -> str | None:
         if len(self.output_ids) >= self.params.max_tokens:
+            return "length"
+        # Hard stop at the context window even if max_tokens wasn't clamped: the KV
+        # cache only has `max_len` positions for this slot (S2 backstop).
+        if self.max_len is not None and self.num_prompt + len(self.output_ids) >= self.max_len:
             return "length"
         if (
             not self.params.ignore_eos

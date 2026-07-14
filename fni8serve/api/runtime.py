@@ -30,6 +30,17 @@ class Done:
 
 
 @dataclass
+class _EncodeRequest:
+    """A pooled-embedding request routed through the worker so `engine.encode()`
+    runs on the SAME thread as `engine.step()` -- the engine (scheduler + KV cache)
+    is not safe to touch from the FastAPI handler thread concurrently with the
+    worker's step loop. `out` carries back the embedding (or the raised exception)."""
+
+    prompt_ids: list[int]
+    out: queue.Queue = field(default_factory=queue.Queue)
+
+
+@dataclass
 class _PendingRequest:
     prompt_ids: list[int]
     params: SamplingParams
@@ -67,8 +78,20 @@ class EngineWorker:
         return req.out_queue
 
     def encode(self, prompt_ids: list[int]) -> list[float]:
-        """Encode a prompt and return the pooled embedding vector."""
-        return self.engine.encode(prompt_ids)
+        """Encode a prompt and return the pooled embedding vector.
+
+        Routed through the worker's inbox (like `submit`) so `engine.encode()` runs
+        on the dedicated engine thread, serialized with `engine.step()` -- calling it
+        straight from the FastAPI handler thread raced the step loop over the shared
+        scheduler / KV cache (data race C1). Blocks the caller until the worker
+        thread produces the embedding; the caller should run it off the event loop
+        (the API handlers use `run_in_executor`)."""
+        req = _EncodeRequest(prompt_ids)
+        self._inbox.put(req)
+        result = req.out.get()
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     async def stream(
         self,
@@ -90,14 +113,29 @@ class EngineWorker:
     def _run(self) -> None:
         while True:
             if not self._pending:
-                self._register(self._inbox.get())  # idle: block for the next request
+                self._intake(self._inbox.get())  # idle: block for the next request
             while True:
                 try:
-                    self._register(self._inbox.get_nowait())
+                    self._intake(self._inbox.get_nowait())
                 except queue.Empty:
                     break
-            self.engine.step()
-            self._dispatch()
+            # Only step when a generation is in flight. An idle worker that only just
+            # served an encode has nothing to decode, so skip the empty step and loop
+            # back to block on the inbox.
+            if self._pending:
+                self.engine.step()
+                self._dispatch()
+
+    def _intake(self, item: _PendingRequest | _EncodeRequest) -> None:
+        """Dispatch one inbox item on the worker thread: an encode is answered
+        inline (serialized with `step`), a generation request is registered."""
+        if isinstance(item, _EncodeRequest):
+            try:
+                item.out.put(self.engine.encode(item.prompt_ids))
+            except BaseException as exc:  # noqa: BLE001 -- relayed to the caller thread
+                item.out.put(exc)
+        else:
+            self._register(item)
 
     def _register(self, req: _PendingRequest) -> None:
         req.seq_id = self.engine.add_request(req.prompt_ids, req.params)

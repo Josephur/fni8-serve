@@ -72,7 +72,15 @@ def fetch_image(url: str) -> Image.Image:
         match = re.match(r"^data:[^;]*(?:;base64)?,(.+)$", url)
         if not match:
             raise ValueError(f"Unsupported data URI format: {url[:80]}")
-        raw = base64.b64decode(match.group(1))
+        payload = match.group(1)
+        # Cap BEFORE decoding (4 base64 chars -> 3 bytes) so an oversized data URI is
+        # rejected without allocating the decoded body or handing it to PIL (S3 DoS) --
+        # same 32 MB cap the HTTP fetch path enforces below.
+        if len(payload) > (_MAX_IMAGE_BYTES // 3 + 1) * 4:
+            raise ValueError(f"data URI image exceeds the {_MAX_IMAGE_BYTES}-byte cap")
+        raw = base64.b64decode(payload)
+        if len(raw) > _MAX_IMAGE_BYTES:
+            raise ValueError(f"data URI image exceeds the {_MAX_IMAGE_BYTES}-byte cap")
         return Image.open(io.BytesIO(raw)).convert("RGB")
     # HTTP(S) URL — SSRF-guarded (scheme allowlist, private/metadata-IP block, no
     # redirects, timeout) with a size cap read.

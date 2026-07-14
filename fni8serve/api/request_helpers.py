@@ -120,11 +120,22 @@ def sampling_params(
     top_p: float,
     max_tokens: int | None,
     logit_processors: list | None = None,
+    *,
+    max_len: int | None = None,
+    prompt_len: int = 0,
 ) -> SamplingParams:
+    resolved = max_tokens or 16
+    # Clamp to the KV room this prompt leaves (S1): an unclamped max_tokens decodes
+    # past the slot's block range (block-table overflow / "no free blocks"), and the
+    # diffusion path pre-allocates `num_prompt + max_tokens` KV up front -- a huge
+    # max_tokens is an instant multi-TB alloc. At least 1 token so a full-context
+    # prompt still produces output.
+    if max_len is not None:
+        resolved = min(resolved, max(1, max_len - prompt_len))
     return SamplingParams(
         temperature=temperature,
         top_p=top_p,
-        max_tokens=max_tokens or 16,
+        max_tokens=resolved,
         logit_processors=logit_processors,
     )
 

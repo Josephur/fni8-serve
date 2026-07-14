@@ -45,6 +45,11 @@ class LLMEngine:
         self.cfg = cfg
         self.device = device
         self.eos_id = eos_id
+        # Context window: the KV cache is sized for exactly `max_len` positions per
+        # slot, so a prompt longer than this would write KV out of range and a decode
+        # past it overflows the block table. `add_request` rejects over-length prompts
+        # up front (S2) and every Sequence carries it so decode stops at the boundary.
+        self.max_len = max_len
         # `consume_weights=True` lets the qkv/gate_up merges POP their source rows out of
         # `weights` as they build, bounding the merge transient so a card-filling 27B
         # fits on one 16 GiB GPU. It MUTATES `weights`, so only pass it when the caller
@@ -108,7 +113,13 @@ class LLMEngine:
         self.stats = None
 
     def add_request(self, prompt_ids: list[int], params: SamplingParams | None = None) -> int:
+        # Reject an over-length prompt at admission (S2) rather than letting the
+        # scheduler admit a single over-budget prefill (its `if batch` short-circuit
+        # admits the first waiter unconditionally) into an OOM / out-of-range KV write.
+        if self.max_len is not None and len(prompt_ids) > self.max_len:
+            raise ValueError(f"prompt length {len(prompt_ids)} exceeds max_len {self.max_len}")
         seq = Sequence(next(self._ids), list(prompt_ids), params or SamplingParams())
+        seq.max_len = self.max_len
         self.scheduler.add(seq)
         self._out[seq.seq_id] = seq
         return seq.seq_id

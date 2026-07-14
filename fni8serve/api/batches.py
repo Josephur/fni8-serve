@@ -56,18 +56,33 @@ from .schemas import (
     _id,
 )
 
+# Pre-auth request-size caps (S3). 32 MB matches the image-fetch cap in
+# `fni8serve.multimodal` (kept as a local literal so this module stays import-light --
+# importing `multimodal` would pull torch/PIL/torchvision into the batch path).
+_MAX_UPLOAD_BYTES = 32 * 1024 * 1024      # per /v1/files upload
+_MAX_BATCH_LINES = 50_000                 # lines admitted per /v1/batches submit
+_MAX_STORED_FILES = 256                   # bound the in-memory _FileStore (FIFO evict)
+
 
 class _FileStore:
-    """In-memory `/v1/files`: content plus the metadata `FileObject` echoes back."""
+    """In-memory `/v1/files`: content plus the metadata `FileObject` echoes back.
 
-    def __init__(self) -> None:
+    Bounded to `max_files` entries with FIFO eviction so a long-lived server can't be
+    grown without limit by repeated uploads (the store never expired anything before)."""
+
+    def __init__(self, max_files: int = _MAX_STORED_FILES) -> None:
         self._content: dict[str, bytes] = {}
         self._meta: dict[str, FileObject] = {}
+        self._max_files = max_files
 
     def put(self, content: bytes, *, filename: str, purpose: str) -> FileObject:
         obj = FileObject(bytes=len(content), filename=filename, purpose=purpose)
         self._content[obj.id] = content
         self._meta[obj.id] = obj
+        while len(self._content) > self._max_files:
+            oldest = next(iter(self._content))
+            self._content.pop(oldest, None)
+            self._meta.pop(oldest, None)
         return obj
 
     def content(self, file_id: str) -> bytes:
@@ -95,7 +110,13 @@ class _Job:
     error: str | None = None
 
 
-def _build_request(url: str, body: dict, tokenizer, grammars, chat_template, tool_parser: str):
+def _guard_prompt_len(prompt_ids: list[int], max_len: int | None) -> None:
+    if max_len is not None and len(prompt_ids) > max_len:
+        raise ValueError(f"prompt length {len(prompt_ids)} exceeds max_len {max_len}")
+
+
+def _build_request(url: str, body: dict, tokenizer, grammars, chat_template, tool_parser: str,
+                   max_len: int | None = None):
     """Parses one batch line's `body` exactly the way the live HTTP endpoint for
     `url` would -- same schemas, same prompt building, same tools/structured-output
     handling."""
@@ -114,15 +135,19 @@ def _build_request(url: str, body: dict, tokenizer, grammars, chat_template, too
             logit_processors = [grammars.for_json_schema(tokenizer, schema)]
 
         prompt_ids = chat_prompt_ids(tokenizer, req.messages, chat_template, tools=tools_wire)
-        params = sampling_params(req.temperature, req.top_p, req.max_tokens, logit_processors)
+        _guard_prompt_len(prompt_ids, max_len)
+        params = sampling_params(req.temperature, req.top_p, req.max_tokens, logit_processors,
+                                 max_len=max_len, prompt_len=len(prompt_ids))
         return req, prompt_ids, params, forced, wants_tools
     if url == "/v1/completions":
         req = CompletionRequest.model_validate(body)
         prompt = req.prompt if isinstance(req.prompt, str) else req.prompt[0]
         prompt_ids = tokenizer.encode(prompt)
+        _guard_prompt_len(prompt_ids, max_len)
         logit_processors = build_logit_processors(
             grammars, tokenizer, req.response_format, req.grammar)
-        params = sampling_params(req.temperature, req.top_p, req.max_tokens, logit_processors)
+        params = sampling_params(req.temperature, req.top_p, req.max_tokens, logit_processors,
+                                 max_len=max_len, prompt_len=len(prompt_ids))
         return req, prompt_ids, params, False, False
     raise ValueError(f"unsupported batch endpoint: {url!r}")
 
@@ -152,7 +177,8 @@ def _response_body(url: str, model: str, text: str, prompt_ids: list[int],
 
 
 def _submit_jobs(worker: EngineWorker, tokenizer, grammars, lines: list[str],
-                 endpoint: str, chat_template, tool_parser: str) -> list[_Job]:
+                 endpoint: str, chat_template, tool_parser: str,
+                 max_len: int | None = None) -> list[_Job]:
     jobs = []
     for raw in lines:
         custom_id = None
@@ -161,7 +187,7 @@ def _submit_jobs(worker: EngineWorker, tokenizer, grammars, lines: list[str],
             custom_id = line.get("custom_id")
             url = line.get("url") or endpoint
             req, prompt_ids, params, forced, wants_tools = _build_request(
-                url, line["body"], tokenizer, grammars, chat_template, tool_parser)
+                url, line["body"], tokenizer, grammars, chat_template, tool_parser, max_len)
             jobs.append(_Job(custom_id, url=url, model=req.model, prompt_ids=prompt_ids,
                              queue=worker.submit(prompt_ids, params),
                              forced=forced, wants_tools=wants_tools))
@@ -203,7 +229,8 @@ async def _drain_jobs(jobs: list[_Job], tokenizer, tool_parser: str) -> tuple[li
 
 
 def register_batch_routes(app: FastAPI, worker: EngineWorker, tokenizer, grammars, *,
-                          chat_template: str | None = None, tool_parser: str = "hermes") -> None:
+                          chat_template: str | None = None, tool_parser: str = "hermes",
+                          max_len: int | None = None) -> None:
     """Mounts `/v1/files` + `/v1/batches` onto `app`, sharing `worker` (and so the
     underlying engine) with the streaming endpoints `create_app` already registered."""
     files = _FileStore()
@@ -211,7 +238,13 @@ def register_batch_routes(app: FastAPI, worker: EngineWorker, tokenizer, grammar
 
     @app.post("/v1/files")
     async def create_file(file: UploadFile = File(...), purpose: str = Form(...)) -> FileObject:
-        content = await file.read()
+        # Read one byte past the cap so an oversized upload is rejected without ever
+        # materialising the whole body in memory (S3).
+        content = await file.read(_MAX_UPLOAD_BYTES + 1)
+        if len(content) > _MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"file exceeds the {_MAX_UPLOAD_BYTES}-byte upload cap")
         return files.put(content, filename=file.filename or "upload.jsonl", purpose=purpose)
 
     @app.get("/v1/files/{file_id}")
@@ -232,9 +265,15 @@ def register_batch_routes(app: FastAPI, worker: EngineWorker, tokenizer, grammar
     async def create_batch(req: CreateBatchRequest) -> Batch:
         input_bytes = files.content(req.input_file_id)
         lines = [ln for ln in input_bytes.decode("utf-8").splitlines() if ln.strip()]
+        # This server runs the whole file to completion inline (no background queue),
+        # so an unbounded line count is a pre-auth compute/memory DoS -- cap it (S3).
+        if len(lines) > _MAX_BATCH_LINES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"batch has {len(lines)} lines, exceeds the {_MAX_BATCH_LINES} cap")
 
         jobs = _submit_jobs(worker, tokenizer, grammars, lines, req.endpoint, chat_template,
-                            tool_parser)
+                            tool_parser, max_len)
         out_lines, failed = await _drain_jobs(jobs, tokenizer, tool_parser)
         output_file = files.put(
             ("\n".join(out_lines) + "\n").encode("utf-8") if out_lines else b"",

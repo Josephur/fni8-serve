@@ -18,11 +18,12 @@ continuous-batching loop instead of contending for the engine.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from collections.abc import AsyncIterator
 
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
 from ..structured import GrammarCompilerCache
@@ -97,6 +98,16 @@ def create_app(
     engine.stats = stats
     worker = EngineWorker(engine, stats=stats)
     grammars = GrammarCompilerCache()
+    # Context-window budget used to clamp `max_tokens` and reject over-length prompts
+    # (pre-auth DoS hardening S1/S2). `None` on a test double without the attribute.
+    max_len = getattr(engine, "max_len", None)
+
+    def _guard_prompt_len(prompt_ids: list[int]) -> None:
+        if max_len is not None and len(prompt_ids) > max_len:
+            raise HTTPException(
+                status_code=400,
+                detail=f"prompt is {len(prompt_ids)} tokens, exceeds max_len {max_len}",
+            )
 
     @app.get("/metrics")
     async def metrics() -> dict:
@@ -129,7 +140,11 @@ def create_app(
             logit_processors = [grammars.for_json_schema(tokenizer, schema)]
 
         prompt_ids = chat_prompt_ids(tokenizer, req.messages, chat_template, tools=tools_wire)
-        params = sampling_params(req.temperature, req.top_p, req.max_tokens, logit_processors)
+        _guard_prompt_len(prompt_ids)
+        params = sampling_params(
+            req.temperature, req.top_p, req.max_tokens, logit_processors,
+            max_len=max_len, prompt_len=len(prompt_ids),
+        )
 
         # Issue #151: extract and preprocess image_url content parts
         image_results = extract_images_from_messages(req.messages)
@@ -174,11 +189,14 @@ def create_app(
     async def completions(req: CompletionRequest):
         prompt = req.prompt if isinstance(req.prompt, str) else req.prompt[0]
         prompt_ids = tokenizer.encode(prompt)
+        _guard_prompt_len(prompt_ids)
         params = sampling_params(
             req.temperature,
             req.top_p,
             req.max_tokens,
             _logit_processors(req.response_format, req.grammar),
+            max_len=max_len,
+            prompt_len=len(prompt_ids),
         )
 
         if req.stream:
@@ -204,9 +222,12 @@ def create_app(
         inputs = [req.input] if isinstance(req.input, str) else req.input
         all_data: list[EmbeddingData] = []
         total_tokens = 0
+        loop = asyncio.get_running_loop()
         for i, text in enumerate(inputs):
             prompt_ids = tokenizer.encode(text)
-            embedding = worker.encode(prompt_ids)
+            _guard_prompt_len(prompt_ids)
+            # encode blocks on the worker thread -- keep it off the event loop.
+            embedding = await loop.run_in_executor(None, worker.encode, prompt_ids)
             all_data.append(EmbeddingData(embedding=embedding, index=i))
             total_tokens += len(prompt_ids)
         if req.encoding_format == "float":
@@ -223,10 +244,12 @@ def create_app(
     async def rerank(req: RerankRequest):
         results: list[RerankResult] = []
         total_tokens = 0
+        loop = asyncio.get_running_loop()
         for i, doc in enumerate(req.documents):
             text = f"{req.query}\n{doc}"
             prompt_ids = tokenizer.encode(text)
-            embedding = worker.encode(prompt_ids)
+            _guard_prompt_len(prompt_ids)
+            embedding = await loop.run_in_executor(None, worker.encode, prompt_ids)
             score = 1.0 / (1.0 + math.exp(-embedding[0]))
             results.append(
                 RerankResult(index=i, relevance_score=score, document=RerankDocument(text=doc))
@@ -244,7 +267,8 @@ def create_app(
         )
 
     register_batch_routes(
-        app, worker, tokenizer, grammars, chat_template=chat_template, tool_parser=tool_parser
+        app, worker, tokenizer, grammars, chat_template=chat_template,
+        tool_parser=tool_parser, max_len=max_len,
     )
 
     return app
