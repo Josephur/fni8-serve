@@ -375,11 +375,28 @@ def load_gguf_engine(
     max_num_seqs: int = 16,
     max_len: int = 2048,
     eos_id: int | None = None,
+    spec_decode: bool | None = None,
 ):
     """Build an `LLMEngine` straight from a `.gguf` — the P1 milestone: end-to-end
     single-stream decode with ZERO `.fni8`. Mirrors `api.server.load_engine`'s `.fni8`
     seam: `gguf_config` + `gguf_state_dict` → `LLMEngine`, over the unchanged,
-    format-agnostic builders + engine."""
+    format-agnostic builders + engine.
+
+    **Speculative decode** is wired through the engine's EXISTING spec path (the same
+    n-gram cascade + `GraphedVerify` the `.fni8` path uses), so a GGUF-loaded model
+    gets it for free. Which drafter engages is chosen from the GGUF's OWN metadata:
+
+      * ``num_mtp_layers > 0`` (the GGUF carries ``nextn.*`` MTP tensors) → the learned
+        MTP head is built (``model.mtp``) and drives the draft; the n-gram lookup stays
+        as the cascade's zero-cost first stage.
+      * ``num_mtp_layers == 0`` (the common case — quantizers strip ``nextn.*``, e.g.
+        Qwen3-8B-Q4_K_M) → no head is built (``model.mtp is None``); the drafter cleanly
+        FALLS BACK to the model-agnostic n-gram lookup, which needs no extra weights.
+
+    ``spec_decode`` (None → `FNI8SERVE_MTP_SPEC` env, default off) turns the path on;
+    it stays OFF by default so a GGUF load never regresses vs plain greedy on the
+    current M=1 decode kernel (spec's net win lands with the warp-per-column kernel).
+    """
     import dataclasses
 
     from .engine import LLMEngine
@@ -400,8 +417,34 @@ def load_gguf_engine(
 
     if eos_id is None:
         eos_id = _gguf_eos_id(path)
+
+    # MTP-head detection (research/llamacpp-mtp-spec.md §1.2): the head is built by the
+    # arch builder iff `cfg.num_mtp_layers > 0` (it reads the GGUF `nextn_predict_layers`
+    # KV). Log which drafter the spec path will use so an absent MTP head (stripped by
+    # the quantizer) is an explicit, greppable fallback to n-gram — never a silent one.
+    import logging
+
+    _log = logging.getLogger("fni8serve.gguf_native")
+    if cfg.num_mtp_layers > 0:
+        _log.info(
+            "GGUF carries %d MTP/nextn layer(s) → MTP head wired as spec drafter "
+            "(n-gram stays the cascade's free first stage).",
+            cfg.num_mtp_layers,
+        )
+    else:
+        _log.info(
+            "GGUF has no nextn.* MTP tensors (num_mtp_layers=0) → spec-decode falls "
+            "back to the model-agnostic n-gram cascade drafter (no MTP head)."
+        )
+
     return LLMEngine(
-        cfg, weights, device=device, max_num_seqs=max_num_seqs, max_len=max_len, eos_id=eos_id
+        cfg,
+        weights,
+        device=device,
+        max_num_seqs=max_num_seqs,
+        max_len=max_len,
+        eos_id=eos_id,
+        spec_decode=spec_decode,
     )
 
 

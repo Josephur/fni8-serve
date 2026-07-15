@@ -25,8 +25,12 @@ from .app import create_app
 
 
 def load_engine(model_path: str, *, device: str = "cuda", max_num_seqs: int = 16,
-                max_len: int = 2048, eos_id: int | None = None) -> LLMEngine:
-    """Architecture is auto-detected from the checkpoint; see the README Quickstart."""
+                max_len: int = 2048, eos_id: int | None = None,
+                spec_decode: bool | None = None) -> LLMEngine:
+    """Architecture is auto-detected from the checkpoint; see the README Quickstart.
+
+    ``spec_decode`` (None → `FNI8SERVE_MTP_SPEC` env, default off) enables the engine's
+    speculative-decode path (n-gram cascade + MTP-head fallback) for BOTH formats."""
     # Suffix branch: a `.gguf` loads NATIVELY (GGUF-KV → ModelConfig + resident
     # k-quant weights, no `.fni8`); anything else takes the legacy `.fni8` path. Both
     # formats coexist through the migration — no `.fni8` code is removed here (P5).
@@ -34,7 +38,8 @@ def load_engine(model_path: str, *, device: str = "cuda", max_num_seqs: int = 16
         from ..gguf_native import load_gguf_engine
 
         return load_gguf_engine(
-            model_path, device=device, max_num_seqs=max_num_seqs, max_len=max_len, eos_id=eos_id
+            model_path, device=device, max_num_seqs=max_num_seqs, max_len=max_len,
+            eos_id=eos_id, spec_decode=spec_decode,
         )
     info = checkpoint_info(model_path)
     meta_cfg = info["meta"]["config"]
@@ -56,7 +61,8 @@ def load_engine(model_path: str, *, device: str = "cuda", max_num_seqs: int = 16
     # engine, so let the qkv/gate_up merges consume (pop) their source rows as they go --
     # bounding the merge transient so a single-card 27B fits in 16 GiB.
     return LLMEngine(cfg, weights, device=device, max_num_seqs=max_num_seqs,
-                     max_len=max_len, eos_id=eos_id, consume_weights=True)
+                     max_len=max_len, eos_id=eos_id, consume_weights=True,
+                     spec_decode=spec_decode)
 
 
 def _human_count(n: int) -> str:
@@ -155,6 +161,9 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--max-num-seqs", type=int, default=16)
     ap.add_argument("--max-len", type=int, default=2048)
+    ap.add_argument("--spec-decode", action="store_true", default=None,
+                    help="enable speculative decode (n-gram cascade + MTP-head "
+                         "fallback); default off (or set FNI8SERVE_MTP_SPEC=1)")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -167,7 +176,8 @@ def main() -> None:
 
     _t0 = time.perf_counter()
     engine = load_engine(args.model, device=args.device, max_num_seqs=args.max_num_seqs,
-                         max_len=args.max_len, eos_id=tokenizer.eos_token_id)
+                         max_len=args.max_len, eos_id=tokenizer.eos_token_id,
+                         spec_decode=args.spec_decode)
     load_time_s = time.perf_counter() - _t0
 
     from ..metrics import StatsCollector, render_banner, start_heartbeat
