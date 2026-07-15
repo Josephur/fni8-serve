@@ -73,10 +73,11 @@ _BLK = {
     "attn_q_norm": "self_attn.q_norm",
     "attn_k_norm": "self_attn.k_norm",
     "ffn_norm": "post_attention_layernorm",
+    "post_attention_norm": "post_attention_layernorm",  # Qwen3.5 GGUF variant
     "ffn_gate": "mlp.gate_proj",
     "ffn_up": "mlp.up_proj",
     "ffn_down": "mlp.down_proj",
-    "ffn_gate_inp": "mlp.gate",              # MoE router (stays raw)
+    "ffn_gate_inp": "mlp.gate",  # MoE router (stays raw)
     "ffn_gate_exps": "mlp.experts.gate_proj",
     "ffn_up_exps": "mlp.experts.up_proj",
     "ffn_down_exps": "mlp.experts.down_proj",
@@ -85,6 +86,42 @@ _BLK = {
     "ffn_up_shexp": "mlp.shared_expert.up_proj",
     "ffn_down_shexp": "mlp.shared_expert.down_proj",
     "exp_probs_b": "mlp.gate.e_score_correction_bias",  # router bias (§2.3)
+    # ── Qwen3.5 / hybrid DeltaNet SSM tensors (llama.cpp qwen35 layout) ──
+    # DeltaNet linear-attention projections.  The GGUF converter uses the raw
+    # ssm_* names from llama.cpp's qwen35 arch; the HF model stores them under
+    # `linear_attn.in_proj_*`.  The `_la_weight` helper in the qwen3_5 builder
+    # tries BOTH naming conventions (native + HF alias), so either mapping works.
+    "ssm_alpha": "linear_attn.in_proj_a",  # dt gate (decay projection)
+    "ssm_beta": "linear_attn.in_proj_b",  # beta (write gate)
+    "ssm_out": "linear_attn.out_proj",  # output projection
+    "ssm_conv1d": "linear_attn.conv1d",  # causal depthwise conv1d
+    "ssm_norm": "linear_attn.norm",  # output gated RMSNorm gain
+    # attn_qkv for DeltaNet layers → fused Q|K|V (NOT for full-attn layers,
+    # which use separate attn_q/attn_k/attn_v — those are already in _BLK).
+    "attn_qkv": "linear_attn.in_proj_qkv",  # fused Q|K|V projection
+    # attn_gate: kept as-is (self_attn.attn_gate) — gguf_native._remap_hybrid_qwen35
+    # handles the layer-type-dependent routing: DeltaNet → linear_attn.in_proj_a,
+    # full-attn → fuse into self_attn.q_proj.
+    "attn_gate": "self_attn.attn_gate",
+}
+
+# Bare parameters (no .weight/.bias suffix) from the SSM block.
+_BARE_PARAMS = {
+    "ssm_a": "linear_attn.A_log",  # log-decay parameter
+    "ssm_dt": "linear_attn.dt_bias",  # dt bias
+}
+
+# MTP tensor prefixes (blk.32.nextn.*) — the llama.cpp Qwen3.5 MTP head layout.
+# These carry a simplified MTP head (eh_proj + norms) without a full decoder block;
+# the qwen3_5 builder's `build_qwen3_5_mtp` can use eh_proj as fc and the norms
+# as pre_fc_norm_{hidden,embedding}.  The decoder-block weights (q/k/v/o/mlp) are
+# absent in this GGUF — the builder gracefully returns None when they're missing,
+# falling back to n-gram spec-decode.
+_MTP = {
+    "eh_proj": "mtp.fc",  # fc weight [2H, H]
+    "enorm": "mtp.pre_fc_norm_hidden",  # hidden-state norm
+    "hnorm": "mtp.pre_fc_norm_embedding",  # embedding norm
+    "shared_head_norm": "mtp.norm",  # final norm before LM head
 }
 
 
@@ -92,13 +129,33 @@ def gguf_name_to_hf(name: str) -> str | None:
     """Map a GGUF tensor name to its HF equivalent, or None if unrecognized."""
     if name in _STATIC:
         return _STATIC[name]
-    m = re.match(r"blk\.(\d+)\.([a-z_]+)\.(weight|bias)$", name)
-    if not m:
+    # MTP tensors: blk.{L}.nextn.{name}.{suffix}
+    m = re.match(r"blk\.(\d+)\.nextn\.([a-z_]+)\.(weight|bias)$", name)
+    if m:
+        part = m.group(2)
+        suffix = m.group(3)
+        if part in _MTP:
+            return f"{_MTP[part]}.{suffix}"
         return None
-    layer, part, suffix = m.group(1), m.group(2), m.group(3)
-    if part not in _BLK:
-        return None
-    return f"model.layers.{layer}.{_BLK[part]}.{suffix}"
+    # Bare parameters (no .weight/.bias): blk.{L}.{name}
+    m = re.match(r"blk\.(\d+)\.(ssm_a)$", name)
+    if m:
+        layer, part = m.group(1), m.group(2)
+        if part in _BARE_PARAMS:
+            return f"model.layers.{layer}.{_BARE_PARAMS[part]}"
+    # Parameters with .bias suffix that map to bare HF names (no suffix).
+    # ssm_dt.bias → linear_attn.dt_bias (the HF model stores this as a bare
+    # nn.Parameter, not as a `.bias` attribute).
+    m = re.match(r"blk\.(\d+)\.(ssm_dt)\.bias$", name)
+    if m:
+        return f"model.layers.{m.group(1)}.linear_attn.dt_bias"
+    # Standard block tensors: blk.{L}.{part}.{suffix}
+    m = re.match(r"blk\.(\d+)\.([a-z0-9_]+)\.(weight|bias)$", name)
+    if m:
+        layer, part, suffix = m.group(1), m.group(2), m.group(3)
+        if part in _BLK:
+            return f"model.layers.{layer}.{_BLK[part]}.{suffix}"
+    return None
 
 
 def read_gguf_weights(path: str):
@@ -113,7 +170,7 @@ def read_gguf_weights(path: str):
         if hf is None:
             continue
         qtype = T(t.tensor_type)
-        deq = dequantize(t.data, qtype).astype(np.float32)          # numpy [.. , in]
+        deq = dequantize(t.data, qtype).astype(np.float32)  # numpy [.. , in]
         w = torch.from_numpy(np.ascontiguousarray(deq))
         # GGUF stores 2-D weights as [out, in] already (row-major, same as HF).
         yield hf, w, qtype.name
@@ -163,8 +220,11 @@ def convert_gguf_to_fni8(
     qtensors, src_map = gguf_state_to_qtensors(
         gguf_path, group_size=group_size, force_mlp_w3a8=force_mlp_w3a8
     )
-    save_fni8(out_path, qtensors, meta={"source": "gguf", "gguf_path": gguf_path,
-                                        "source_types": src_map, **(meta or {})})
+    save_fni8(
+        out_path,
+        qtensors,
+        meta={"source": "gguf", "gguf_path": gguf_path, "source_types": src_map, **(meta or {})},
+    )
     return src_map
 
 
@@ -175,15 +235,21 @@ def main():
     ap.add_argument("gguf_path")
     ap.add_argument("out_path")
     ap.add_argument("--group", type=int, default=128)
-    ap.add_argument("--force-mlp-w3a8", action="store_true",
-                    help="override the source menu: MLP gate/up -> uniform 3-bit dp4a "
-                         "(the issue #181 VRAM lever), down/others keep harvested scheme")
+    ap.add_argument(
+        "--force-mlp-w3a8",
+        action="store_true",
+        help="override the source menu: MLP gate/up -> uniform 3-bit dp4a "
+        "(the issue #181 VRAM lever), down/others keep harvested scheme",
+    )
     args = ap.parse_args()
     src_map = convert_gguf_to_fni8(
-        args.gguf_path, args.out_path, group_size=args.group,
+        args.gguf_path,
+        args.out_path,
+        group_size=args.group,
         force_mlp_w3a8=args.force_mlp_w3a8,
     )
     from collections import Counter
+
     print(f"wrote {args.out_path}")
     print("source k-quant types harvested:", dict(Counter(src_map.values())))
 
