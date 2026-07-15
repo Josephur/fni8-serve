@@ -1,11 +1,24 @@
 # SPDX-License-Identifier: MIT
 """Speculative-decode drafters — cheap proposers that feed the shared MTP verify
-path. Two are cascaded (n-gram first, MTP fallback) by the engine runner.
+path. Three are cascaded (grammar first, then n-gram, MTP fallback) by the runner.
 
 The verify forward is a single weight-stream over ``k+1`` tokens; acceptance-length
 (how many drafts survive) is what divides that stream's cost across emitted tokens.
 A drafter's only job is to make the accepted prefix as long as possible for free
 (no full-model forward):
+
+  * :class:`GrammarDrafter` — **tier-0, the free/perfect drafter.** When a
+    grammar / structured-output constraint is active (JSON-schema, tool-call syntax,
+    raw GBNF), at many positions the grammar permits **exactly one** token — the
+    structural ones: ``{``, ``"``, field names, ``:``, ``,``, closing braces. Those
+    are KNOWN with certainty, so they can be committed with NO draft-model forward at
+    all: strictly better than n-gram on structured output. The drafter walks the
+    grammar forward from ``base_tok``, emitting each singleton-forced token until the
+    grammar branches (allows >1) — then it returns and the cascade falls through to
+    n-gram / MTP for the free positions. Bit-identity is by construction: a
+    singleton-forced token is exactly what plain grammar-constrained greedy decode
+    would emit (its mask leaves one legal token); the shared verify path re-checks it
+    against the SAME grammar-masked argmax anyway.
 
   * :class:`NgramDrafter` — prompt-lookup / n-gram. Matches the last ``n`` tokens
     against everything generated so far and proposes the continuation that followed
@@ -16,7 +29,7 @@ A drafter's only job is to make the accepted prefix as long as possible for free
 
   * The MTP head (``model.mtp``) is the fallback: on non-repetitive prose the n-gram
     lookup misses and the learned depth-1 head still lands ~90%. The engine runner
-    cascades them: try n-gram, fall back to MTP on a miss (:func:`cascade_draft`).
+    cascades all three: grammar (free forced run) → n-gram → MTP (:func:`cascade_draft`).
 """
 
 from __future__ import annotations
@@ -66,13 +79,82 @@ class NgramDrafter:
         return []
 
 
-def cascade_draft(ngram, mtp_fallback, tokens, k):
-    """Cascade: n-gram first (free, long on structured spans), else the MTP head.
+class GrammarDrafter:
+    """Tier-0 spec-decode drafter: the active grammar IS the drafter.
 
-    ``ngram`` is a :class:`NgramDrafter` (or None to skip straight to MTP);
-    ``mtp_fallback`` is a zero-arg callable returning the MTP head's draft list
-    (evaluated lazily — only on an n-gram miss, so the head's forward is skipped
-    whenever the free lookup hits). Returns the draft token list (possibly empty)."""
+    Wraps a :class:`GrammarView` — the small non-destructive walk interface a
+    grammar/structured-output matcher exposes (:class:`fni8serve.structured.\
+GrammarLogitsProcessor` implements it over an XGrammar ``GrammarMatcher``):
+
+      * ``advance(token_id) -> bool`` — accept one token, advancing the walk one
+        position; ``False`` if the token is not grammar-legal.
+      * ``next_singleton() -> int | None`` — the sole grammar-legal token at the
+        current position, or ``None`` when zero or >1 tokens are legal (a branch).
+      * ``rewind(n)`` — undo the last ``n`` ``advance`` calls (restore state).
+
+    ``propose(base_tok, k)`` walks forward from ``base_tok`` (the first verify token,
+    already committed this step) collecting the singleton-forced continuation, then
+    rewinds so the view is left exactly where it started — the drafter NEVER mutates
+    the sequence's grammar state, it only peeks. Returns ``[]`` the moment the grammar
+    branches (so the cascade falls through to n-gram / MTP for that free position).
+    """
+
+    def __init__(self, view, max_k: int = 8):
+        self.view = view
+        self.max_k = max_k
+
+    def propose(self, base_tok: int, k: int) -> list[int]:
+        k = min(k, self.max_k)
+        if k <= 0 or self.view is None:
+            return []
+        g = self.view
+        # Speculatively step over base_tok (the first verify token, already committed),
+        # then collect the grammar-forced continuation. `steps` counts advances so the
+        # finally-clause restores the EXACT starting state even if a walk step is
+        # rejected or an exception fires — the drafter only peeks, never mutates.
+        if not g.advance(base_tok):
+            return []
+        forced: list[int] = []
+        steps = 1
+        try:
+            # Prefer the view's own forced-run primitive (XGrammar jump-forward: it
+            # captures the MULTI-token structural runs of JSON/tool-calls, where exact
+            # token singletons are rare on a BPE vocab). Fall back to the generic
+            # singleton walk (used by the CPU fake-grammar tests, and any view without
+            # jump-forward): draft one forced token per position until the grammar
+            # branches. Either way `forced` holds only grammar-legal tokens.
+            if hasattr(g, "forced_run"):
+                forced = g.forced_run(k)
+                steps += len(forced)
+            else:
+                while len(forced) < k:
+                    tid = g.next_singleton()
+                    if tid is None:  # grammar branches here — stop the free run
+                        break
+                    if not g.advance(tid):
+                        break
+                    forced.append(tid)
+                    steps += 1
+        finally:
+            g.rewind(steps)
+        return forced
+
+
+def cascade_draft(ngram, mtp_fallback, tokens, k, *, grammar=None):
+    """Cascade: grammar (free forced run) → n-gram → MTP head.
+
+    ``grammar`` is a :class:`GrammarDrafter` (or None when no constraint is active);
+    when present it proposes the singleton-forced continuation of ``tokens[-1]`` (the
+    first verify token / ``base_tok``) for free — strictly the best drafter on the
+    forced structural positions of JSON / tool-call output. On a grammar branch it
+    returns ``[]`` and the cascade falls through: ``ngram`` (a :class:`NgramDrafter`,
+    or None to skip straight to MTP), then ``mtp_fallback`` — a zero-arg callable
+    returning the MTP head's draft list, evaluated lazily so the head's forward is
+    skipped whenever a free tier hits. Returns the draft token list (possibly empty)."""
+    if grammar is not None and tokens:
+        drafts = grammar.propose(tokens[-1], k)
+        if drafts:
+            return drafts
     if ngram is not None:
         drafts = ngram.propose(tokens, k)
         if drafts:
@@ -83,11 +165,18 @@ def cascade_draft(ngram, mtp_fallback, tokens, k):
 def drafter_config():
     """Read spec-decode drafter config from the environment (engine kwargs override).
 
-    FNI8SERVE_SPEC_DRAFTER: ``cascade`` (default) | ``ngram`` | ``mtp``.
-    FNI8SERVE_SPEC_K:       max draft length (default 4). n-gram uses up to this;
-                            the MTP head is depth-1 so it caps the effective k at 1
-                            on prose. Larger k helps structured workloads, costs a
-                            few wasted verify slots on prose.
+    FNI8SERVE_SPEC_DRAFTER: ``cascade`` (default) | ``grammar`` | ``ngram`` | ``mtp``.
+                            ``cascade`` runs all tiers (grammar → n-gram → MTP);
+                            ``grammar`` runs ONLY the tier-0 grammar drafter (free
+                            forced runs, no draft-model forward ever) — the isolated
+                            structured-output tier; ``ngram`` / ``mtp`` select a single
+                            fallback tier. The grammar tier only engages on sequences
+                            that actually carry a grammar/structured constraint; it is
+                            a silent no-op on unconstrained sequences.
+    FNI8SERVE_SPEC_K:       max draft length (default 4). n-gram / grammar use up to
+                            this; the MTP head is depth-1 so it caps the effective k at
+                            1 on prose. Larger k helps structured workloads (long forced
+                            runs), costs a few wasted verify slots on prose.
     FNI8SERVE_SPEC_NGRAM:   ``min_n,max_n`` (default ``2,3``).
     """
     mode = os.environ.get("FNI8SERVE_SPEC_DRAFTER", "cascade").lower()

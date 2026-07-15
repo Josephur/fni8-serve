@@ -19,8 +19,21 @@ from ..layers.sampler import Sampler
 from ..models.base import ForwardContext
 from ..models.cache import MTPKVCache, RecurrentStateCache
 from .cuda_graph import GraphedDecode, GraphedVerify, cuda_graph_enabled_by_env
-from .drafters import NgramDrafter, cascade_draft, drafter_config
+from .drafters import GrammarDrafter, NgramDrafter, cascade_draft, drafter_config
 from .sequence import Sequence
+
+
+def _grammar_view(seq: "Sequence"):
+    """The sequence's grammar/structured-output walk (a
+    :class:`fni8serve.structured.GrammarLogitsProcessor`) if it carries one, else None.
+    Detected structurally by the GrammarView interface so spec-decode stays decoupled
+    from `structured.py` (and from xgrammar being installed): any logit processor that
+    exposes the non-destructive walk (``advance`` / ``next_singleton`` / ``mask_row``)
+    is a grammar drafter/verifier; a plain callable logit processor is ignored."""
+    for p in seq.params.logit_processors or ():
+        if all(hasattr(p, m) for m in ("advance", "next_singleton", "mask_row", "sync")):
+            return p
+    return None
 
 
 class EngineRunner:
@@ -423,6 +436,17 @@ class EngineRunner:
         device = self.device
         slots = [s.slot for s in batch]
 
+        # Per-row grammar/structured-output view (tier-0 drafter + grammar-masked
+        # verify), or None on an unconstrained row. When present the walk is driven
+        # here directly (bypassing the sampler hook), so the whole spec step — base
+        # pick, drafts, and verify truth — is the SAME grammar-masked greedy plain
+        # decode would emit. Sync each view to its committed history up front.
+        views = [_grammar_view(s) for s in batch]
+        for b, gv in enumerate(views):
+            if gv is not None:
+                gv.sync(batch[b].all_token_ids)
+        has_grammar = any(v is not None for v in views)
+
         # -- 1. Bootstrap base forward for sequences on their FIRST spec step ----
         # A newly-admitted (just-prefilled) sequence has no pipelining carry yet: run
         # ONE base forward over exactly those rows to write their last token's K/V,
@@ -443,22 +467,25 @@ class EngineRunner:
                 slots=nslots, slot_lengths=nlens,
             )
             bh = self.model(ids, pos, bctx)  # [nb, 1, H]
-            btok = self.model.compute_logits(bh[:, -1]).argmax(-1)  # [nb]
+            blogits = self.model.compute_logits(bh[:, -1])  # [nb, vocab]
             for j, b in enumerate(need):
-                batch[b].spec_base_tok = int(btok[j])
+                # A grammar row's base token is the grammar-masked greedy pick — the
+                # matcher is at "predict base_tok" (synced above, base_tok not yet
+                # accepted), exactly as plain grammar decode picks the next token.
+                if views[b] is not None:
+                    views[b].mask_row(blogits[j])
+                batch[b].spec_base_tok = int(blogits[j].argmax())
                 batch[b].spec_base_hidden = bh[j, -1].clone()
 
         base_tok = torch.tensor([s.spec_base_tok for s in batch], device=device)  # [B]
         base_hidden = torch.stack([s.spec_base_hidden for s in batch], dim=0)  # [B, H]
         lengths = [s.length for s in batch]
 
-        # -- 2. Draft: cascade (n-gram first, MTP head fallback) ----------------
+        # -- 2. Draft: cascade (grammar tier-0, then n-gram, MTP head fallback) --
         # Per-row variable-length drafts; the verify tensor is sized to the longest.
-        draft_lists = self._compute_drafts(mtp, base_hidden, base_tok, lengths, slots, batch)
-        # Graphed verify captures ONE fixed shape, so pad every row to the full spec_k
-        # (S = spec_k+1 constant) when it's active; else size to the longest real draft
-        # (rejected pads are harmless either way — the accept loop only walks each row's
-        # REAL drafts). Result-identical: the extra pad positions never get accepted.
+        draft_lists = self._compute_drafts(
+            mtp, base_hidden, base_tok, lengths, slots, batch, views
+        )
         actual_len = [len(d) for d in draft_lists]
         # Graphed verify captures ONE fixed S per (batch, context, S) bucket, so the
         # verify width must be shape-static — but forcing the full spec_k every step
@@ -507,6 +534,35 @@ class EngineRunner:
             logits_v = self.model.compute_logits(hidden_v)  # [B, S, vocab]
             true_tokens = logits_v.argmax(-1)  # [B, S] — true greedy at each verify slot
 
+        # -- 3b. Grammar-masked verify truth (bit-identity on constrained rows) --
+        # An unconstrained row's truth is the plain argmax above. On a grammar row the
+        # truth at each slot must be the grammar-MASKED argmax — otherwise a forced
+        # structural token (the tier-0 draft) whose UNmasked argmax differs would be
+        # wrongly rejected, diverging from plain grammar-constrained decode. Walk the
+        # matcher along [base_tok, draft_0, ...]: mask slot t, take its argmax as truth,
+        # and advance only while the draft keeps matching (so we never accept an
+        # illegal draft into the matcher — the walk stops exactly where verify does).
+        if has_grammar:
+            for b in range(B):
+                gv = views[b]
+                if gv is None:
+                    continue
+                if not gv.advance(int(base_tok[b])):  # base_tok is grammar-legal by pick
+                    continue
+                acc = 1  # matcher advances to restore after this row (base_tok + drafts)
+                for t in range(min(actual_len[b] + 1, S)):
+                    gv.mask_row(logits_v[b, t])
+                    tt = int(logits_v[b, t].argmax())
+                    true_tokens[b, t] = tt
+                    if t < actual_len[b] and tt == drafts_mat[b][t] and tt != self.eos_id:
+                        gv.advance(tt)
+                        acc += 1
+                    else:
+                        break
+                # Undo the speculative walk; the accepted tokens are re-committed via
+                # `mark_committed` after truncation/EOS is resolved in the accept loop.
+                gv.rewind(acc)
+
         # -- 4. Accept longest greedy prefix + commit (no re-decode) ------------
         row_last = []  # per-row 0-based index of the last accepted verify slot
         for b in range(B):
@@ -545,6 +601,15 @@ class EngineRunner:
             if not truncated:
                 seq.spec_base_tok = next_base_tok
                 seq.spec_base_hidden = next_base_hidden.clone()
+                # Commit the grammar walk over the tokens emitted this step so the next
+                # step (spec OR plain `__call__` decode) resumes at the right position
+                # and never re-accepts them. Only for a continuing row — a truncated
+                # (EOS/budget) row finishes, so its matcher state is never reused.
+                gv = views[b]
+                if gv is not None:
+                    for tok in emit:
+                        gv.advance(tok)
+                    gv.mark_committed(len(seq.all_token_ids))
             else:
                 seq.spec_base_tok = None
                 seq.spec_base_hidden = None
@@ -600,15 +665,21 @@ class EngineRunner:
         return emit
 
     @torch.inference_mode()
-    def _compute_drafts(self, mtp, base_hidden, base_tok, lengths, slots, batch) -> list:
+    def _compute_drafts(
+        self, mtp, base_hidden, base_tok, lengths, slots, batch, views=None
+    ) -> list:
         """Propose a per-row draft token LIST (variable length) via the cascade:
-        n-gram (prompt-lookup) first, MTP head fallback. The n-gram context is the
-        sequence's tokens so far PLUS ``base_tok`` (the first verify token), so it
-        proposes the continuation that follows ``base_tok``. The MTP head is depth-1
-        (one token) and attends its own prefix-KV over the committed context.
+        grammar (tier-0, free forced structural run) → n-gram (prompt-lookup) →
+        MTP head fallback. The context is the sequence's tokens so far PLUS
+        ``base_tok`` (the first verify token), so each tier proposes the continuation
+        that FOLLOWS ``base_tok``. The grammar tier commits singleton-forced tokens
+        with no model forward; on a branch it yields and the n-gram / depth-1 MTP head
+        take over. ``views[b]`` is the synced grammar walk for row ``b`` (or None).
 
         Single draft-dispatch seam (tests may patch this)."""
         B = base_tok.shape[0]
+        if views is None:
+            views = [None] * B
         out = []
         for b in range(B):
             seq = batch[b]
@@ -625,12 +696,23 @@ class EngineRunner:
                 return []
 
             ctx_tokens = seq.all_token_ids + [int(base_tok[b])]
-            # "ngram" mode = n-gram only (no MTP fallback on a miss); "mtp" mode has
-            # self._ngram is None so the cascade uses only the fallback; "cascade" uses
-            # both. A step where the drafter proposes nothing still verifies base_tok
-            # (k_step floored at 1) — it just commits 1 token like plain decode.
-            fb = None if self._drafter_mode == "ngram" else mtp_fallback
-            dl = cascade_draft(self._ngram, fb, ctx_tokens, self._spec_k)
+            # Modes: "grammar" = tier-0 grammar drafter ONLY (no n-gram/MTP fallback —
+            # free forced runs, then a bare base_tok verify on a branch); "ngram" =
+            # n-gram only (no MTP fallback on a miss); "mtp" = MTP fallback only
+            # (self._ngram is None); "cascade" = grammar → n-gram → MTP. A step where
+            # every tier proposes nothing still verifies base_tok (k_step floored at 1)
+            # — it just commits 1 token like plain decode.
+            gd = (
+                GrammarDrafter(views[b], max_k=self._spec_k)
+                if views[b] is not None and self._drafter_mode in ("cascade", "grammar")
+                else None
+            )
+            if self._drafter_mode == "grammar":
+                ng, fb = None, None
+            else:
+                ng = self._ngram
+                fb = None if self._drafter_mode == "ngram" else mtp_fallback
+            dl = cascade_draft(ng, fb, ctx_tokens, self._spec_k, grammar=gd)
             out.append(dl)
         return out
 

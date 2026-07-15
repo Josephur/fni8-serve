@@ -441,7 +441,7 @@ def _force_full_acceptance(eng_spec, ref_by_prompt):
     runner = eng_spec.runner
     runner._spec_enabled = True  # spec-decode is opt-in/off by default; force it on here
 
-    def forced_compute_drafts(mtp, base_hidden, base_tok, lengths, slots, batch):
+    def forced_compute_drafts(mtp, base_hidden, base_tok, lengths, slots, batch, views=None):
         # Force each row's drafts to the true greedy continuation (up to _spec_k
         # tokens) so every draft is accepted and the real verify/commit + multi-token
         # accept path is exercised. Patches the single draft seam ``_compute_drafts``
