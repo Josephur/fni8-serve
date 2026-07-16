@@ -47,6 +47,7 @@ print(f"[check] _FNI8_HAS_Q4K = {_FNI8_HAS_Q4K}")
 GGUF_PATH = os.environ.get("FNI8_GGUF_PATH", "/flint8_work/Qwen3.5-9B-UD-Q4_K_XL.gguf")
 MODEL_LABEL = os.environ.get("FNI8_MODEL_LABEL", os.path.basename(GGUF_PATH))
 TARGET_TOK_S = float(os.environ.get("FNI8_TARGET_TOK_S", "69"))
+MAX_LEN = int(os.environ.get("FNI8_MAX_LEN", "2048"))
 assert os.path.exists(GGUF_PATH), f"GGUF not found: {GGUF_PATH}"
 
 from fni8serve.gguf_native import (  # noqa: E402
@@ -84,7 +85,7 @@ engine = load_gguf_engine(
     GGUF_PATH,
     device="cuda",
     max_num_seqs=1,
-    max_len=2048,
+    max_len=MAX_LEN,
     spec_decode=SPEC_DECODE,
 )
 t_load = time.perf_counter() - t0
@@ -93,7 +94,7 @@ print(f"[load] engine built in {t_load:.2f}s")
 # Report native vs fallback path
 native_types = _native_kquant_types()
 print(f"[load] native_types={','.join(native_types) or '(none — int8 fallback)'}")
-print(f"[load] spec_decode={SPEC_DECODE}")
+print(f"[load] spec_decode={SPEC_DECODE}, max_len={MAX_LEN}")
 
 # CUDA graph status
 runner = engine.runner
@@ -143,14 +144,23 @@ request_id = engine.add_request(
     prompt_ids, SamplingParams(max_tokens=NEW_TOKENS, temperature=0.0, ignore_eos=True)
 )
 step_times = []
+emitted_tokens_per_step = []
 while engine.scheduler.has_work():
+    before = len(engine._out[request_id].output_ids)
     t0 = time.perf_counter()
     engine.step()
     torch.cuda.synchronize()
     step_times.append(time.perf_counter() - t0)
+    emitted_tokens_per_step.append(len(engine._out[request_id].output_ids) - before)
 output_ids = list(engine._out[request_id].output_ids)
-summary = summarize_generation_steps(step_times, warmup_decode_steps=1)
+summary = summarize_generation_steps(
+    step_times,
+    warmup_decode_steps=1,
+    emitted_tokens_per_step=emitted_tokens_per_step if SPEC_DECODE else None,
+)
 peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
+spec_stats = dict(runner.spec_stats)
+spec_active = SPEC_DECODE and spec_stats["steps"] > 0
 
 # ── Step 4: report ──────────────────────────────────────────────────────────
 print(f"\n[debug] output_ids ({len(output_ids)} tokens): {output_ids[:30]}")
@@ -175,7 +185,15 @@ print(f"  Peak VRAM:                     {peak_vram:.2f} GB")
 print(f"  VRAM < 16GB:                   {'YES' if peak_vram < 16.0 else 'NO — OVER BUDGET'}")
 print(f"  Native k-quant types:           {','.join(native_types) or 'none'}")
 print(f"  CUDA graphs:                   {'ON' if gd and gd.supported else 'OFF'}")
-print(f"  Speculative decode:            {'ON' if SPEC_DECODE else 'OFF'}")
+print(
+    "  Speculative decode:            "
+    f"{'ACTIVE' if spec_active else 'REQUESTED, SAFE FALLBACK' if SPEC_DECODE else 'OFF'}"
+)
+if SPEC_DECODE:
+    print(
+        "  Spec steps/drafts/accepts:      "
+        f"{spec_stats['steps']}/{spec_stats['drafts']}/{spec_stats['accepts']}"
+    )
 
 # Degeneracy check only. Language coherence requires a tokenizer + natural prompt and
 # is reported as decoded text above for inspection/oracle comparison.

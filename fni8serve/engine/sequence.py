@@ -51,6 +51,10 @@ class Sequence:
     # weight-stream. None until the first step establishes them (or after a preempt).
     spec_base_tok: int | None = None
     spec_base_hidden: "torch.Tensor | None" = None
+    # N-gram-only speculation cannot know whether prompt lookup will hit until the
+    # target model produces its base token. After a miss, ordinary graphed decode is
+    # used for this many steps before one inexpensive re-probe.
+    spec_ngram_cooldown: int = 0
 
     @property
     def num_prompt(self) -> int:

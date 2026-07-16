@@ -149,6 +149,15 @@ def test_cascade_no_grammar_is_unchanged_ngram_then_mtp():
     assert cascade_draft(ng, lambda: [0], tokens=tokens, k=4, grammar=None) == [6, 7, 5]
 
 
+def test_ngram_preflight_only_rejects_impossible_next_token_matches():
+    ng = NgramDrafter(min_n=2, max_n=3)
+
+    assert ng.could_match_after([10, 20, 30]) is False
+    # If the target's next token is 2, appending it makes the suffix [1, 2]
+    # match the earlier span and prompt lookup can propose its continuation.
+    assert ng.could_match_after([1, 2, 3, 1]) is True
+
+
 class ForcedRunView:
     """A view exposing the ``forced_run`` primitive (the XGrammar jump-forward path):
     it returns a MULTI-token forced run at once (advancing its walk), which the drafter

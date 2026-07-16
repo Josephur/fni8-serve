@@ -78,6 +78,23 @@ class NgramDrafter:
                     break  # match with no continuation room; try a shorter n
         return []
 
+    def could_match_after(self, tokens: list[int]) -> bool:
+        """Whether *some* next token could complete a usable n-gram match.
+
+        The target model has not produced that token yet, but the preceding
+        ``n-1`` suffix is already known. If it never appeared earlier with a token
+        after it, no possible target token can make :meth:`propose` succeed, so the
+        runner can stay on ordinary graphed decode without an eager probe.
+        """
+        L = len(tokens)
+        for n in range(self.min_n, min(self.max_n, L + 1) + 1):
+            prefix_len = n - 1
+            suffix = tokens[-prefix_len:] if prefix_len else []
+            for i in range(0, L - prefix_len):
+                if tokens[i : i + prefix_len] == suffix:
+                    return True
+        return False
+
 
 class GrammarDrafter:
     """Tier-0 spec-decode drafter: the active grammar IS the drafter.

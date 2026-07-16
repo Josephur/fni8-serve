@@ -191,6 +191,31 @@ class RecurrentStateCache:
             return self._sset(self._conv_buf, layer_idx, tail)
         self._scatter(self._conv_tail, layer_idx, tail)
 
+    def verify_trajectory_nbytes(self, batch_rows: int, tokens: int) -> int:
+        """Estimate storage for a recurrent verify trajectory.
+
+        Verification records every token's state and convolution tail for every
+        active row. Static cache buffers include all scheduler slots, so count one
+        row from each layer buffer rather than the full preallocated tensor.
+        """
+        if batch_rows < 1 or tokens < 1:
+            return 0
+
+        def row_nbytes(t: torch.Tensor) -> int:
+            return t[0].numel() * t.element_size()
+
+        if self._static:
+            per_row = sum(row_nbytes(t) for t in self._state_buf.values())
+            per_row += sum(row_nbytes(t) for t in self._conv_buf.values())
+        else:
+            # Dict values are stored one row per (slot, layer). Count each layer
+            # once, then scale by the prospective verify batch below.
+            state_rows = {layer: t for (_, layer), t in self._state.items()}
+            conv_rows = {layer: t for (_, layer), t in self._conv_tail.items()}
+            per_row = sum(row_nbytes(t) for t in state_rows.values())
+            per_row += sum(row_nbytes(t) for t in conv_rows.values())
+        return per_row * batch_rows * tokens
+
     def snapshot(self) -> dict:
         """Deep-copy every layer's recurrent state + conv tail for the CURRENTLY
         BOUND slots (``bind(slots)`` must have been called). Returns an opaque token

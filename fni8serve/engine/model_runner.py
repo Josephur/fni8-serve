@@ -137,9 +137,7 @@ class EngineRunner:
             and self.graphed.supported
             and os.environ.get("FNI8SERVE_VERIFY_GRAPH", "1") not in ("0", "false", "False")
         )
-        self.graphed_verify = (
-            GraphedVerify(self.graphed) if self._verify_graph_enabled else None
-        )
+        self.graphed_verify = GraphedVerify(self.graphed) if self._verify_graph_enabled else None
         # Persistent host/device staging for the per-step sampling params (issue #183):
         # `temps`/`top_p` used to be rebuilt every step with `torch.tensor(list,
         # device=cuda)` -- a blocking pageable host->device copy per step. We keep a
@@ -332,7 +330,6 @@ class EngineRunner:
             for t in range(n):
                 slot_mapping_flat.append(self.cache._slot_mapping([seq.slot], [t]).item())
 
-        total_tokens = cu_seqlens[-1]
         ids = torch.tensor([all_ids], device=self.device)  # [1, total_tok]
         pos = torch.tensor([all_positions], device=self.device)
         cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=self.device)
@@ -399,10 +396,40 @@ class EngineRunner:
             return False
         if any(s.pixel_values is not None for s in batch):
             return False
+        if mtp is None and any(s.spec_ngram_cooldown > 0 for s in batch):
+            for seq in batch:
+                seq.spec_ngram_cooldown = max(0, seq.spec_ngram_cooldown - 1)
+            return False
+        has_grammar = any(_grammar_view(s) is not None for s in batch)
+        if (
+            mtp is None
+            and self._ngram is not None
+            and not has_grammar
+            and not any(self._ngram.could_match_after(s.all_token_ids) for s in batch)
+        ):
+            return False
         # Recurrent hybrid whose state can't be committed from the verify trajectory
         # (a non-capturing recurrent layer) — plain decode instead of a wrong commit.
         if self.has_recurrent and not self._spec_recurrent_ok:
             return False
+        if self.has_recurrent and str(getattr(self, "device", "cpu")).startswith("cuda"):
+            # Recurrent verify stores state after every candidate token. On a nearly
+            # full one-card 27B load that trajectory is several GiB, so attempting it
+            # cannot succeed. Include allocator-held inactive segments in usable
+            # memory, but retain headroom for verify logits and graph workspace.
+            tokens = getattr(self, "_spec_k", 1) + 1
+            needed = self.lin_cache.verify_trajectory_nbytes(len(batch), tokens)
+            try:
+                free, _ = torch.cuda.mem_get_info(self.device)
+                reusable = max(
+                    0,
+                    torch.cuda.memory_reserved(self.device)
+                    - torch.cuda.memory_allocated(self.device),
+                )
+            except (RuntimeError, TypeError):
+                return False
+            if needed + (64 << 20) > free + reusable:
+                return False
         return True
 
     @torch.inference_mode()
@@ -418,7 +445,7 @@ class EngineRunner:
         return self._sample(logits, batch)
 
     @torch.inference_mode()
-    def _spec_decode_eager(self, batch: list[Sequence], mtp) -> None:
+    def _spec_decode_eager(self, batch: list[Sequence], mtp) -> list[int] | None:
         """Restructured speculative-decode step (spec loop, task 1). Emits, per
         sequence, ``1 + (#accepted drafts)`` tokens from ONE weight-stream (the verify
         forward). The redundant per-step base forward and the accepted-token re-decode
@@ -439,7 +466,8 @@ class EngineRunner:
             state after each row's last accepted token is committed directly — no
             snapshot/restore/replay.
 
-        Returns ``None`` — ``llm_engine.step`` skips its per-sequence append on None.
+        Returns normal one-token results when every drafter misses; otherwise returns
+        ``None`` because this method appends the accepted multi-token prefixes itself.
         """
         B = len(batch)
         device = self.device
@@ -472,8 +500,11 @@ class EngineRunner:
             self.cache.ensure_capacity(nslots, [n + 1 for n in nlens])
             self.lin_cache.bind(nslots)
             bctx = ForwardContext(
-                is_prefill=False, kv_cache=self.cache, lin_cache=self.lin_cache,
-                slots=nslots, slot_lengths=nlens,
+                is_prefill=False,
+                kv_cache=self.cache,
+                lin_cache=self.lin_cache,
+                slots=nslots,
+                slot_lengths=nlens,
             )
             bh = self.model(ids, pos, bctx)  # [nb, 1, H]
             blogits = self.model.compute_logits(bh[:, -1])  # [nb, vocab]
@@ -492,10 +523,28 @@ class EngineRunner:
 
         # -- 2. Draft: cascade (grammar tier-0, then n-gram, MTP head fallback) --
         # Per-row variable-length drafts; the verify tensor is sized to the longest.
-        draft_lists = self._compute_drafts(
-            mtp, base_hidden, base_tok, lengths, slots, batch, views
-        )
+        draft_lists = self._compute_drafts(mtp, base_hidden, base_tok, lengths, slots, batch, views)
         actual_len = [len(d) for d in draft_lists]
+        if not any(actual_len):
+            # No proposal means there is nothing to verify. The bootstrap forward
+            # above (or the prior step's carried verify slot) has already produced
+            # the same next token plain greedy decode would return. Commit that one
+            # processed position, discard the speculative carry, and let the engine
+            # append the tokens normally. This avoids an S=2 target-model pass that
+            # made n-gram misses roughly 2x slower than plain graph decode.
+            out = [int(seq.spec_base_tok) for seq in batch]
+            for b, seq in enumerate(batch):
+                seq.length += 1
+                seq.spec_base_tok = None
+                seq.spec_base_hidden = None
+                gv = views[b]
+                if gv is not None:
+                    gv.advance(out[b])
+                    gv.mark_committed(len(seq.all_token_ids) + 1)
+            if mtp is None and not has_grammar and self._drafter_mode in ("ngram", "cascade"):
+                for seq in batch:
+                    seq.spec_ngram_cooldown = 64
+            return out
         # Graphed verify captures ONE fixed S per (batch, context, S) bucket, so the
         # verify width must be shape-static — but forcing the full spec_k every step
         # wastes compute the graph can't hide when acceptance is low: a spec_k+1-wide
@@ -516,7 +565,10 @@ class EngineRunner:
         verify_ids_l = [[int(base_tok[b])] + drafts_mat[b] for b in range(B)]  # [B][S]
         verify_pos_l = [[lengths[b] + 1 + t for t in range(S)] for b in range(B)]
         hidden_v = true_tokens = None
-        if self.graphed_verify is not None:
+        # Grammar verification must retain and mask the per-token logits. The graph
+        # intentionally exposes only hidden states and unmasked argmax tokens, so use
+        # eager verify for constrained rows until a logits-aware graph ABI exists.
+        if self.graphed_verify is not None and not has_grammar:
             res = self.graphed_verify.try_run(batch, verify_ids_l, verify_pos_l, lengths)
             if res is not None:
                 hidden_v, true_tokens = res  # KV writes + recurrent traj done in-graph
@@ -532,8 +584,12 @@ class EngineRunner:
                     flat_positions.append(base + t)
             verify_slot_mapping = self.cache.slot_mapping_for(flat_slots, flat_positions)
             v_ctx = ForwardContext(
-                is_prefill=False, is_verify=True, kv_cache=self.cache, lin_cache=self.lin_cache,
-                slots=slots, slot_lengths=[n + 1 for n in lengths],
+                is_prefill=False,
+                is_verify=True,
+                kv_cache=self.cache,
+                lin_cache=self.lin_cache,
+                slots=slots,
+                slot_lengths=[n + 1 for n in lengths],
                 verify_slot_mapping=verify_slot_mapping,
             )
             if self.has_recurrent:
@@ -699,7 +755,10 @@ class EngineRunner:
                     rope = torch.tensor([[lengths[b]]], device=self.device)
                     tok, _kc, _vc = mtp.draft_greedy_cached(
                         base_hidden[b : b + 1].unsqueeze(1),
-                        base_tok[b : b + 1].unsqueeze(-1), rope, pk, pv,
+                        base_tok[b : b + 1].unsqueeze(-1),
+                        rope,
+                        pk,
+                        pv,
                     )
                     return [int(tok[0, 0])]
                 return []

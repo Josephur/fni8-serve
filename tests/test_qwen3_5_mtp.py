@@ -112,7 +112,9 @@ def test_guard_allows_ngram_without_mtp_head():
     stripped the `nextn.*` MTP tensors. Locks in the new contract."""
     r = _runner(_PlainModel())
     assert r._ngram is not None  # default cascade mode wires the n-gram drafter
-    assert r._spec_decode_allowed([_seq()], None) is True
+    seq = _seq()
+    seq.prompt_ids = [1, 2, 3, 1]  # a next token can complete the earlier [1, ...] span
+    assert r._spec_decode_allowed([seq], None) is True
 
 
 def test_guard_refuses_nonzero_temperature():
