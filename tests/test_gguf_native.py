@@ -74,6 +74,34 @@ def test_gguf_engine_consumes_owned_weights(monkeypatch):
 
 
 @pytest.mark.correctness
+def test_qwen35_gguf_transforms_are_restored_to_hf_semantics():
+    """llama.cpp rewrites Qwen3.5 tensors; the HF-layout builder needs the inverse."""
+    from types import SimpleNamespace
+
+    from fni8serve.gguf_native import _restore_hf_qwen35_weights
+
+    cfg = SimpleNamespace(
+        linear_attention=True,
+        extra={"linear_num_key_heads": 2, "linear_num_value_heads": 4},
+    )
+    sd = {
+        "model.layers.0.input_layernorm.weight": torch.tensor([1.25]),
+        "model.layers.0.self_attn.q_norm.weight": torch.tensor([0.75]),
+        "model.layers.0.linear_attn.norm.weight": torch.tensor([0.875]),
+        "model.layers.0.linear_attn.A_log": torch.tensor([-torch.exp(torch.tensor(2.0))]),
+    }
+
+    restored, tiled = _restore_hf_qwen35_weights(sd, cfg)
+
+    assert torch.equal(restored["model.layers.0.input_layernorm.weight"], torch.tensor([0.25]))
+    assert torch.equal(restored["model.layers.0.self_attn.q_norm.weight"], torch.tensor([-0.25]))
+    # The gated DeltaNet output norm is not zero-centered and is not shifted by the converter.
+    assert torch.equal(restored["model.layers.0.linear_attn.norm.weight"], torch.tensor([0.875]))
+    assert torch.allclose(restored["model.layers.0.linear_attn.A_log"], torch.tensor([2.0]))
+    assert tiled is True
+
+
+@pytest.mark.correctness
 def test_native_kquant_capabilities_cover_every_installed_kernel(monkeypatch):
     """The loader must not silently transcode a format whose fused kernel exists."""
     import fni8
