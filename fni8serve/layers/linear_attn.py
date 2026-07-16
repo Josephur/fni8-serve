@@ -322,9 +322,15 @@ class GatedDeltaNetAttention(nn.Module):
         # recurrence, which stays a pure delta rule) since it is a per-model readout
         # scale. Omitting it inflates the pre-norm output ~sqrt(Dk)x and — via the gated
         # RMSNorm eps — rotates the normed output (cos ~0.84 vs HF instead of 1.0).
-        q = (_l2norm(q.view(B, L, self.nk, self.kd)) * (self.kd**-0.5)).transpose(1, 2)
-        k = _l2norm(k.view(B, L, self.nk, self.kd)).transpose(1, 2)
-        v = v.view(B, L, self.nv, self.vd).transpose(1, 2)
+        # Q/K normalization and the recurrence are numerically load-bearing fp32.
+        # Cast BEFORE the norm: normalizing the fp16 projection output and only then
+        # upcasting changed the normalized vectors enough to flip downstream int8
+        # activation codes (the eager oracle missed fused decode by rel-L1 0.00249).
+        q = (
+            _l2norm(q.view(B, L, self.nk, self.kd).float()) * (self.kd**-0.5)
+        ).transpose(1, 2)
+        k = _l2norm(k.view(B, L, self.nk, self.kd).float()).transpose(1, 2)
+        v = v.view(B, L, self.nv, self.vd).float().transpose(1, 2)
         # broadcast k/q heads to value heads (GQA)
         rep = self.nv // self.nk
         q = q.repeat_interleave(rep, dim=1)
