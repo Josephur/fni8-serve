@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import itertools
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import torch
@@ -256,6 +257,18 @@ def _move_stage_module(module: nn.Module, device: str) -> nn.Module:
     return module
 
 
+def _move_stage_groups(module_groups: list[list[nn.Module]], devices: tuple[int, ...]) -> None:
+    """Move disjoint pipeline stages concurrently, one worker per GPU."""
+
+    def move_group(group: list[nn.Module], device: int) -> None:
+        for module in group:
+            _move_stage_module(module, f"cuda:{device}")
+            module.eval()
+
+    with ThreadPoolExecutor(max_workers=len(devices)) as pool:
+        list(pool.map(move_group, module_groups, devices))
+
+
 class PipelineStage:
     """One contiguous slice of model layers on a single GPU.
 
@@ -365,12 +378,11 @@ def make_pipeline(
         module_groups.append(group)
     _detach_shared_stage_modules(module_groups)
 
+    _move_stage_groups(module_groups, devices)
+
     stages = []
     for stage_id, (device, modules) in enumerate(zip(devices, module_groups)):
         start, end = bounds[stage_id : stage_id + 2]
-        for module in modules:
-            _move_stage_module(module, f"cuda:{device}")
-            module.eval()
         stages.append(
             PipelineStage(
                 stage_id,

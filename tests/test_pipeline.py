@@ -27,6 +27,28 @@ two_gpus = pytest.mark.skipif(NUM_GPUS < 2, reason="needs >= 2 GPUs for PP")
 three_gpus = pytest.mark.skipif(NUM_GPUS < 3, reason="needs >= 3 GPUs for PP")
 
 
+def test_stage_module_transfers_overlap(monkeypatch):
+    """Disjoint stage copies must run concurrently so PCIe x1 links can overlap."""
+    import threading
+
+    import fni8serve.dist.pipeline as pipeline
+
+    barrier = threading.Barrier(3)
+    seen = []
+
+    def blocking_move(module, device):
+        seen.append((module, device, threading.get_ident()))
+        barrier.wait(timeout=2)
+
+    monkeypatch.setattr(pipeline, "_move_stage_module", blocking_move)
+    modules = [[torch.nn.Identity()] for _ in range(3)]
+
+    pipeline._move_stage_groups(modules, (0, 1, 2))
+
+    assert {device for _, device, _ in seen} == {"cuda:0", "cuda:1", "cuda:2"}
+    assert len({thread_id for _, _, thread_id in seen}) == 3
+
+
 def _cfg(n_layers: int = 2):
     return ModelConfig(
         arch="qwen3",
