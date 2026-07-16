@@ -104,12 +104,23 @@ else:
     print("[graph] no GraphedDecode on runner")
 
 # ── Step 3: benchmark decode ────────────────────────────────────────────────
-PROMPT_LEN = 256
-NEW_TOKENS = 128
+PROMPT_LEN = int(os.environ.get("FNI8_PROMPT_LEN", "256"))
+NEW_TOKENS = int(os.environ.get("FNI8_NEW_TOKENS", "128"))
+TOKENIZER_PATH = os.environ.get("FNI8_TOKENIZER")
+PROMPT_TEXT = os.environ.get("FNI8_PROMPT_TEXT", "The capital of France is")
 
-# Generate a synthetic prompt (repeat a common token to fill PROMPT_LEN tokens)
-# Use token 1 (typically a valid token in most tokenizers)
-prompt_ids = [1] * PROMPT_LEN
+# The default repeated-token prompt is intentionally a timing-only workload. A supplied
+# tokenizer switches the run into a natural-prompt correctness check and decodes the
+# output text; token diversity alone is not evidence of language coherence.
+tokenizer = None
+if TOKENIZER_PATH:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH)
+    prompt_ids = tokenizer.encode(PROMPT_TEXT, add_special_tokens=False)
+    PROMPT_LEN = len(prompt_ids)
+else:
+    prompt_ids = [1] * PROMPT_LEN
 
 from fni8serve.engine.sequence import SamplingParams  # noqa: E402
 
@@ -143,6 +154,9 @@ peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
 
 # ── Step 4: report ──────────────────────────────────────────────────────────
 print(f"\n[debug] output_ids ({len(output_ids)} tokens): {output_ids[:30]}")
+if tokenizer is not None:
+    print(f"[debug] prompt: {PROMPT_TEXT!r}")
+    print(f"[debug] decoded output: {tokenizer.decode(output_ids)!r}")
 
 print(f"\n{'=' * 60}")
 print(f"RESULTS: {MODEL_LABEL} GGUF-native decode")
@@ -163,14 +177,17 @@ print(f"  VRAM < 16GB:                   {'YES' if peak_vram < 16.0 else 'NO —
 print(f"  Native k-quant types:           {','.join(native_types) or 'none'}")
 print(f"  CUDA graphs:                   {'ON' if gd and gd.supported else 'OFF'}")
 
-# Coherence check: decode output should be non-empty, non-repetitive
+# Degeneracy check only. Language coherence requires a tokenizer + natural prompt and
+# is reported as decoded text above for inspection/oracle comparison.
 if output_ids:
     unique = len(set(output_ids))
     print(f"  Unique tokens:                 {unique}/{len(output_ids)}")
-    coherent = unique > len(output_ids) * 0.1
-    print(f"  Coherent:                      {'YES' if coherent else 'NO — likely garbage'}")
+    nondegenerate = unique > len(output_ids) * 0.1
+    print(f"  Non-degenerate ids:            {'YES' if nondegenerate else 'NO'}")
+    print(f"  Language coherence checked:    {'YES (decoded above)' if tokenizer else 'NO'}")
 else:
-    print("  Coherent:                      NO — empty output!")
+    print("  Non-degenerate ids:            NO — empty output!")
+    print("  Language coherence checked:    NO")
 
 # Verbatim output if short enough
 if len(output_ids) <= 200:
