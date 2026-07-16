@@ -55,8 +55,8 @@ _FLOAT_TYPES = {"F32", "F16", "BF16"}
 # Sources: research/llamacpp-hybrid-linattn.md §1 (qwen35/qwen3next), §5a;
 #          research/llamacpp-moe.md §1.1 (arch registrations).
 _GGUF_ARCH_ALIASES = {
-    "qwen35": "qwen3_next",  # Qwen3.5 hybrid = our qwen3_next backbone (§5a)
-    "qwen35moe": "qwen3_next",  # MoE variant of the same backbone
+    "qwen35": "qwen3_5",  # Qwen3.5 hybrid dense (9B) → our qwen3_5 builder
+    "qwen35moe": "qwen3_next",  # MoE variant → qwen3_next backbone
     "qwen3next": "qwen3_next",
     "qwen3moe": "qwen3",  # our qwen3 builder registers qwen3_moe/qwen3moe
     "deepseek2": "deepseek",
@@ -237,7 +237,7 @@ def gguf_config(path: str) -> ModelConfig:
     hf: dict = {
         "vocab_size": vocab,
         "hidden_size": hidden,
-        "num_hidden_layers": kv.a("block_count"),
+        "num_hidden_layers": kv.a("block_count") - n_mtp,
         "num_attention_heads": n_head,
         "num_key_value_heads": kv.a("attention.head_count_kv", n_head),
         "intermediate_size": kv.a("feed_forward_length", 0) or 0,
@@ -347,7 +347,9 @@ def gguf_state_dict(
                 dequantize(t.data, GGMLQuantizationType[gtype]).astype(np.float32)
             )
         elif quantizable and gtype == "Q8_0":
-            out[hf] = _to_per_row_i8(dequantize(t.data, GGMLQuantizationType.Q8_0).astype(np.float32))
+            out[hf] = _to_per_row_i8(
+                dequantize(t.data, GGMLQuantizationType.Q8_0).astype(np.float32)
+            )
         else:
             # float weights + all non-linear (norms/router/embeddings) → fp16 Tensor.
             if gtype in _FLOAT_TYPES:
@@ -357,6 +359,54 @@ def gguf_state_dict(
                 w = torch.from_numpy(np.ascontiguousarray(deq)).to(device).half()
             out[hf] = w
     return out
+
+
+def _remap_hybrid_qwen35(sd: dict, cfg) -> dict:
+    """Post-process a GGUF state dict for Qwen3.5 hybrid models.
+
+    The llama.cpp qwen35 GGUF layout uses fused `attn_qkv` and `attn_gate`
+    tensors that need layer-type-dependent remapping:
+
+    * **DeltaNet layers** (linear_attention): `attn_gate.weight` →
+      `linear_attn.in_proj_a.weight` (the dt/decay projection).  The fused
+      `attn_qkv.weight` is already mapped to `linear_attn.in_proj_qkv.weight`
+      by `gguf_name_to_hf`.
+
+    * **Full-attention layers**: `attn_q.weight` + `attn_gate.weight` must be
+      FUSED into `self_attn.q_proj.weight` (the gated-QAttention convention:
+      q_proj carries [query | gate] on the output axis).  K/V stay separate.
+
+    This runs ONCE after `gguf_state_dict` and before the model builder.
+    Only touches layers whose GGUF tensors are present (safe for non-hybrid
+    models — returns `sd` unchanged if no `self_attn.attn_gate` keys exist).
+    """
+    # Quick bail: no attn_gate tensors → nothing to remap.
+    gate_keys = [k for k in sd if k.endswith(".self_attn.attn_gate.weight")]
+    if not gate_keys:
+        return sd
+
+    n_head = cfg.num_attention_heads
+    n_kv = cfg.num_key_value_heads
+    hd = cfg.resolved_head_dim()
+
+    for gk in gate_keys:
+        prefix = gk.rsplit(".self_attn.attn_gate.weight", 1)[0]
+        layer_idx = int(prefix.split(".")[-1])
+        kind = cfg.attention_kind(layer_idx)
+        gate = sd.pop(gk)
+
+        if kind == "linear":
+            # DeltaNet: attn_gate → linear_attn.in_proj_z (z gate, output gate)
+            sd[f"{prefix}.linear_attn.in_proj_z.weight"] = gate
+        else:
+            # Full attention: fuse gate into q_proj.
+            # HF q_proj = [query_heads | gate_heads] on the output axis.
+            qk = f"{prefix}.self_attn.q_proj.weight"
+            q = sd.pop(qk)
+            # gate is [H, H] (one scalar gate per head, broadcast to head_dim),
+            # q is [nh*hd, H].  Concat on output axis → [(nh*hd + nh*hd), H].
+            sd[qk] = torch.cat([q, gate], dim=0)
+    return sd
 
 
 def _gguf_eos_id(path: str) -> int | None:
@@ -408,6 +458,66 @@ def load_gguf_engine(
     # NOW (the per-forward dequant fallback is far too slow for a whole model).
     native_types = ("Q4_K",) if _FNI8_HAS_Q4K else ()
     weights = gguf_state_dict(path, device=device, native_types=native_types)
+
+    # ── Unsloth GGUF [in, out] → [out, in] transposition ──────────────────────
+    # The Unsloth GGUF converter (used for the Qwen3.5-9B UD-Q4_K_XL checkpoint)
+    # stores 2-D weight tensors as [in_features, out_features], transposed from
+    # PyTorch's [out_features, in_features] convention.  Detect by checking if
+    # token_embd has shape [hidden_size, vocab_size] (wrong) instead of
+    # [vocab_size, hidden_size] (correct).  When detected, transpose every2-D
+    # tensor so the builders and kernels see the expected layout.
+    _embed = weights.get("model.embed_tokens.weight")
+    if _embed is not None and _embed.dim() == 2 and _embed.shape[0] == cfg.hidden_size:
+        import logging
+
+        _log = logging.getLogger("fni8serve.gguf_native")
+        _log.info("GGUF weights are [in, out] (Unsloth convention) — transposing all 2D tensors")
+        _new = {}
+        for k, v in weights.items():
+            if isinstance(v, QTensor):
+                if v.scheme == "gguf_kquant":
+                    # K-quant raw bytes: the kernel unpacks from the block layout
+                    # directly.  Transpose the logical shape metadata but keep the
+                    # bytes intact — the kernel determines N/K from the blocks.
+                    _new[k] = QTensor(
+                        v.data,
+                        v.scale,
+                        scheme=v.scheme,
+                        codebook=v.codebook,
+                        group_size=v.group_size,
+                    )
+                    # Swap the logical [in, blocks] → [blocks, in] by reshaping.
+                    # Actually, k-quant QTensor data is flat uint8 — no2-D shape
+                    # to transpose.  The kernel ignores the tensor shape entirely.
+                    pass  # leave as-is
+                elif v.scheme == "per_row_i8":
+                    # Dequantize → transpose → re-quantize.  Expensive but correct:
+                    # the per-row scales must correspond to the new rows.
+                    from .convert import quantize_weight_i8
+
+                    fp = (v.data.float() * v.scale.unsqueeze(-1)).half()
+                    _new[k] = quantize_weight_i8(fp.T.contiguous())
+                else:
+                    _new[k] = v  # raw — shouldn't happen for2-D but be safe
+            elif isinstance(v, torch.Tensor) and v.dim() == 2:
+                _new[k] = v.T.contiguous()
+            else:
+                _new[k] = v
+        weights = _new
+
+    # Hybrid Qwen3.5/3.6: remap the llama.cpp qwen35 GGUF layout (fused attn_qkv,
+    # attn_gate) to the HF naming the qwen3_5 builder expects.  No-op for non-hybrid
+    # models (no attn_gate keys → returns immediately).
+    if cfg.linear_attention:
+        weights = _remap_hybrid_qwen35(weights, cfg)
+
+    # DeltaNet in_proj_* → qkv_proj / z_proj / beta_proj / dt_proj / conv_weight:
+    # the same rename the .fni8 conversion path applies (convert._remap_qwen3_next).
+    # Needed because the GGUF name mapping produces `in_proj_*` names, but the
+    # qwen3_5 builder reads `qkv_proj` / `z_proj` / etc.
+    from .convert import _remap_qwen3_next
+
+    weights = _remap_qwen3_next(weights, cfg)
 
     # qk_norm is detect-from-tensors (no GGUF KV for it): Qwen3/Gemma3 carry per-head
     # q_norm/k_norm and skipping them feeds un-normalized Q/K into RoPE → garbage.
