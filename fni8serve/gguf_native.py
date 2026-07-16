@@ -576,6 +576,7 @@ def load_gguf_engine(
         max_len=max_len,
         eos_id=eos_id,
         spec_decode=spec_decode,
+        consume_weights=True,
     )
 
 
