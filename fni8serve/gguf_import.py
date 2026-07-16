@@ -80,6 +80,11 @@ _BLK = {
     "ffn_gate_exps": "mlp.experts.gate_proj",
     "ffn_up_exps": "mlp.experts.up_proj",
     "ffn_down_exps": "mlp.experts.down_proj",
+    # shared-expert (DeepSeek/Qwen-MoE) — research/llamacpp-moe.md §2.2, constants.py:1189
+    "ffn_gate_shexp": "mlp.shared_expert.gate_proj",
+    "ffn_up_shexp": "mlp.shared_expert.up_proj",
+    "ffn_down_shexp": "mlp.shared_expert.down_proj",
+    "exp_probs_b": "mlp.gate.e_score_correction_bias",  # router bias (§2.3)
 }
 
 

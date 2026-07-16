@@ -56,15 +56,55 @@ def to_qtensor(w) -> QTensor:
     return QTensor(q.contiguous(), s.squeeze(-1).float().contiguous(), scheme="per_row_i8")
 
 
+def _row_to_fp16(r: QTensor) -> torch.Tensor:
+    """Reconstruct one pre-quantized merge row to fp16 [out, in], dispatching on its
+    OWN scheme. Needed for heterogeneous merged groups (Q4_K `gguf_kquant` q/k next to
+    a Q6_K-derived `per_row_i8` v): each row must be dequantized by the scheme it was
+    stored in before the group can be re-quantized as one `per_row_i8`."""
+    if r.scheme == "gguf_kquant":
+        from ..gguf_native import dequant_kquant
+
+        return dequant_kquant(r)
+    if r.scheme == "per_row_i8":
+        return (r.data.float() * r.scale.unsqueeze(-1)).to(torch.float16)
+    if r.scheme == "raw":
+        return r.data.to(torch.float16)
+    raise ValueError(f"merge_qtensor: cannot dequant merge row scheme {r.scheme!r}")
+
+
 def merge_qtensor(rows: list) -> QTensor:
     """Fuse q/k/v -> qkv (and gate/up -> gate_up) on the output (row) axis. For fp16
     rows: concat then quantize as one. For pre-quantized QTensors: concat the int8/
     int4 data AND the per-row scales along the row axis (each output row keeps its
     own scale, so the fused weight is exact)."""
     if isinstance(rows[0], QTensor):
+        r0 = rows[0]
+        # Native GGUF k-quant rows: each row is independently k-quantized (super-blocks
+        # run along the IN dim), so concatenating rows on the output axis is exact —
+        # BUT only when EVERY row is the SAME native k-quant type (same codebook +
+        # bytes/row). A GGUF Q4_K_M/imatrix menu MIXES types across a merged group
+        # (e.g. Qwen3-8B: q,k at Q4_K but the sensitive v at Q6_K — and with the P1
+        # loader keeping only some k-quant types resident as `gguf_kquant`, the other
+        # rows arrive already dequant→`per_row_i8`). Those heterogeneous groups can't
+        # concat natively: dequant EACH row to fp16 *per its own scheme* and merge as
+        # one `per_row_i8` (the benign-requant fallback). NB: `dequant_kquant` only
+        # accepts `gguf_kquant` rows, so a `per_row_i8` row must be reconstructed from
+        # its int8 data+scale here, not routed through it (that was `KeyError: ''`).
+        schemes = {r.scheme for r in rows}
+        if "gguf_kquant" in schemes:
+            widths = {r.data.shape[1] for r in rows}
+            codes = {r.codebook for r in rows}
+            if schemes == {"gguf_kquant"} and len(widths) == 1 and len(codes) == 1:
+                return QTensor(
+                    torch.cat([r.data for r in rows], dim=0).contiguous(),
+                    None,
+                    scheme="gguf_kquant",
+                    group_size=r0.group_size,
+                    codebook=r0.codebook,
+                )
+            return to_qtensor(torch.cat([_row_to_fp16(r) for r in rows], dim=0))
         data = torch.cat([r.data for r in rows], dim=0)
         scale = torch.cat([r.scale for r in rows], dim=0)
-        r0 = rows[0]
         return QTensor(
             data.contiguous(),
             scale.contiguous(),

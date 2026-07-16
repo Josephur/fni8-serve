@@ -366,10 +366,19 @@ class EngineRunner:
         return toks
 
     def _spec_decode_allowed(self, batch: list[Sequence], mtp) -> bool:
-        """Gate MTP speculative decode. It engages only when ALL hold:
+        """Gate speculative decode. It engages only when ALL hold:
 
-        * an MTP head exists and every sequence is greedy (temp 0) — the
-          accept-longest-greedy-prefix rule is only bit-identical to plain greedy;
+        * at least one DRAFTER exists — either the learned MTP head (``mtp``) OR the
+          model-agnostic n-gram lookup (``self._ngram``). The n-gram drafter carries
+          NO head weights, so spec-decode runs on any model, including a quantized
+          GGUF whose converter stripped the ``nextn.*`` MTP tensors
+          (``num_mtp_layers==0`` → ``model.mtp is None``): the free prompt-lookup
+          still proposes drafts and the shared verify path commits them. With neither
+          drafter (``FNI8SERVE_SPEC_DRAFTER=mtp`` on a head-less model) there is
+          nothing to propose, so spec-decode stays off (it would only verify base_tok
+          each step — a pointless net slowdown).
+        * every sequence is greedy (temp 0) — the accept-longest-greedy-prefix rule
+          is only bit-identical to plain greedy;
         * NO sequence carries an image (``pixel_values``). MTP×vision is the exact
           interaction that broke in llama.cpp — a text-only spec path must never run
           the verify forward over spliced image embeds / image positions.
@@ -384,7 +393,7 @@ class EngineRunner:
         (``GatedGQAAttention``/``GQAAttention._verify_batched``), so the M=1 paged
         assert no longer fires on the S=k+1 verify tensor.
         """
-        if mtp is None:
+        if mtp is None and self._ngram is None:
             return False
         if not all(s.params.temperature == 0.0 for s in batch):
             return False

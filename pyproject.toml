@@ -31,6 +31,9 @@ authors = [{ name = "fni8-serve authors" }]
 dependencies = [
   "torch==2.10.0",
   "numpy",
+  # llama.cpp's own GGUF reader + block dequant — backs the native-GGUF load path
+  # (fni8serve.gguf_native) and the GGUF→.fni8 importer (fni8serve.gguf_import).
+  "gguf",
   # fni8 supplies the sm_70 dp4a kernels this server is built on. It is NOT on PyPI:
   # the Docker base (fni8-built:sm70) provides it as an editable install at /opt/fni8,
   # which satisfies this bare requirement (pip leaves the existing install in place).

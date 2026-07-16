@@ -79,9 +79,25 @@ def test_guard_allows_plain_greedy_text():
     assert r._spec_decode_allowed([_seq()], _MTP) is True
 
 
-def test_guard_refuses_when_no_mtp_head():
+def test_guard_refuses_when_no_drafter():
+    """Refusal now requires NEITHER drafter: no MTP head AND no n-gram lookup
+    (`FNI8SERVE_SPEC_DRAFTER=mtp` on a head-less model). With nothing to propose,
+    spec-decode would only verify base_tok each step — a pointless net slowdown, so
+    the guard refuses. (A runner built in the default `cascade` mode HAS the n-gram
+    drafter, so we disable it explicitly here to model the no-drafter case.)"""
     r = _runner(_PlainModel())
+    r._ngram = None  # no n-gram drafter either
     assert r._spec_decode_allowed([_seq()], None) is False
+
+
+def test_guard_allows_ngram_without_mtp_head():
+    """The GGUF-native capability: an MTP-less model (`mtp is None`) with an active
+    n-gram drafter is a VALID greedy spec target — the prompt-lookup carries no head
+    weights, so it drafts on any model, including a quantized GGUF whose converter
+    stripped the `nextn.*` MTP tensors. Locks in the new contract."""
+    r = _runner(_PlainModel())
+    assert r._ngram is not None  # default cascade mode wires the n-gram drafter
+    assert r._spec_decode_allowed([_seq()], None) is True
 
 
 def test_guard_refuses_nonzero_temperature():
