@@ -432,6 +432,29 @@ def _remap_hybrid_qwen35(sd: dict, cfg) -> dict:
     return sd
 
 
+def _restore_hf_qwen35_weights(sd: dict, cfg) -> tuple[dict, bool]:
+    """Undo llama.cpp-only Qwen3.5 transforms before using the HF-layout builder.
+
+    llama.cpp stores zero-centered RMSNorm gains with one added and stores the
+    DeltaNet decay parameter as ``-exp(A_log)``. Its unequal K/V-head tensors also
+    remain in tiled V-head order; preserving that order avoids expanding native
+    k-quant weights merely to permute columns, and the mixer selects the matching
+    tiled Q/K broadcast.
+    """
+    if not getattr(cfg, "linear_attention", False):
+        return sd, False
+
+    for name, weight in list(sd.items()):
+        if name.endswith("norm.weight") and ".linear_attn.norm.weight" not in name:
+            sd[name] = weight - 1
+        elif name.endswith(".linear_attn.A_log"):
+            sd[name] = (-weight.float()).clamp_min(1e-30).log().to(weight.dtype)
+
+    x = getattr(cfg, "extra", {})
+    tiled = x.get("linear_num_key_heads") != x.get("linear_num_value_heads")
+    return sd, tiled
+
+
 def _gguf_eos_id(path: str) -> int | None:
     """Read the GGUF tokenizer's EOS id (`tokenizer.ggml.eos_token_id`) so decode can
     stop naturally, mirroring the `.fni8` load path's `eos_id`."""
@@ -539,6 +562,15 @@ def load_gguf_engine(
     from .convert import _remap_qwen3_next
 
     weights = _remap_qwen3_next(weights, cfg)
+
+    # llama.cpp's qwen35 converter changes norm/decay semantics and, when K/V head
+    # counts differ, stores DeltaNet V heads in tiled order. Restore scalar semantics
+    # and tell the mixer which broadcast matches the still-native k-quant row layout.
+    weights, tiled_delta_heads = _restore_hf_qwen35_weights(weights, cfg)
+    if tiled_delta_heads:
+        cfg = dataclasses.replace(
+            cfg, extra={**cfg.extra, "gguf_tiled_linear_attention": True}
+        )
 
     # qk_norm is detect-from-tensors (no GGUF KV for it): Qwen3/Gemma3 carry per-head
     # q_norm/k_norm and skipping them feeds un-normalized Q/K into RoPE → garbage.

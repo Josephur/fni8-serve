@@ -450,6 +450,17 @@ def test_qwen3_5_rmsnorm_is_zero_centered():
     assert F.cosine_similarity(ref.reshape(-1), bug.reshape(-1), dim=0) < 0.99
 
 
+def test_tiled_gguf_delta_head_broadcast_matches_llama_layout():
+    """GGUF stores V heads tiled, so Q/K broadcast must tile instead of group."""
+    from fni8serve.layers.linear_attn import _expand_delta_k_heads
+
+    x = torch.tensor([[[[0.0]], [[1.0]]]])
+    grouped = _expand_delta_k_heads(x, 4, tiled=False)
+    tiled = _expand_delta_k_heads(x, 4, tiled=True)
+    assert grouped.flatten().tolist() == [0.0, 0.0, 1.0, 1.0]
+    assert tiled.flatten().tolist() == [0.0, 1.0, 0.0, 1.0]
+
+
 @pytest.mark.skipif(not CUDA, reason="needs CUDA")
 def test_qwen3_5_gated_deltanet_matches_hf():
     """Our GatedDeltaNetAttention vs HF Qwen3_5GatedDeltaNet on shared fp weights: guards

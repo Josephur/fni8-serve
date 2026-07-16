@@ -37,6 +37,12 @@ def _l2norm(x: torch.Tensor) -> torch.Tensor:
     return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
+def _expand_delta_k_heads(x: torch.Tensor, num_v_heads: int, *, tiled: bool) -> torch.Tensor:
+    """Broadcast K/Q heads into grouped HF order or llama.cpp's tiled V-head order."""
+    rep = num_v_heads // x.shape[1]
+    return x.repeat(1, rep, *([1] * (x.dim() - 2))) if tiled else x.repeat_interleave(rep, dim=1)
+
+
 def recurrent_gated_delta_rule(q, k, v, beta, g, state=None, return_traj=False):
     """Gated delta rule, scalar form. q,k: [B,H,L,Dk] (pre-L2-normed), v: [B,H,L,Dv],
     beta: [B,H,L] in (0,1], g: [B,H,L] = log(alpha) (<=0). `state`: optional
@@ -196,6 +202,7 @@ class GatedDeltaNetAttention(nn.Module):
         super().__init__()
         self.nk, self.nv = num_k_heads, num_v_heads
         self.kd, self.vd = key_dim, value_dim
+        self.tiled_delta_heads = bool(cfg.extra.get("gguf_tiled_linear_attention", False))
         self.conv_kernel = conv_kernel
         self.qkv_proj = LinearW8A8(qkv_proj)
         self.out_proj = LinearW8A8(out_proj)
@@ -326,7 +333,14 @@ class GatedDeltaNetAttention(nn.Module):
         # Fully-fused decode fast path (L==1, CUDA, Dk==Dv==128): ONE launch for the
         # whole glue. Byte-for-byte the eager chain below, which stays the fallback +
         # oracle; auto-degrades for prefill / CPU / other dims / an older fni8.
-        if _DND_STEP and L == 1 and hidden.is_cuda and self.kd == 128 and self.vd == 128:
+        if (
+            _DND_STEP
+            and not self.tiled_delta_heads
+            and L == 1
+            and hidden.is_cuda
+            and self.kd == 128
+            and self.vd == 128
+        ):
             return self._fused_decode_step(hidden, q, k, v, cache, layer_idx, B)
         # HF gated-delta-rule scales the (l2-normed) query by 1/sqrt(head_k_dim) before
         # the readout (`query = query * scale`). Applied here (not inside the shared
@@ -343,9 +357,8 @@ class GatedDeltaNetAttention(nn.Module):
         k = _l2norm(k.view(B, L, self.nk, self.kd).float()).transpose(1, 2)
         v = v.view(B, L, self.nv, self.vd).float().transpose(1, 2)
         # broadcast k/q heads to value heads (GQA)
-        rep = self.nv // self.nk
-        q = q.repeat_interleave(rep, dim=1)
-        k = k.repeat_interleave(rep, dim=1)
+        q = _expand_delta_k_heads(q, self.nv, tiled=self.tiled_delta_heads)
+        k = _expand_delta_k_heads(k, self.nv, tiled=self.tiled_delta_heads)
         dt, beta = self._project_gate_beta(hidden)
         beta = torch.sigmoid(beta).transpose(1, 2)  # [B,nv,L]
         beta = beta.reshape(B, self.nv, L) if beta.dim() == 3 else beta
