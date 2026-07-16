@@ -17,7 +17,7 @@ pytest.importorskip("fni8")
 
 from fni8serve.dist.pipeline import make_pipeline, PipelineEngine, PipelineStage
 from fni8serve.engine import LLMEngine, SamplingParams
-from fni8serve.models import ModelConfig, build_model
+from fni8serve.models import ModelConfig
 
 CUDA = torch.cuda.is_available()
 cuda_only = pytest.mark.skipif(not CUDA, reason="pipeline needs CUDA + fni8")
@@ -75,6 +75,28 @@ def _sd(cfg: ModelConfig):
 
 
 class TestMakePipeline:
+    @two_gpus
+    @cuda_only
+    def test_make_pipeline_builds_backbone_once(self, monkeypatch):
+        """Stage construction must not duplicate a card-filling model per GPU."""
+        import fni8serve.dist.pipeline as pipeline
+
+        calls = 0
+        real_build = pipeline.build_model
+
+        def counted_build(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return real_build(*args, **kwargs)
+
+        monkeypatch.setattr(pipeline, "build_model", counted_build)
+        cfg = _cfg(n_layers=4)
+        s0, s1 = pipeline.make_pipeline(cfg, _sd(cfg), devices=(0, 1), max_num_seqs=4, max_len=64)
+
+        assert calls == 1
+        assert s0.layers[0].self_attn.qkv_proj.weight.data.device.index == 0
+        assert s1.layers[0].self_attn.qkv_proj.weight.data.device.index == 1
+
     @two_gpus
     @cuda_only
     def test_make_pipeline_returns_two_stages(self):
