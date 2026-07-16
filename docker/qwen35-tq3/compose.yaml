@@ -1,0 +1,24 @@
+services:
+  qwen35b:
+    build: .
+    image: local/qwen35b-tq3:cuda-sm70
+    container_name: qwen35b
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8017:8080"
+    volumes:
+      - ${QWEN35B_MODEL_DIR:-/srv/nvme-data/model-cache/fni8/qwen35b-tq3}:/models:ro
+    environment:
+      QWEN35B_MODEL: /models/Qwen3.6-35B-A3B-MTP-TQ3_4S.gguf
+      QWEN35B_ENABLE_MTP: "0"
+      QWEN35B_BATCH_SIZE: "32"
+      QWEN35B_UBATCH_SIZE: "32"
+      QWEN35B_CACHE_TYPE_K: q8_0
+      QWEN35B_CACHE_TYPE_V: tq3_0
+      QWEN35B_GPU_LAYERS: "99"
+      QWEN35B_CTX_SIZE: "260000"
+      QWEN35B_EXTRA_ARGS: -fitt 512 --cache-ram 8192 --no-warmup --jinja --alias coder
+    gpus:
+      - driver: nvidia
+        device_ids: ["${QWEN35B_GPU:-8}"]
+        capabilities: [gpu]

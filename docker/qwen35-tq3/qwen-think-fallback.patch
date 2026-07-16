@@ -1,0 +1,78 @@
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 56873e3a1..9584cc671 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -2486,6 +2486,57 @@ common_chat_msg common_chat_parse(const std::string &               input,
+     return common_chat_peg_parse(params.parser, input, is_partial, params);
+ }
+ 
++static void common_chat_qwen_think_fallback(common_chat_msg & msg, bool is_partial, const common_chat_parser_params & params) {
++    if (params.reasoning_format != COMMON_REASONING_FORMAT_DEEPSEEK || !msg.reasoning_content.empty()) {
++        return;
++    }
++
++    std::string content = msg.content;
++    const auto first_non_ws = content.find_first_not_of(" \n\r\t");
++    if (first_non_ws == std::string::npos) {
++        return;
++    }
++
++    auto ltrim = [](std::string s) {
++        const auto pos = s.find_first_not_of(" \n\r\t");
++        if (pos == std::string::npos) {
++            return std::string();
++        }
++        return s.substr(pos);
++    };
++
++    if (content.compare(first_non_ws, 7, "<think>") == 0) {
++        const auto reasoning_start = first_non_ws + 7;
++        const auto reasoning_end = content.find("</think>", reasoning_start);
++        if (reasoning_end == std::string::npos) {
++            if (is_partial) {
++                msg.reasoning_content = content.substr(reasoning_start);
++                msg.content.clear();
++            }
++            return;
++        }
++
++        msg.reasoning_content = content.substr(reasoning_start, reasoning_end - reasoning_start);
++        msg.content = ltrim(content.substr(reasoning_end + 8));
++
++        bool all_whitespace = true;
++        for (char c : msg.reasoning_content) {
++            if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
++                all_whitespace = false;
++                break;
++            }
++        }
++        if (all_whitespace) {
++            msg.reasoning_content.clear();
++        }
++        return;
++    }
++
++    if (content.compare(first_non_ws, 8, "</think>") == 0) {
++        msg.content = ltrim(content.substr(first_non_ws + 8));
++    }
++}
++
+ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_parser,
+                                       const std::string &               input,
+                                       bool                              is_partial,
+@@ -2526,6 +2577,7 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+                 mapper = std::make_unique<common_chat_peg_mapper>(msg);
+             }
+             mapper->from_ast(ctx.ast, result);
++            common_chat_qwen_think_fallback(msg, is_partial, params);
+ 
+             if (ctx.is_debug()) {
+                 fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
+@@ -2547,6 +2599,7 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+         mapper = std::make_unique<common_chat_peg_mapper>(msg);
+     }
+     mapper->from_ast(ctx.ast, result);
++    common_chat_qwen_think_fallback(msg, is_partial, params);
+ 
+     if (ctx.is_debug()) {
+         fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());
