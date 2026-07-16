@@ -513,6 +513,7 @@ class PipelineEngine:
             with torch.cuda.device(dev):
                 _clear_hadamard_cache()
                 stage.lin_cache.reset()
+                stage.lin_cache.bind(slots)
                 positions = torch.tensor([all_positions], device=device)
                 cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
                 mapping = torch.tensor(slot_mappings[stage_id], dtype=torch.int32, device=device)
@@ -592,7 +593,7 @@ class PipelineEngine:
                 device = f"cuda:{dev}"
                 with torch.cuda.device(dev):
                     _clear_hadamard_cache()
-                    stage.lin_cache.reset()
+                    stage.lin_cache.bind(slots)
                     stage.kv_cache.ensure_capacity(slots, [n + 1 for n in lengths])
                     positions = torch.tensor([[s.length] for s in mb], device=device)
                     ctx = ForwardContext(
