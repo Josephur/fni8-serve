@@ -65,6 +65,7 @@ def _native_kquant_types() -> tuple[str, ...]:
     }
     return tuple(kind for kind, op in ops.items() if callable(getattr(fni8, op, None)))
 
+
 # ── GGUF `general.architecture` string → our registry builder key ────────────
 # The GGUF arch strings (llama.cpp `LLM_ARCH_*` names, `gguf-py/gguf/constants.py`
 # `MODEL_ARCH_NAMES`) do NOT all equal our registry keys, and `registry._resolve`
@@ -145,7 +146,14 @@ class _KV:
         return key in self._f
 
 
-def gguf_config(path: str) -> ModelConfig:
+def _open_gguf(path: str):
+    """Open one GGUF reader for all header and tensor phases of a cold load."""
+    from gguf import GGUFReader
+
+    return GGUFReader(path)
+
+
+def gguf_config(path: str, *, _reader=None) -> ModelConfig:
     """Read a GGUF's KV metadata and build the same `ModelConfig` that
     `ModelConfig.from_hf` produces for the model — sourced from GGUF-KV, no `.fni8`.
 
@@ -154,9 +162,7 @@ def gguf_config(path: str) -> ModelConfig:
     layer schedule, MoE routing, VLM detection) are reused verbatim (DRY, no
     second copy of the schema). DiT GGUFs carry no `<arch>.*` KV — only an opaque
     diffusers `config` JSON blob — so they route to `gguf_dit_config` (§2c)."""
-    from gguf import GGUFReader
-
-    reader = GGUFReader(path)
+    reader = _reader if _reader is not None else _open_gguf(path)
     fields = reader.fields
     gguf_arch = _field_value(fields["general.architecture"])
 
@@ -320,7 +326,11 @@ def dequant_kquant(qt: QTensor) -> torch.Tensor:
 
 
 def gguf_state_dict(
-    path: str, *, device: str = "cuda", native_types: tuple[str, ...] = ("Q4_K", "Q5_K", "Q6_K")
+    path: str,
+    *,
+    device: str = "cuda",
+    native_types: tuple[str, ...] = ("Q4_K", "Q5_K", "Q6_K"),
+    _reader=None,
 ) -> dict:
     """Load a GGUF's tensors as a build-ready state dict, RESIDENT and native — no
     dequant→requant transcode of the k-quant weights (MIGRATION §3a):
@@ -344,7 +354,7 @@ def gguf_state_dict(
     whose FUSED dp4a kernel is actually built (MIGRATION P0), so decode runs fast on
     real dp4a today and flips to native residency automatically as the kernels land —
     the LinearW8A8 dequant fallback is per-forward and far too slow for a full model."""
-    from gguf import GGMLQuantizationType, GGUFReader, dequantize
+    from gguf import GGMLQuantizationType, dequantize
 
     from .convert import is_quantizable_linear
     from .gguf_import import gguf_name_to_hf
@@ -356,7 +366,7 @@ def gguf_state_dict(
         q, s = quantize_int8_rowwise(w)
         return QTensor(q.contiguous(), s.squeeze(-1).float().contiguous(), scheme="per_row_i8")
 
-    reader = GGUFReader(path)
+    reader = _reader if _reader is not None else _open_gguf(path)
     out: dict = {}
     for t in reader.tensors:
         hf = gguf_name_to_hf(t.name)
@@ -367,7 +377,7 @@ def gguf_state_dict(
 
         if quantizable and gtype in _KQUANT and gtype in native_types:
             code, _tsz = _KQUANT[gtype]
-            data = torch.from_numpy(np.ascontiguousarray(t.data).copy()).to(device)  # uint8 [out,·]
+            data = torch.from_numpy(np.ascontiguousarray(t.data).copy()).to(device)
             out[hf] = QTensor(data, None, scheme="gguf_kquant", codebook=code, group_size=256)
         elif quantizable and gtype in _KQUANT:  # k-quant with no fused kernel → int8 dp4a
             out[hf] = _to_per_row_i8(
@@ -455,12 +465,11 @@ def _restore_hf_qwen35_weights(sd: dict, cfg) -> tuple[dict, bool]:
     return sd, tiled
 
 
-def _gguf_eos_id(path: str) -> int | None:
+def _gguf_eos_id(path: str, *, _reader=None) -> int | None:
     """Read the GGUF tokenizer's EOS id (`tokenizer.ggml.eos_token_id`) so decode can
     stop naturally, mirroring the `.fni8` load path's `eos_id`."""
-    from gguf import GGUFReader
-
-    f = GGUFReader(path).fields.get("tokenizer.ggml.eos_token_id")
+    reader = _reader if _reader is not None else _open_gguf(path)
+    f = reader.fields.get("tokenizer.ggml.eos_token_id")
     return None if f is None else int(_field_value(f))
 
 
@@ -496,12 +505,14 @@ def load_gguf_engine(
     import dataclasses
 
     from .engine import LLMEngine
-    cfg = gguf_config(path)
+
+    reader = _open_gguf(path)
+    cfg = gguf_config(path, _reader=reader)
     # Keep k-quant weights RESIDENT (native gguf_kquant) only for types whose fused
     # dp4a kernel is built; otherwise dequant→per_row_i8 so decode runs on real dp4a
     # NOW (the per-forward dequant fallback is far too slow for a whole model).
     native_types = _native_kquant_types()
-    weights = gguf_state_dict(path, device=device, native_types=native_types)
+    weights = gguf_state_dict(path, device=device, native_types=native_types, _reader=reader)
 
     # ── Unsloth GGUF [in, out] → [out, in] transposition ──────────────────────
     # The Unsloth GGUF converter (used for the Qwen3.5-9B UD-Q4_K_XL checkpoint)
@@ -568,9 +579,7 @@ def load_gguf_engine(
     # and tell the mixer which broadcast matches the still-native k-quant row layout.
     weights, tiled_delta_heads = _restore_hf_qwen35_weights(weights, cfg)
     if tiled_delta_heads:
-        cfg = dataclasses.replace(
-            cfg, extra={**cfg.extra, "gguf_tiled_linear_attention": True}
-        )
+        cfg = dataclasses.replace(cfg, extra={**cfg.extra, "gguf_tiled_linear_attention": True})
 
     # qk_norm is detect-from-tensors (no GGUF KV for it): Qwen3/Gemma3 carry per-head
     # q_norm/k_norm and skipping them feeds un-normalized Q/K into RoPE → garbage.
@@ -579,7 +588,7 @@ def load_gguf_engine(
         cfg = dataclasses.replace(cfg, qk_norm=True)
 
     if eos_id is None:
-        eos_id = _gguf_eos_id(path)
+        eos_id = _gguf_eos_id(path, _reader=reader)
 
     # MTP-head detection (research/llamacpp-mtp-spec.md §1.2): the head is built by the
     # arch builder iff `cfg.num_mtp_layers > 0` (it reads the GGUF `nextn_predict_layers`
