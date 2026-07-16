@@ -40,3 +40,20 @@ def test_generation_summary_handles_short_runs():
     assert summary["graph_capture_s"] == 0.0
     assert summary["steady_decode_s"] == []
     assert summary["steady_decode_tok_s"] == 0.0
+
+
+def test_generation_summary_counts_multi_token_spec_steps():
+    times = [4.0, 0.2, 0.1, 0.1]
+    emitted = [1, 1, 3, 2]
+    summary = summarize_generation_steps(
+        times, warmup_decode_steps=1, emitted_tokens_per_step=emitted
+    )
+
+    assert summary["steady_decode_tokens"] == 5
+    assert summary["steady_decode_tok_s"] == 25.0
+    assert summary["end_to_end_tok_s"] == 7 / 4.4
+
+
+def test_generation_summary_rejects_misaligned_token_counts():
+    with pytest.raises(ValueError, match="same length"):
+        summarize_generation_steps([1.0, 0.1], emitted_tokens_per_step=[1])

@@ -91,27 +91,35 @@ def _schedule(vocab_size):
     tokens; the runs of length >= 2 guarantee the accept path commits several tokens
     per step (n_acc >= 2), the same stress the MTP bit-identity tests demand."""
     return {
-        0: {100},           # forced run 1 (len 3): 100,101,102
+        0: {100},  # forced run 1 (len 3): 100,101,102
         1: {101},
         2: {102},
         # 3,4 free (model branches)
-        5: {150},           # forced run 2 (len 4): 150,151,152,153
+        5: {150},  # forced run 2 (len 4): 150,151,152,153
         6: {151},
         7: {152},
         8: {153},
         # 9,10 free
-        11: {200},          # forced run 3 (len 2)
+        11: {200},  # forced run 3 (len 2)
         12: {201},
     }
 
 
-def _run(cfg, sd, prompt, params_factory, spec, drafter_mode="cascade"):
-    eng = LLMEngine(cfg, sd, device="cuda", max_num_seqs=2, max_len=64,
-                    enable_cuda_graph=False)
+def _run(cfg, sd, prompt, params_factory, spec, drafter_mode="cascade", forbid_graph=False):
+    eng = LLMEngine(cfg, sd, device="cuda", max_num_seqs=2, max_len=64, enable_cuda_graph=False)
     if spec:
         eng.runner._spec_enabled = True
         eng.runner._drafter_mode = drafter_mode
         eng.runner.spec_stats = {"steps": 0, "drafts": 0, "accepts": 0}
+        if forbid_graph:
+
+            class _ForbiddenGrammarGraph:
+                def try_run(self, *args, **kwargs):
+                    pytest.fail(
+                        "grammar verification needs maskable logits; graph must be bypassed"
+                    )
+
+            eng.runner.graphed_verify = _ForbiddenGrammarGraph()
     out = eng.generate([prompt], params_factory())[0]
     stats = dict(eng.runner.spec_stats) if spec else None
     return out, stats
@@ -127,18 +135,32 @@ def test_grammar_spec_bit_identical_to_plain_grammar_decode(drafter_mode):
     V = cfg.vocab_size
 
     def plain_params():
-        return SamplingParams(temperature=0.0, max_tokens=16,
-                              logit_processors=[FakeGrammar(len(prompt), _schedule(V), V)])
+        return SamplingParams(
+            temperature=0.0,
+            max_tokens=16,
+            logit_processors=[FakeGrammar(len(prompt), _schedule(V), V)],
+        )
 
     def spec_params():
-        return SamplingParams(temperature=0.0, max_tokens=16,
-                              logit_processors=[FakeGrammar(len(prompt), _schedule(V), V)])
+        return SamplingParams(
+            temperature=0.0,
+            max_tokens=16,
+            logit_processors=[FakeGrammar(len(prompt), _schedule(V), V)],
+        )
 
     # Plain grammar-constrained greedy reference (no MTP head, spec off).
     out_ref, _ = _run(_no_mtp_cfg(cfg), sd, prompt, plain_params, spec=False)
 
     # Spec-decode with the grammar constraint active.
-    out_spec, stats = _run(cfg, sd, prompt, spec_params, spec=True, drafter_mode=drafter_mode)
+    out_spec, stats = _run(
+        cfg,
+        sd,
+        prompt,
+        spec_params,
+        spec=True,
+        drafter_mode=drafter_mode,
+        forbid_graph=True,
+    )
 
     assert out_spec == out_ref, (
         f"[{drafter_mode}] grammar spec-decode NOT bit-identical to plain grammar decode:\n"
@@ -159,8 +181,11 @@ def test_grammar_forced_tokens_present_in_output():
     V = cfg.vocab_size
 
     def params():
-        return SamplingParams(temperature=0.0, max_tokens=16,
-                              logit_processors=[FakeGrammar(len(prompt), _schedule(V), V)])
+        return SamplingParams(
+            temperature=0.0,
+            max_tokens=16,
+            logit_processors=[FakeGrammar(len(prompt), _schedule(V), V)],
+        )
 
     out, _ = _run(cfg, sd, prompt, params, spec=True, drafter_mode="cascade")
     assert out[0:3] == [100, 101, 102]

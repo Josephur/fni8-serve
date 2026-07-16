@@ -73,6 +73,7 @@ class Scheduler:
         # cache, which are recomputed from scratch on re-admission.
         preempted.spec_base_tok = None
         preempted.spec_base_hidden = None
+        preempted.spec_ngram_cooldown = 0
         preempted.status = Status.WAITING
         self.waiting.append(preempted)
 

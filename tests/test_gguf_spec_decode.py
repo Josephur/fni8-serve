@@ -25,6 +25,7 @@ import torch
 from fni8serve.engine.drafters import NgramDrafter
 from fni8serve.engine.model_runner import EngineRunner
 from fni8serve.engine.sequence import SamplingParams, Sequence
+from fni8serve.models.cache import RecurrentStateCache
 
 _QWEN3_8B = (
     "/mnt/24tb/containers-archive/comfy/storage-models/models/"
@@ -40,11 +41,14 @@ def _gate_runner(*, ngram, has_recurrent=False, spec_recurrent_ok=True):
     r._ngram = ngram
     r.has_recurrent = has_recurrent
     r._spec_recurrent_ok = spec_recurrent_ok
+    r._spec_k = 4
+    r.device = "cpu"
+    r.lin_cache = None
     return r
 
 
-def _greedy_seq():
-    return Sequence(0, [1, 2, 3], SamplingParams(temperature=0.0, max_tokens=8))
+def _greedy_seq(prompt=None):
+    return Sequence(0, prompt or [1, 2, 3], SamplingParams(temperature=0.0, max_tokens=8))
 
 
 # ── gate: n-gram spec-decode must engage with NO MTP head ─────────────────────
@@ -52,7 +56,12 @@ def test_gate_allows_ngram_spec_without_mtp_head():
     """The core GGUF-native enablement: an MTP-less model (``mtp is None``) with an
     active n-gram drafter is a VALID spec-decode target — the lookup needs no head."""
     r = _gate_runner(ngram=NgramDrafter())
-    assert r._spec_decode_allowed([_greedy_seq()], mtp=None) is True
+    assert r._spec_decode_allowed([_greedy_seq([1, 2, 3, 1])], mtp=None) is True
+
+
+def test_gate_skips_ngram_probe_when_next_match_is_impossible():
+    r = _gate_runner(ngram=NgramDrafter())
+    assert r._spec_decode_allowed([_greedy_seq([10, 20, 30])], mtp=None) is False
 
 
 def test_gate_blocks_when_no_drafter_at_all():
@@ -60,7 +69,7 @@ def test_gate_blocks_when_no_drafter_at_all():
     without a head) = nothing to propose → spec-decode must NOT engage (it would just
     verify base_tok every step, a pointless net slowdown)."""
     r = _gate_runner(ngram=None)
-    assert r._spec_decode_allowed([_greedy_seq()], mtp=None) is False
+    assert r._spec_decode_allowed([_greedy_seq([1, 2, 3, 1])], mtp=None) is False
 
 
 def test_gate_still_blocks_non_greedy():
@@ -77,6 +86,89 @@ def test_gate_blocks_image_sequence():
     seq = _greedy_seq()
     seq.pixel_values = torch.zeros(1, 3, 8, 8)
     assert r._spec_decode_allowed([seq], mtp=None) is False
+
+
+def test_gate_blocks_recurrent_verify_that_cannot_fit(monkeypatch):
+    """A one-card recurrent model must fall back to plain decode before verify
+    allocates a multi-token state trajectory that cannot fit in free VRAM."""
+
+    class _Trajectory:
+        def verify_trajectory_nbytes(self, batch_rows, tokens):
+            assert (batch_rows, tokens) == (1, 5)
+            return 3 << 30
+
+    r = _gate_runner(ngram=NgramDrafter(), has_recurrent=True)
+    r.device = "cuda"
+    r.lin_cache = _Trajectory()
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (2 << 30, 16 << 30))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: 0)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: 0)
+
+    assert r._spec_decode_allowed([_greedy_seq([1, 2, 3, 1])], mtp=None) is False
+
+
+def test_recurrent_verify_trajectory_size_uses_active_rows_and_tokens():
+    cache = RecurrentStateCache()
+    cache.enable_static_buffers(num_slots=4)
+    cache.bind([0])
+    cache.set_state(0, torch.zeros(1, 2, 3, dtype=torch.float32))  # 24 B / row
+    cache.set_conv_tail(0, torch.zeros(1, 5, dtype=torch.float16))  # 10 B / row
+
+    assert cache.verify_trajectory_nbytes(batch_rows=2, tokens=5) == 340
+
+
+def test_zero_draft_commits_bootstrap_without_verify():
+    """An n-gram miss has no tokens to verify. The bootstrap is already the same
+    one-token forward as plain decode, so return its sampled base directly."""
+
+    class _Model:
+        mtp = None
+
+        def __call__(self, ids, pos, ctx):
+            return torch.zeros(1, 1, 4)
+
+        def compute_logits(self, hidden):
+            logits = torch.zeros(1, 16)
+            logits[0, 7] = 1
+            return logits
+
+    class _Cache:
+        def ensure_capacity(self, slots, lengths):
+            pass
+
+    class _LinCache:
+        def bind(self, slots):
+            pass
+
+    class _ForbiddenVerify:
+        def try_run(self, *args, **kwargs):
+            pytest.fail("zero-draft step must not run verification")
+
+    r = EngineRunner.__new__(EngineRunner)
+    r.model = _Model()
+    r.cache = _Cache()
+    r.lin_cache = _LinCache()
+    r.device = "cpu"
+    r.graphed_verify = _ForbiddenVerify()
+    r.has_recurrent = False
+    r._mtp_prefix_kv = False
+    r._drafter_mode = "ngram"
+    r._compute_drafts = lambda *args: [[]]
+
+    seq = _greedy_seq()
+    seq.slot = 0
+    seq.length = len(seq.prompt_ids)
+
+    assert r._spec_decode_eager([seq], mtp=None) == [7]
+    assert seq.length == len(seq.prompt_ids) + 1
+    assert seq.spec_base_tok is None
+    assert seq.spec_base_hidden is None
+    assert seq.spec_ngram_cooldown == 64
+
+    r._ngram = NgramDrafter()
+    r._spec_recurrent_ok = True
+    assert r._spec_decode_allowed([seq], mtp=None) is False
+    assert seq.spec_ngram_cooldown == 63
 
 
 # ── MTP-head detection on the real GGUF (config level, no GPU) ────────────────
@@ -106,8 +198,20 @@ def test_gguf_ngram_spec_bit_identical_and_accept_rate():
 
     # A repetitive prompt so the n-gram lookup has structured spans to ride.
     prompt = [
-        3838, 374, 279, 6722, 315, 9625, 30,  # "What is the capital of France?"
-        3838, 374, 279, 6722, 315, 9625, 30,
+        3838,
+        374,
+        279,
+        6722,
+        315,
+        9625,
+        30,  # "What is the capital of France?"
+        3838,
+        374,
+        279,
+        6722,
+        315,
+        9625,
+        30,
     ]
     n = 48
     params = SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True)
@@ -121,9 +225,7 @@ def test_gguf_ngram_spec_bit_identical_and_accept_rate():
     torch.cuda.empty_cache()
 
     # -- spec ON (n-gram cascade; no MTP head on this GGUF) --
-    eng1 = load_gguf_engine(
-        _QWEN3_8B, device="cuda", max_num_seqs=2, max_len=256, spec_decode=True
-    )
+    eng1 = load_gguf_engine(_QWEN3_8B, device="cuda", max_num_seqs=2, max_len=256, spec_decode=True)
     assert getattr(eng1.model, "mtp", None) is None, "Qwen3-8B GGUF must have no MTP head"
     assert eng1.runner._ngram is not None, "n-gram drafter must be active"
     t1 = time.perf_counter()
