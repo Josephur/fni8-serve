@@ -44,7 +44,11 @@ from fni8serve.layers.linear import _FNI8_HAS_Q4K  # noqa: E402
 print(f"[check] _FNI8_HAS_Q4K = {_FNI8_HAS_Q4K}")
 
 # ── Step 2: load GGUF native ────────────────────────────────────────────────
-GGUF_PATH = "/flint8_work/Qwen3.5-9B-UD-Q4_K_XL.gguf"
+GGUF_PATH = os.environ.get(
+    "FNI8_GGUF_PATH", "/flint8_work/Qwen3.5-9B-UD-Q4_K_XL.gguf"
+)
+MODEL_LABEL = os.environ.get("FNI8_MODEL_LABEL", os.path.basename(GGUF_PATH))
+TARGET_TOK_S = float(os.environ.get("FNI8_TARGET_TOK_S", "69"))
 assert os.path.exists(GGUF_PATH), f"GGUF not found: {GGUF_PATH}"
 
 from fni8serve.gguf_native import (  # noqa: E402
@@ -141,14 +145,17 @@ peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
 print(f"\n[debug] output_ids ({len(output_ids)} tokens): {output_ids[:30]}")
 
 print(f"\n{'=' * 60}")
-print("RESULTS: Qwen3.5-9B GGUF-native decode")
+print(f"RESULTS: {MODEL_LABEL} GGUF-native decode")
 print(f"{'=' * 60}")
 print(f"  Steady decode tok/s:           {summary['steady_decode_tok_s']:.1f}")
 print(f"  End-to-end tok/s:              {summary['end_to_end_tok_s']:.1f}")
 print(f"  Prefill:                       {summary['prefill_s']:.3f}s")
 print(f"  Lazy graph capture:            {summary['graph_capture_s']:.3f}s")
-print("  Target:                        69")
-print(f"  steady vs target:              {summary['steady_decode_tok_s'] / 69 * 100:.1f}%")
+print(f"  Target:                        {TARGET_TOK_S:g}")
+print(
+    f"  steady vs target:              "
+    f"{summary['steady_decode_tok_s'] / TARGET_TOK_S * 100:.1f}%"
+)
 print(f"  Output tokens:                 {len(output_ids)}")
 print(f"  Total time:                    {summary['total_s']:.2f}s")
 print(f"  Peak VRAM:                     {peak_vram:.2f} GB")
