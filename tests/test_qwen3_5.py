@@ -207,6 +207,16 @@ def _sd(cfg, device="cpu"):
     return sd
 
 
+def test_qwen3_5_merges_deltanet_scalar_projections():
+    cfg = _cfg()
+    model = build_model(cfg, _sd(cfg))
+    attn = model.layers[0].attn
+    assert hasattr(attn, "gate_beta_proj")
+    assert attn.gate_beta_proj.out_features == 2 * _NV
+    assert not hasattr(attn, "gate_proj")
+    assert not hasattr(attn, "beta_proj")
+
+
 @pytest.mark.skipif(not CUDA, reason="prefill needs the dp4a kernels")
 def test_qwen3_5_hybrid_prefill():
     cfg = _cfg()

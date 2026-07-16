@@ -37,7 +37,7 @@ from .config import ModelConfig
 from .moe import SparseMoE
 from .mtp import MTPLayer, MultiTokenPredictor
 from .registry import register_model
-from .weights import gate_up_weight, qkv_weight, to_qtensor
+from .weights import gate_up_weight, merge_qtensor, qkv_weight, to_qtensor
 
 
 def _gated_full_attn(cfg, sd, p, rope):
@@ -121,8 +121,12 @@ def _linear_attn(cfg, sd, p):
         conv_weight=conv_w,
         a_log=_la_weight(sd, la, "A_log"),
         dt_bias=_la_weight(sd, la, "dt_bias"),
-        beta_proj=to_qtensor(_la_weight(sd, la, "beta_proj.weight", "in_proj_b.weight")),
-        gate_proj=to_qtensor(_la_weight(sd, la, "dt_proj.weight", "in_proj_a.weight")),
+        beta_proj=None,
+        gate_proj=None,
+        gate_beta_proj=merge_qtensor([
+            to_qtensor(_la_weight(sd, la, "dt_proj.weight", "in_proj_a.weight")),
+            to_qtensor(_la_weight(sd, la, "beta_proj.weight", "in_proj_b.weight")),
+        ]),
         z_proj=to_qtensor(_la_weight(sd, la, "z_proj.weight", "in_proj_z.weight")),
         norm_gain=_la_weight(sd, la, "norm.weight"),
         num_k_heads=d["linear_num_key_heads"],
