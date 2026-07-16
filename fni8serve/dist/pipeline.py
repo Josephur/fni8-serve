@@ -15,16 +15,19 @@ busy.  2-stage PP only (MoE-EP is the next rung — see issue #60 / D10).
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import itertools
 from typing import Any
 
 import torch
 import torch.nn as nn
+from fni8 import QTensor
 
 from ..engine.kv_cache import PagedKVCache
-from ..engine.sequence import SamplingParams, Sequence, Status
-from ..models.base import CausalLM, ForwardContext
-from ..models.cache import MLALatentCache, RecurrentStateCache
+from ..engine.sequence import SamplingParams, Sequence
+from ..models.base import ForwardContext
+from ..models.cache import RecurrentStateCache
 from ..models.config import ModelConfig
 from ..models.registry import build_model
 from . import recv, send
@@ -130,7 +133,9 @@ class LayerRemappedCache:
         return self._cache.block_table(slots)
 
     def write_prefill(self, layer: int, k, v, *, slot: int, start: int = 0, **kwargs):
-        return self._cache.write_prefill(layer - self._offset, k, v, slot=slot, start=start, **kwargs)
+        return self._cache.write_prefill(
+            layer - self._offset, k, v, slot=slot, start=start, **kwargs
+        )
 
     def write_prefill_varlen(self, layer: int, slot_mapping, k, v):
         return self._cache.write_prefill_varlen(layer - self._offset, slot_mapping, k, v)
@@ -208,6 +213,46 @@ def _unpack_boundary(packed: torch.Tensor, hidden_size: int):
     if packed.shape[-1] == hidden_size:
         return packed, None
     return packed[..., :hidden_size], packed[..., hidden_size:]
+
+
+def _detach_shared_stage_modules(stage0_modules: list[nn.Module], stage1_modules: list[nn.Module]):
+    """Give stage 1 one copy of buffer-bearing modules shared across stage roots.
+
+    Model builders intentionally share one RoPE table across every layer. Moving the
+    two layer slices independently would otherwise move that same table from GPU 0 to
+    GPU 1 and leave stage 0 with a cross-device reference.
+    """
+    ids0 = {id(m) for root in stage0_modules for m in root.modules()}
+    ids1 = {id(m) for root in stage1_modules for m in root.modules()}
+    shared = ids0 & ids1
+    replacements: dict[int, nn.Module] = {}
+    for root in stage1_modules:
+        for parent in root.modules():
+            for name, child in list(parent.named_children()):
+                if id(child) in shared:
+                    replacement = replacements.setdefault(id(child), copy.deepcopy(child))
+                    setattr(parent, name, replacement)
+
+
+def _move_stage_module(module: nn.Module, device: str) -> nn.Module:
+    """Move parameters, buffers, and fni8's dataclass QTensors to one stage GPU."""
+    module.to(device)
+    for child in module.modules():
+        for name, value in list(vars(child).items()):
+            if isinstance(value, QTensor):
+                setattr(
+                    child,
+                    name,
+                    dataclasses.replace(
+                        value,
+                        data=value.data.to(device),
+                        scale=value.scale.to(device) if value.scale is not None else None,
+                    ),
+                )
+            elif isinstance(value, torch.Tensor) and name not in child._parameters:
+                if name not in child._buffers:
+                    setattr(child, name, value.to(device))
+    return module
 
 
 class PipelineStage:
@@ -294,26 +339,27 @@ def make_pipeline(
     n_layers = cfg.num_hidden_layers
     mid = max(1, n_layers // 2)
 
-    # Build full model on each device (duplicating weights — memory tradeoff for
-    # correct QTensor device placement). In production a per-device filtered build
-    # avoids the duplication.
-    models_raw: list[nn.Module] = []
-    for dev in devices:
-        wt = {
-            k: v.to(f"cuda:{dev}") if isinstance(v, torch.Tensor) else v for k, v in weights.items()
-        }
-        m: Any = build_model(cfg, wt)
-        m.to(f"cuda:{dev}")
-        m.eval()
-        models_raw.append(m)
-
-    m0: Any = models_raw[0]
-    m0_model: Any = m0.model
+    # Assemble once on CPU, split the module graph, then move only each stage's
+    # parameters/buffers/QTensor payloads. The previous implementation built the
+    # complete model on BOTH GPUs, so a model larger than one card could never enter
+    # the supposedly sharded path and quantized QTensor attrs did not move at all.
+    model: Any = build_model(cfg, weights)
+    backbone: Any = model.model
+    first_modules = [backbone.embed_tokens, *list(backbone.layers[:mid])]
+    last_modules = [*list(backbone.layers[mid:]), backbone.norm, model.lm_head]
+    _detach_shared_stage_modules(first_modules, last_modules)
+    dev0, dev1 = (f"cuda:{dev}" for dev in devices)
+    for module in first_modules:
+        _move_stage_module(module, dev0)
+        module.eval()
+    for module in last_modules:
+        _move_stage_module(module, dev1)
+        module.eval()
 
     stage0 = PipelineStage(
         0,
-        embed=m0_model.embed_tokens,
-        layers=[m0_model.layers[i] for i in range(mid)],
+        embed=backbone.embed_tokens,
+        layers=[backbone.layers[i] for i in range(mid)],
         layer_offset=0,
         kv_cache=_build_stage_cache(
             mid,
@@ -326,14 +372,11 @@ def make_pipeline(
         ),
     )
 
-    m1: Any = models_raw[1]
-    m1_model: Any = m1.model
-
     stage1 = PipelineStage(
         1,
-        layers=[m1_model.layers[i] for i in range(mid, n_layers)],
-        norm=m1_model.norm,
-        lm_head=m1.lm_head,
+        layers=[backbone.layers[i] for i in range(mid, n_layers)],
+        norm=backbone.norm,
+        lm_head=model.lm_head,
         layer_offset=mid,
         kv_cache=_build_stage_cache(
             n_layers - mid,
@@ -498,7 +541,11 @@ class PipelineEngine:
                 h_s0, residual = layer(h_s0, pos0, stage0_ctx, residual)
 
             boundary_packed = _pack_boundary(h_s0.contiguous(), residual)
-            scheme = self._wire_scheme if self._wire_scheme is not None else select_wire_scheme(boundary_packed)
+            scheme = (
+                self._wire_scheme
+                if self._wire_scheme is not None
+                else select_wire_scheme(boundary_packed)
+            )
             handle = send(boundary_packed, dst=dev1, scheme=scheme)
 
         # --- Stage 1 forward ---
@@ -609,7 +656,11 @@ class PipelineEngine:
                     h_emb, residual = layer(h_emb, pos_tok, stage0_ctx, residual)
 
                 mb_packed = _pack_boundary(h_emb.contiguous(), residual)
-                scheme = self._wire_scheme if self._wire_scheme is not None else select_wire_scheme(mb_packed)
+                scheme = (
+                    self._wire_scheme
+                    if self._wire_scheme is not None
+                    else select_wire_scheme(mb_packed)
+                )
                 handle = send(mb_packed, dst=dev1, scheme=scheme)
 
             # --- Stage 1 ---
