@@ -43,6 +43,30 @@ requires_ltx = pytest.mark.skipif(not os.path.exists(_LTX_DIT), reason=f"missing
 
 
 @pytest.mark.correctness
+def test_native_kquant_capabilities_cover_every_installed_kernel(monkeypatch):
+    """The loader must not silently transcode a format whose fused kernel exists."""
+    import fni8
+
+    from fni8serve.gguf_native import _native_kquant_types
+
+    expected = {
+        gguf_type
+        for gguf_type, op in {
+            "Q2_K": "linear_q2k",
+            "Q3_K": "linear_q3k",
+            "Q4_K": "linear_q4k",
+            "Q5_K": "linear_q5k",
+            "Q6_K": "linear_q6k",
+        }.items()
+        if callable(getattr(fni8, op, None))
+    }
+    assert set(_native_kquant_types()) == expected
+
+    monkeypatch.setattr(fni8, "linear_q6k", None, raising=False)
+    assert "Q6_K" not in _native_kquant_types()
+
+
+@pytest.mark.correctness
 @requires_qwen35
 def test_qwen35_9b_config_matches_hf():
     """Qwen3.5-9B hybrid: every dim/rope/head/hybrid field maps from GGUF-KV, and
