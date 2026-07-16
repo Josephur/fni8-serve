@@ -24,16 +24,14 @@ try:  # NF4 codebook for 4-bit weight reconstruction (present in fni8)
 except Exception:  # pragma: no cover
     NF4_CODEBOOK = None
 
-# Does the installed fni8 build carry the FUSED native-GGUF k-quant dp4a kernel
-# (fni8.linear → linear_q4k, MIGRATION P0)? It is the other agent's keystone and may
-# not be in every fni8 build yet. When absent, `gguf_kquant` weights take the exact
-# dequant-matmul fallback below (numerically correct, just not yet accelerated).
-try:
-    import inspect as _inspect
+def _has_native_kquant(codebook: str) -> bool:
+    """Whether the installed fni8 exposes this format's fused public linear op."""
+    op = f"linear_{codebook.replace('_', '')}"
+    return callable(getattr(fni8, op, None))
 
-    _FNI8_HAS_Q4K = "gguf_kquant" in _inspect.getsource(fni8.ops.linear)
-except Exception:  # pragma: no cover
-    _FNI8_HAS_Q4K = False
+
+# Backward-compatible name for callers/tests from the Q4-only bring-up.
+_FNI8_HAS_Q4K = _has_native_kquant("q4_k")
 
 
 def _dequant_weight(qt: QTensor) -> torch.Tensor:
@@ -87,7 +85,9 @@ class LinearW8A8(nn.Module):
             self.in_features = (weight.data.shape[1] // 3) * 32
         elif weight.scheme == "gguf_kquant":
             # raw k-quant bytes [out, n_superblocks*type_size]; in = n_superblocks*256
-            _TS = {"q4_k": 144, "q5_k": 176, "q6_k": 210}[weight.codebook]
+            _TS = {"q2_k": 84, "q3_k": 110, "q4_k": 144, "q5_k": 176, "q6_k": 210}[
+                weight.codebook
+            ]
             self.in_features = (weight.data.shape[1] // _TS) * 256
         else:
             self.in_features = weight.data.shape[1]
@@ -101,11 +101,8 @@ class LinearW8A8(nn.Module):
             return True
         if qt.scheme == "per_group_w3a8":
             return True                              # uniform 3-bit dp4a (issue #181)
-        # Native GGUF k-quant: only Q4_K has a fused dp4a kernel today (fni8.linear ->
-        # linear_q4k). Q5_K/Q6_K fall through to the dequant fallback until their
-        # kernels land (MIGRATION P0); both are numerically correct meanwhile.
         if qt.scheme == "gguf_kquant":
-            return qt.codebook == "q4_k" and _FNI8_HAS_Q4K
+            return _has_native_kquant(qt.codebook)
         return qt.scheme == "per_group_i4" and qt.codebook == "int4"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -38,11 +38,32 @@ from .models.registry import _resolve
 # GGUF bytes are already stored [out, n_superblocks*type_size], exactly the shape a
 # `gguf_kquant` QTensor wants (verified against gguf.constants.GGML_QUANT_SIZES).
 _KQUANT = {
+    "Q2_K": ("q2_k", 84),
+    "Q3_K": ("q3_k", 110),
     "Q4_K": ("q4_k", 144),
     "Q5_K": ("q5_k", 176),
     "Q6_K": ("q6_k", 210),
 }
 _FLOAT_TYPES = {"F32", "F16", "BF16"}
+
+
+def _native_kquant_types() -> tuple[str, ...]:
+    """Return GGUF types backed by the installed fni8 fused kernels.
+
+    Probe the public operations directly.  The previous source-text probe only
+    recognized Q4_K, so Q5_K/Q6_K were needlessly expanded to float and requantized
+    to W8 during every load even after their native kernels shipped.
+    """
+    import fni8
+
+    ops = {
+        "Q2_K": "linear_q2k",
+        "Q3_K": "linear_q3k",
+        "Q4_K": "linear_q4k",
+        "Q5_K": "linear_q5k",
+        "Q6_K": "linear_q6k",
+    }
+    return tuple(kind for kind, op in ops.items() if callable(getattr(fni8, op, None)))
 
 # ── GGUF `general.architecture` string → our registry builder key ────────────
 # The GGUF arch strings (llama.cpp `LLM_ARCH_*` names, `gguf-py/gguf/constants.py`
@@ -286,7 +307,13 @@ def dequant_kquant(qt: QTensor) -> torch.Tensor:
     the mixed-type merge path. Byte-faithful: no re-quant, just the native dequant."""
     from gguf import GGMLQuantizationType, dequantize
 
-    tag = {"q4_k": "Q4_K", "q5_k": "Q5_K", "q6_k": "Q6_K"}[qt.codebook]
+    tag = {
+        "q2_k": "Q2_K",
+        "q3_k": "Q3_K",
+        "q4_k": "Q4_K",
+        "q5_k": "Q5_K",
+        "q6_k": "Q6_K",
+    }[qt.codebook]
     arr = qt.data.detach().cpu().numpy()  # uint8 [out, n_superblocks*type_size]
     deq = dequantize(arr, GGMLQuantizationType[tag]).astype(np.float32)  # [out, in]
     return torch.from_numpy(np.ascontiguousarray(deq)).to(qt.data.device).half()
@@ -385,10 +412,6 @@ def _remap_hybrid_qwen35(sd: dict, cfg) -> dict:
     if not gate_keys:
         return sd
 
-    n_head = cfg.num_attention_heads
-    n_kv = cfg.num_key_value_heads
-    hd = cfg.resolved_head_dim()
-
     for gk in gate_keys:
         prefix = gk.rsplit(".self_attn.attn_gate.weight", 1)[0]
         layer_idx = int(prefix.split(".")[-1])
@@ -450,13 +473,11 @@ def load_gguf_engine(
     import dataclasses
 
     from .engine import LLMEngine
-    from .layers.linear import _FNI8_HAS_Q4K
-
     cfg = gguf_config(path)
     # Keep k-quant weights RESIDENT (native gguf_kquant) only for types whose fused
     # dp4a kernel is built; otherwise dequant→per_row_i8 so decode runs on real dp4a
     # NOW (the per-forward dequant fallback is far too slow for a whole model).
-    native_types = ("Q4_K",) if _FNI8_HAS_Q4K else ()
+    native_types = _native_kquant_types()
     weights = gguf_state_dict(path, device=device, native_types=native_types)
 
     # ── Unsloth GGUF [in, out] → [out, in] transposition ──────────────────────
