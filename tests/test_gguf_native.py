@@ -40,6 +40,20 @@ requires_qwen3 = pytest.mark.skipif(not os.path.exists(_QWEN3_8B), reason=f"miss
 requires_ltx = pytest.mark.skipif(not os.path.exists(_LTX_DIT), reason=f"missing {_LTX_DIT}")
 
 
+@pytest.mark.perf
+@requires_qwen35
+def test_native_reader_skips_materializing_token_string_parts():
+    """Tokenizer vocabulary metadata must not allocate one Python entry per token."""
+    from fni8serve.gguf_native import _open_gguf
+
+    reader = _open_gguf(_QWEN35_9B)
+    tokens = reader.fields["tokenizer.ggml.tokens"]
+
+    assert isinstance(tokens.data, range)
+    assert len(tokens.data) == 248320
+    assert len(reader.tensors) > 400
+
+
 def test_gguf_engine_consumes_owned_weights(monkeypatch):
     """The one-shot GGUF load must free source rows while merging a card-filling model."""
     from types import SimpleNamespace
@@ -176,11 +190,11 @@ def test_qwen35_9b_config_matches_hf():
     the divergent SSM params round-trip into `extra` for the qwen3_next builder."""
     cfg = gguf_config(_QWEN35_9B)
 
-    # arch: GGUF `qwen35` must map onto our registered builder key `qwen3_next`
+    # arch: GGUF `qwen35` must map onto our registered Qwen3.5 builder key
     # (registry._resolve does NOT know `qwen35`; the GGUF-arch alias table does).
     from fni8serve.models.registry import _resolve
 
-    assert _resolve(cfg.arch) == "qwen3_next", f"arch {cfg.arch!r} did not resolve to a builder"
+    assert _resolve(cfg.arch) == "qwen3_5", f"arch {cfg.arch!r} did not resolve to a builder"
 
     # ── dims (qwen35.* KV → ModelConfig) ──
     assert cfg.vocab_size == 248320  # len(tokenizer.ggml.tokens)
