@@ -42,6 +42,37 @@ requires_qwen3 = pytest.mark.skipif(not os.path.exists(_QWEN3_8B), reason=f"miss
 requires_ltx = pytest.mark.skipif(not os.path.exists(_LTX_DIT), reason=f"missing {_LTX_DIT}")
 
 
+def test_gguf_engine_consumes_owned_weights(monkeypatch):
+    """The one-shot GGUF load must free source rows while merging a card-filling model."""
+    from types import SimpleNamespace
+
+    import fni8serve.engine
+    import fni8serve.gguf_native as native
+
+    cfg = SimpleNamespace(
+        arch="qwen3",
+        hidden_size=4,
+        linear_attention=False,
+        qk_norm=False,
+        num_mtp_layers=0,
+    )
+    weights = {"model.embed_tokens.weight": torch.zeros(8, 4)}
+    seen = {}
+
+    class FakeEngine:
+        def __init__(self, passed_cfg, passed_weights, **kwargs):
+            seen.update(cfg=passed_cfg, weights=passed_weights, kwargs=kwargs)
+
+    monkeypatch.setattr(native, "gguf_config", lambda _path: cfg)
+    monkeypatch.setattr(native, "gguf_state_dict", lambda *_args, **_kwargs: weights)
+    monkeypatch.setattr(native, "_native_kquant_types", lambda: set())
+    monkeypatch.setattr(native, "_gguf_eos_id", lambda _path: 1)
+    monkeypatch.setattr(fni8serve.engine, "LLMEngine", FakeEngine)
+
+    native.load_gguf_engine("model.gguf", device="cpu")
+    assert seen["kwargs"]["consume_weights"] is True
+
+
 @pytest.mark.correctness
 def test_native_kquant_capabilities_cover_every_installed_kernel(monkeypatch):
     """The loader must not silently transcode a format whose fused kernel exists."""
