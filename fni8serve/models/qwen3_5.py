@@ -82,8 +82,11 @@ def _la_dims(sd, la, x):
     value_dim for this family): num_v_heads = A_log length, value_dim = per-head norm
     gain length, and qkv_out = 2*num_k*key_dim + num_v*value_dim pins key_dim."""
     keys = (
-        "linear_num_key_heads", "linear_num_value_heads",
-        "linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_conv_kernel_dim",
     )
     if all(k in x for k in keys):
         return {k: x[k] for k in keys}  # full config survived — no derivation needed
@@ -123,10 +126,12 @@ def _linear_attn(cfg, sd, p):
         dt_bias=_la_weight(sd, la, "dt_bias"),
         beta_proj=None,
         gate_proj=None,
-        gate_beta_proj=merge_qtensor([
-            to_qtensor(_la_weight(sd, la, "dt_proj.weight", "in_proj_a.weight")),
-            to_qtensor(_la_weight(sd, la, "beta_proj.weight", "in_proj_b.weight")),
-        ]),
+        gate_beta_proj=merge_qtensor(
+            [
+                to_qtensor(_la_weight(sd, la, "dt_proj.weight", "in_proj_a.weight")),
+                to_qtensor(_la_weight(sd, la, "beta_proj.weight", "in_proj_b.weight")),
+            ]
+        ),
         z_proj=to_qtensor(_la_weight(sd, la, "z_proj.weight", "in_proj_z.weight")),
         norm_gain=_la_weight(sd, la, "norm.weight"),
         num_k_heads=d["linear_num_key_heads"],
@@ -193,14 +198,22 @@ def _qwen3_5_mtp_decoder(cfg, prefix, sd, rope):
             super().__init__()
             self.self_attn = attn
             self.input_layernorm = RMSNorm(
-                cfg.hidden_size, cfg.rms_norm_eps,
-                sd[f"{prefix}.input_layernorm.weight"], add_unit_offset=True)
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                sd[f"{prefix}.input_layernorm.weight"],
+                add_unit_offset=True,
+            )
             self.post_attention_layernorm = RMSNorm(
-                cfg.hidden_size, cfg.rms_norm_eps,
-                sd[f"{prefix}.post_attention_layernorm.weight"], add_unit_offset=True)
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                sd[f"{prefix}.post_attention_layernorm.weight"],
+                add_unit_offset=True,
+            )
             self.mlp = GatedMLP(
                 gate_up_weight(sd, f"{prefix}.mlp"),
-                to_qtensor(sd[f"{prefix}.mlp.down_proj.weight"]), act=cfg.hidden_act)
+                to_qtensor(sd[f"{prefix}.mlp.down_proj.weight"]),
+                act=cfg.hidden_act,
+            )
 
         def project(self, x, positions):
             """fc-output hidden ``x`` [B,S,H] -> (q, gate, k, v, residual), q/k RoPE'd,
@@ -221,7 +234,8 @@ def _qwen3_5_mtp_decoder(cfg, prefix, sd, rope):
             complete residual stream — the earlier code dropped the post-MLP residual."""
             a = self.self_attn
             out = GQAAttention._draft_attn(
-                q.transpose(1, 2), k_all.transpose(1, 2), v_all.transpose(1, 2), scale=a.scale)
+                q.transpose(1, 2), k_all.transpose(1, 2), v_all.transpose(1, 2), scale=a.scale
+            )
             out = out.view(B, S, a.nh, a.hd)
             h = a._gate_and_project(out, gate, B, S)  # sigmoid gate + o_proj
             h, residual = self.post_attention_layernorm(h, residual)
@@ -266,28 +280,56 @@ def build_qwen3_5_mtp(cfg, sd, embed, lm_head, rope):
     mp = _resolve_mtp_prefix(sd)
     if mp is None:
         return None  # no MTP head shipped in this checkpoint
+    shared_required = (
+        f"{mp}.fc.weight",
+        f"{mp}.pre_fc_norm_hidden.weight",
+        f"{mp}.pre_fc_norm_embedding.weight",
+        f"{mp}.norm.weight",
+    )
+    if not all(name in sd for name in shared_required):
+        return None
+
+    def _depth_complete(depth: int) -> bool:
+        p = f"{mp}.layers.{depth}"
+        required = (
+            f"{p}.input_layernorm.weight",
+            f"{p}.post_attention_layernorm.weight",
+            f"{p}.self_attn.q_proj.weight",
+            f"{p}.self_attn.k_proj.weight",
+            f"{p}.self_attn.v_proj.weight",
+            f"{p}.self_attn.o_proj.weight",
+            f"{p}.mlp.gate_proj.weight",
+            f"{p}.mlp.up_proj.weight",
+            f"{p}.mlp.down_proj.weight",
+        )
+        return all(name in sd for name in required)
+
     n_present = 0
-    while f"{mp}.layers.{n_present}.self_attn.q_proj.weight" in sd:
+    while _depth_complete(n_present):
         n_present += 1
     n_depths = min(n_present, cfg.num_mtp_layers) if cfg.num_mtp_layers > 0 else n_present
     layers = []
     for d in range(n_depths):
-        layers.append(MTPLayer(
-            cfg,
-            fc_weight=sd[f"{mp}.fc.weight"],
-            hidden_norm=sd[f"{mp}.pre_fc_norm_hidden.weight"],
-            emb_norm=sd[f"{mp}.pre_fc_norm_embedding.weight"],
-            block=_qwen3_5_mtp_decoder(cfg, f"{mp}.layers.{d}", sd, rope),
-            norm_add_unit_offset=True,
-        ))
+        layers.append(
+            MTPLayer(
+                cfg,
+                fc_weight=sd[f"{mp}.fc.weight"],
+                hidden_norm=sd[f"{mp}.pre_fc_norm_hidden.weight"],
+                emb_norm=sd[f"{mp}.pre_fc_norm_embedding.weight"],
+                block=_qwen3_5_mtp_decoder(cfg, f"{mp}.layers.{d}", sd, rope),
+                norm_add_unit_offset=True,
+            )
+        )
     if not layers:
         return None
     # Qwen3.5's MTP carries its OWN final norm (not the main model's) before the
     # shared LM head — use it so draft logits match the head's training.
-    mtp_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, sd[f"{mp}.norm.weight"],
-                       add_unit_offset=True)
-    return MultiTokenPredictor(cfg, layers=layers, embed=embed, final_norm=mtp_norm,
-                               lm_head=lm_head)
+    mtp_norm = RMSNorm(
+        cfg.hidden_size, cfg.rms_norm_eps, sd[f"{mp}.norm.weight"], add_unit_offset=True
+    )
+    return MultiTokenPredictor(
+        cfg, layers=layers, embed=embed, final_norm=mtp_norm, lm_head=lm_head
+    )
 
 
 class Qwen3_5DecoderLayer(nn.Module):
@@ -301,11 +343,15 @@ class Qwen3_5DecoderLayer(nn.Module):
         )
         # Qwen3.5 RMSNorm is zero-centered (Gemma-style gain = 1 + weight).
         self.input_layernorm = RMSNorm(
-            cfg.hidden_size, cfg.rms_norm_eps, sd[f"{p}.input_layernorm.weight"],
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            sd[f"{p}.input_layernorm.weight"],
             add_unit_offset=True,
         )
         self.post_attention_layernorm = RMSNorm(
-            cfg.hidden_size, cfg.rms_norm_eps, sd[f"{p}.post_attention_layernorm.weight"],
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            sd[f"{p}.post_attention_layernorm.weight"],
             add_unit_offset=True,
         )
         self.mlp = _build_mlp(cfg, sd, p)
@@ -333,7 +379,7 @@ def _unwrap_vlm_text_backbone(sd: dict) -> dict:
     for k, v in sd.items():
         if k.startswith("model.visual.") or ".visual." in k:
             continue  # vision tower — not needed to serve the text model
-        out[("model." + k[len(pref):]) if k.startswith(pref) else k] = v
+        out[("model." + k[len(pref) :]) if k.startswith(pref) else k] = v
     return out
 
 
@@ -342,7 +388,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         super().__init__()
         self.config = cfg
         sd = _unwrap_vlm_text_backbone(sd)
-        self.embed_tokens = VocabEmbedding(sd["model.embed_tokens.weight"], out_dtype=cfg.act_dtype())
+        self.embed_tokens = VocabEmbedding(
+            sd["model.embed_tokens.weight"], out_dtype=cfg.act_dtype()
+        )
         rope = RotaryEmbedding(
             cfg.resolved_head_dim(),
             cfg.max_position_embeddings,
@@ -352,8 +400,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.layers = nn.ModuleList(
             [Qwen3_5DecoderLayer(cfg, i, sd, rope) for i in range(cfg.num_hidden_layers)]
         )
-        self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, sd["model.norm.weight"],
-                            add_unit_offset=True)  # zero-centered (Qwen3_5RMSNorm)
+        self.norm = RMSNorm(
+            cfg.hidden_size, cfg.rms_norm_eps, sd["model.norm.weight"], add_unit_offset=True
+        )  # zero-centered (Qwen3_5RMSNorm)
         lm_w = sd["model.embed_tokens.weight"] if cfg.tie_word_embeddings else sd["lm_head.weight"]
         self.lm_head = LMHead(to_qtensor(lm_w))
         # MTP speculative-decode head (present in the shipped .fni8; None if absent).
