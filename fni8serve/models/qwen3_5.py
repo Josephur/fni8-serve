@@ -376,6 +376,8 @@ class Qwen3_5ForCausalLM(nn.Module):
     "qwen3.5",
     "qwen3_5_text",  # text backbone of the VLM wrapper — published .fni8s (e.g.
     "qwen3_5_text_config",  # Qwen3.5-0.8B-fni8) carry this as their meta arch
+    "qwen3_5_moe",  # Qwen3.6-35B-A3B: same hybrid backbone, SparseMoE MLP branch
+    "Qwen3_5MoeForCausalLM",
     "Qwen3_5ForCausalLM",
     # NOTE: `Qwen3_5ForConditionalGeneration` (the raw HF VLM arch) is claimed by
     # models/qwen3_5_vl.py, which composes THIS text backbone with the vision tower.

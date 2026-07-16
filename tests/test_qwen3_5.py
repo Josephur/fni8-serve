@@ -69,6 +69,42 @@ _REAL_HF = {
 
 def test_qwen3_5_registered():
     assert is_supported("qwen3_5")
+
+
+def test_qwen36_moe_legacy_fni8_meta_recovers_family_semantics():
+    """The fleet's 35B-A3B artifact predates nested Qwen3.6 config preservation."""
+    from fni8serve.models.registry import _resolve
+
+    legacy = {
+        "arch": "qwen3_5_moe",
+        "vocab_size": 248320,
+        "hidden_size": 2048,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "intermediate_size": 0,
+        "max_position_embeddings": 262144,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1e6,
+        "partial_rotary_factor": 1.0,
+        "linear_attention": False,
+        "full_attention_interval": 0,
+        "num_experts": 256,
+        "num_experts_per_tok": 8,
+        "moe_intermediate_size": 512,
+        "shared_expert_intermediate_size": 512,
+    }
+    cfg = _MC.from_hf(legacy, arch=legacy["arch"])
+
+    assert _resolve(cfg.arch) == "qwen3_5"
+    assert cfg.linear_attention is True
+    assert cfg.full_attention_interval == 4
+    assert cfg.rope_theta == 1e7
+    assert cfg.partial_rotary_factor == 0.25
+    assert cfg.torch_dtype == "bfloat16"
+    assert cfg.attention_kind(0) == "linear"
+    assert cfg.attention_kind(3) == "full"
     assert is_supported("Qwen3_5ForConditionalGeneration")
     assert is_supported("Qwen3_5ForCausalLM")
 

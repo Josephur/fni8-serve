@@ -44,6 +44,7 @@ _MULTIMODAL_ARCHS = frozenset(
 _HYBRID_LINEAR_DEFAULT_INTERVAL = {
     "qwen3_5_text": 4,
     "qwen3_5_vl": 4,  # VLM wrapper's text backbone is the same DeltaNet/full hybrid
+    "qwen3_5_moe": 4,  # Qwen3.6-35B-A3B uses the same 3:1 hybrid text backbone
     "qwen3_6_text": 4,
     "qwen3_next": 4,
 }
@@ -283,6 +284,12 @@ class ModelConfig:
         partial_rotary = rope_params.get(
             "partial_rotary_factor", c.get("partial_rotary_factor", 1.0)
         )
+        # The first fleet Qwen3.6-35B-A3B conversion serialized ModelConfig defaults
+        # instead of the nested text_config values. Recover only that identifiable
+        # legacy signature; a modern header with rope_parameters remains authoritative.
+        legacy_qwen36_moe = resolved_arch == "qwen3_5_moe" and not rope_params
+        if legacy_qwen36_moe and rope_theta == 1e6 and partial_rotary == 1.0:
+            rope_theta, partial_rotary = 1e7, 0.25
 
         # Multimodal VLM detection — read vision_config and expose on ModelConfig.
         if resolved_arch in _MULTIMODAL_ARCHS:
@@ -330,7 +337,7 @@ class ModelConfig:
             rope_theta=rope_theta,
             rope_local_theta=c.get("rope_local_base_freq"),
             tie_word_embeddings=c.get("tie_word_embeddings", False),
-            torch_dtype=str(c.get("torch_dtype", "float16")),
+            torch_dtype=str(c.get("torch_dtype", "bfloat16" if legacy_qwen36_moe else "float16")),
             qk_norm=c.get("qk_norm", False),
             qkv_bias=c.get("attention_bias", False),
             partial_rotary_factor=partial_rotary,
