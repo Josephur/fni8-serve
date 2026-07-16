@@ -81,9 +81,7 @@ class TestMakePipeline:
     def test_make_pipeline_supports_three_stage_capacity(self):
         """A model larger than two cards must split across three stage-local slices."""
         cfg = _cfg(n_layers=6)
-        stages = make_pipeline(
-            cfg, _sd(cfg), devices=(0, 1, 2), max_num_seqs=4, max_len=64
-        )
+        stages = make_pipeline(cfg, _sd(cfg), devices=(0, 1, 2), max_num_seqs=4, max_len=64)
 
         assert len(stages) == 3
         assert [len(stage.layers) for stage in stages] == [2, 2, 2]
@@ -175,6 +173,29 @@ class TestMakePipeline:
 
 
 class TestPipelineOutputMatchesSingleGpu:
+    @three_gpus
+    @cuda_only
+    def test_same_output_three_stage_pipeline(self):
+        torch.manual_seed(42)
+        cfg = _cfg(n_layers=6)
+        sd = _sd(cfg)
+        prompt = [3, 1, 4, 1, 5]
+        params = SamplingParams(temperature=0.0, max_tokens=4)
+
+        ref = LLMEngine(
+            cfg,
+            {k: v.clone().to("cuda:0") for k, v in sd.items()},
+            device="cuda:0",
+            max_num_seqs=4,
+            max_len=64,
+        ).generate([prompt], params)[0]
+        stages = make_pipeline(cfg, sd, devices=(0, 1, 2), max_num_seqs=4, max_len=64)
+        engine = PipelineEngine.from_stages(
+            stages, cfg, max_num_seqs=4, max_len=64, wire_scheme="int8"
+        )
+
+        assert engine.generate([prompt], params)[0] == ref
+
     @two_gpus
     @cuda_only
     def test_same_output_single_prompt(self):

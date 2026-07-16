@@ -394,7 +394,7 @@ def make_pipeline(
 
 
 class PipelineEngine:
-    """Pipeline-parallel inference for two contiguous GPU stages."""
+    """Pipeline-parallel inference across two or more contiguous GPU stages."""
 
     def __init__(
         self,
@@ -410,6 +410,7 @@ class PipelineEngine:
     ):
         self.stage0 = stage0
         self.stage1 = stage1
+        self.stages = (stage0, stage1)
         self.cfg = cfg
         self.eos_id = eos_id
         self.hidden_size = cfg.hidden_size
@@ -426,12 +427,17 @@ class PipelineEngine:
             eos_id=eos_id,
         )
 
+    @classmethod
+    def from_stages(cls, stages: tuple[PipelineStage, ...], cfg: ModelConfig, **kwargs):
+        if len(stages) < 2:
+            raise ValueError("PipelineEngine needs at least two stages")
+        engine = cls(stages[0], stages[-1], cfg, **kwargs)
+        engine.stages = tuple(stages)
+        return engine
+
     @property
     def devices(self):
-        return (
-            self.stage0._device.index or 0,
-            self.stage1._device.index or 1,
-        )
+        return tuple(stage._device.index or 0 for stage in self.stages)
 
     def add_request(self, prompt_ids: list[int], params: SamplingParams | None = None) -> int:
         seq = Sequence(next(self._ids), list(prompt_ids), params or SamplingParams())
@@ -446,19 +452,20 @@ class PipelineEngine:
         self._out.pop(seq_id, None)
 
     def _sync_caches(self, slot_op: str, slots: Any = None):
-        """Mirror slot-level cache ops across both stages."""
-        c0, c1 = self.stage0.kv_cache, self.stage1.kv_cache
+        """Mirror slot-level cache ops across every stage."""
+        caches = [stage.kv_cache for stage in self.stages]
         if slot_op == "alloc":
-            s0 = c0.alloc()
-            c1.alloc()
-            return s0
+            allocated = [cache.alloc() for cache in caches]
+            if len(set(allocated)) != 1:
+                raise RuntimeError(f"pipeline cache slots diverged: {allocated}")
+            return allocated[0]
         elif slot_op == "free":
             for s in slots:
-                c0.free(s)
-                c1.free(s)
+                for cache in caches:
+                    cache.free(s)
         elif slot_op == "ensure_capacity":
-            c0.ensure_capacity(slots[0], slots[1])
-            c1.ensure_capacity(slots[0], slots[1])
+            for cache in caches:
+                cache.ensure_capacity(slots[0], slots[1])
         return None
 
     def step(self):
@@ -474,231 +481,161 @@ class PipelineEngine:
         self.scheduler.postprocess(batch, is_prefill)
 
     def _prefill(self, batch: list[Sequence]):
-        """Prefill: stage 0 forward -> send -> stage 1 recv -> forward -> sample."""
+        """Prefill every contiguous stage, transferring one compressed boundary."""
         from ..layers.sampler import Sampler
 
         sampler = Sampler()
-        dev0 = self.devices[0]
-        dev1 = self.devices[1]
-        device0 = f"cuda:{dev0}"
-        device1 = f"cuda:{dev1}"
-
-        # Build device-agnostic prefill metadata first
         all_ids: list[int] = []
         all_positions: list[int] = []
         cu_seqlens: list[int] = [0]
-        slots_0: list[int] = []
-        slot_mapping_flat_0: list[int] = []
-        slot_mapping_flat_1: list[int] = []
+        slots: list[int] = []
+        slot_mappings: list[list[int]] = [[] for _ in self.stages]
 
         for seq in batch:
-            self.stage0.kv_cache.ensure_capacity([seq.slot], [seq.num_prompt])
-            self.stage1.kv_cache.ensure_capacity([seq.slot], [seq.num_prompt])
+            for stage in self.stages:
+                stage.kv_cache.ensure_capacity([seq.slot], [seq.num_prompt])
             n = seq.num_prompt
             all_ids.extend(seq.prompt_ids)
             all_positions.extend(range(n))
             cu_seqlens.append(cu_seqlens[-1] + n)
-            slots_0.append(seq.slot)
+            slots.append(seq.slot)
             for t in range(n):
-                slot_mapping_flat_0.append(
-                    self.stage0.kv_cache._slot_mapping([seq.slot], [t]).item()
+                for stage_id, stage in enumerate(self.stages):
+                    slot_mappings[stage_id].append(
+                        stage.kv_cache._slot_mapping([seq.slot], [t]).item()
+                    )
+
+        hidden = None
+        residual = None
+        for stage_id, stage in enumerate(self.stages):
+            dev = self.devices[stage_id]
+            device = f"cuda:{dev}"
+            with torch.cuda.device(dev):
+                _clear_hadamard_cache()
+                stage.lin_cache.reset()
+                positions = torch.tensor([all_positions], device=device)
+                cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+                mapping = torch.tensor(slot_mappings[stage_id], dtype=torch.int32, device=device)
+                ctx = ForwardContext(
+                    is_prefill=True,
+                    kv_cache=stage.kv_cache,
+                    lin_cache=stage.lin_cache,
+                    slots=slots,
+                    cu_seqlens=cu,
+                    slot_mapping=mapping,
                 )
-                slot_mapping_flat_1.append(
-                    self.stage1.kv_cache._slot_mapping([seq.slot], [t]).item()
-                )
+                if stage.is_first:
+                    assert stage.embed is not None
+                    ids = torch.tensor([all_ids], device=device)
+                    hidden = stage.embed(ids)
+                assert hidden is not None
+                stage_ctx = _remap_ctx(ctx, stage._remap(stage.kv_cache), stage.lin_cache)
+                for layer in stage.layers:
+                    hidden, residual = layer(hidden, positions, stage_ctx, residual)
+                if not stage.is_last:
+                    packed = _pack_boundary(hidden.contiguous(), residual)
+                    scheme = self._wire_scheme or select_wire_scheme(packed)
+                    handle = send(packed, dst=self.devices[stage_id + 1], scheme=scheme)
+                    hidden, residual = _unpack_boundary(recv(handle), self.hidden_size)
 
-        # --- Stage 0 forward ---
-        with torch.cuda.device(dev0):
-            _clear_hadamard_cache()
-            self.stage0.lin_cache.reset()
-            ids = torch.tensor([all_ids], device=device0)
-            pos0 = torch.tensor([all_positions], device=device0)
-            cu0 = torch.tensor(cu_seqlens, dtype=torch.int32, device=device0)
-            sm0 = torch.tensor(slot_mapping_flat_0, dtype=torch.int32, device=device0)
-
-            ctx0 = ForwardContext(
-                is_prefill=True,
-                kv_cache=self.stage0.kv_cache,
-                lin_cache=self.stage0.lin_cache,
-                slots=slots_0,
-                cu_seqlens=cu0,
-                slot_mapping=sm0,
-            )
-
-            embed = self.stage0.embed
-            assert embed is not None, "stage 0 must have an embedding"
-            h_s0 = embed(ids)
-
-            residual = None
-            stage0_ctx = _remap_ctx(
-                ctx0, self.stage0._remap(self.stage0.kv_cache), self.stage0.lin_cache
-            )
-            for layer in self.stage0.layers:
-                h_s0, residual = layer(h_s0, pos0, stage0_ctx, residual)
-
-            boundary_packed = _pack_boundary(h_s0.contiguous(), residual)
-            scheme = (
-                self._wire_scheme
-                if self._wire_scheme is not None
-                else select_wire_scheme(boundary_packed)
-            )
-            handle = send(boundary_packed, dst=dev1, scheme=scheme)
-
-        # --- Stage 1 forward ---
-        with torch.cuda.device(dev1):
-            # fni8's hadamard_matrix caches per (dim, device_type), but device_type
-            # = "cuda" omits the device index.  Clear the cache so the matrix is
-            # re-created on the correct GPU.
-            _clear_hadamard_cache()
-            boundary_rcv: torch.Tensor = recv(handle)
-            h_in, residual = _unpack_boundary(boundary_rcv, self.hidden_size)
-
-            pos1 = torch.tensor([all_positions], device=device1)
-            cu1 = torch.tensor(cu_seqlens, dtype=torch.int32, device=device1)
-            sm1 = torch.tensor(slot_mapping_flat_1, dtype=torch.int32, device=device1)
-
-            ctx1 = ForwardContext(
-                is_prefill=True,
-                kv_cache=self.stage1.kv_cache,
-                lin_cache=self.stage1.lin_cache,
-                slots=slots_0,
-                cu_seqlens=cu1,
-                slot_mapping=sm1,
-            )
-
-            stage1_ctx = _remap_ctx(
-                ctx1, self.stage1._remap(self.stage1.kv_cache), self.stage1.lin_cache
-            )
-            for layer in self.stage1.layers:
-                h_in, residual = layer(h_in, pos1, stage1_ctx, residual)
-
-            norm1 = self.stage1.norm
-            assert norm1 is not None, "last stage must have a norm"
-            h_in, _ = norm1(h_in, residual)
-
-            last_indices = torch.tensor(
-                [cu_seqlens[i] - 1 for i in range(1, len(cu_seqlens))],
-                device=device1,
-                dtype=torch.long,
-            )
-            logits = self.stage1.compute_logits(h_in[:, last_indices]).squeeze(0)
-
-            temps = torch.tensor(
-                [s.params.temperature for s in batch], device=device1, dtype=torch.float32
-            )
-            top_p = torch.tensor(
-                [s.params.top_p for s in batch], device=device1, dtype=torch.float32
-            )
-            procs = [s.params.logit_processors for s in batch]
-            has_procs = any(procs)
-            toks = sampler(
-                logits,
-                temps,
-                top_p=top_p,
-                logit_processors=procs if has_procs else None,
-                input_ids=[s.all_token_ids for s in batch] if has_procs else None,
-            )
-            for seq, tok in zip(batch, toks.tolist()):
-                seq.output_ids.append(tok)
+        last = self.stages[-1]
+        final_device = f"cuda:{self.devices[-1]}"
+        assert last.norm is not None and hidden is not None
+        hidden, _ = last.norm(hidden, residual)
+        last_indices = torch.tensor(
+            [cu_seqlens[i] - 1 for i in range(1, len(cu_seqlens))],
+            device=final_device,
+            dtype=torch.long,
+        )
+        logits = last.compute_logits(hidden[:, last_indices]).squeeze(0)
+        temps = torch.tensor(
+            [s.params.temperature for s in batch], device=final_device, dtype=torch.float32
+        )
+        top_p = torch.tensor(
+            [s.params.top_p for s in batch], device=final_device, dtype=torch.float32
+        )
+        procs = [s.params.logit_processors for s in batch]
+        has_procs = any(procs)
+        toks = sampler(
+            logits,
+            temps,
+            top_p=top_p,
+            logit_processors=procs if has_procs else None,
+            input_ids=[s.all_token_ids for s in batch] if has_procs else None,
+        )
+        for seq, tok in zip(batch, toks.tolist()):
+            seq.output_ids.append(tok)
 
         for seq in batch:
             seq.length = seq.num_prompt
-            self.stage0.kv_cache.store_prefix(seq.prompt_ids, seq.slot)
-            self.stage1.kv_cache.store_prefix(seq.prompt_ids, seq.slot)
+            for stage in self.stages:
+                stage.kv_cache.store_prefix(seq.prompt_ids, seq.slot)
 
     def _decode_microbatched(self, batch: list[Sequence]):
-        """Micro-batched decode: split the batch into micro-batches that pipeline
-        through stages 0 and 1 with overlapped transfer. Default micro-batch size = 2
-        balances pipeline utilisation on the PCIe-x1 link."""
+        """Decode micro-batches through every stage and compressed boundary."""
         if not batch:
             return
 
         from ..layers.sampler import Sampler
 
         sampler = Sampler()
-        dev0 = self.devices[0]
-        dev1 = self.devices[1]
-        device0 = f"cuda:{dev0}"
-        device1 = f"cuda:{dev1}"
         microbatch_size = 2
         micros = [batch[i : i + microbatch_size] for i in range(0, len(batch), microbatch_size)]
 
         for mb in micros:
-            # --- Stage 0 ---
-            with torch.cuda.device(dev0):
-                _clear_hadamard_cache()
-                self.stage0.lin_cache.reset()
-                c0 = self.stage0.kv_cache
-                slots = [s.slot for s in mb]
-                lengths = [s.length for s in mb]
-                c0.ensure_capacity(slots, [n + 1 for n in lengths])
-                ids_tok = torch.tensor([[s.last_token] for s in mb], device=device0)
-                pos_tok = torch.tensor([[s.length] for s in mb], device=device0)
+            slots = [s.slot for s in mb]
+            lengths = [s.length for s in mb]
+            hidden = None
+            residual = None
+            for stage_id, stage in enumerate(self.stages):
+                dev = self.devices[stage_id]
+                device = f"cuda:{dev}"
+                with torch.cuda.device(dev):
+                    _clear_hadamard_cache()
+                    stage.lin_cache.reset()
+                    stage.kv_cache.ensure_capacity(slots, [n + 1 for n in lengths])
+                    positions = torch.tensor([[s.length] for s in mb], device=device)
+                    ctx = ForwardContext(
+                        is_prefill=False,
+                        kv_cache=stage.kv_cache,
+                        lin_cache=stage.lin_cache,
+                        slots=slots,
+                        slot_lengths=lengths,
+                    )
+                    if stage.is_first:
+                        assert stage.embed is not None
+                        ids = torch.tensor([[s.last_token] for s in mb], device=device)
+                        hidden = stage.embed(ids)
+                    assert hidden is not None
+                    stage_ctx = _remap_ctx(ctx, stage._remap(stage.kv_cache), stage.lin_cache)
+                    for layer in stage.layers:
+                        hidden, residual = layer(hidden, positions, stage_ctx, residual)
+                    if not stage.is_last:
+                        packed = _pack_boundary(hidden.contiguous(), residual)
+                        scheme = self._wire_scheme or select_wire_scheme(packed)
+                        handle = send(packed, dst=self.devices[stage_id + 1], scheme=scheme)
+                        hidden, residual = _unpack_boundary(recv(handle), self.hidden_size)
 
-                ctx0 = ForwardContext(
-                    is_prefill=False,
-                    kv_cache=c0,
-                    lin_cache=self.stage0.lin_cache,
-                    slots=slots,
-                    slot_lengths=lengths,
-                )
-
-                embed = self.stage0.embed
-                assert embed is not None
-                h_emb = embed(ids_tok)
-                residual = None
-                stage0_ctx = _remap_ctx(ctx0, self.stage0._remap(c0), self.stage0.lin_cache)
-                for layer in self.stage0.layers:
-                    h_emb, residual = layer(h_emb, pos_tok, stage0_ctx, residual)
-
-                mb_packed = _pack_boundary(h_emb.contiguous(), residual)
-                scheme = (
-                    self._wire_scheme
-                    if self._wire_scheme is not None
-                    else select_wire_scheme(mb_packed)
-                )
-                handle = send(mb_packed, dst=dev1, scheme=scheme)
-
-            # --- Stage 1 ---
-            with torch.cuda.device(dev1):
-                _clear_hadamard_cache()
-                c1 = self.stage1.kv_cache
-                c1.ensure_capacity(slots, [n + 1 for n in lengths])
-
-                mb_rcv: torch.Tensor = recv(handle)
-                h_in, residual = _unpack_boundary(mb_rcv, self.hidden_size)
-
-                ctx1 = ForwardContext(
-                    is_prefill=False,
-                    kv_cache=c1,
-                    lin_cache=self.stage1.lin_cache,
-                    slots=slots,
-                    slot_lengths=lengths,
-                )
-                stage1_ctx = _remap_ctx(ctx1, self.stage1._remap(c1), self.stage1.lin_cache)
-                for layer in self.stage1.layers:
-                    h_in, residual = layer(h_in, pos_tok.to(device1), stage1_ctx, residual)
-
-                norm1 = self.stage1.norm
-                assert norm1 is not None
-                h_in, _ = norm1(h_in, residual)
-                logits_mb = self.stage1.compute_logits(h_in[:, -1])
-
-                temps = torch.tensor(
-                    [s.params.temperature for s in mb], device=device1, dtype=torch.float32
-                )
-                top_p = torch.tensor(
-                    [s.params.top_p for s in mb], device=device1, dtype=torch.float32
-                )
-                procs = [s.params.logit_processors for s in mb]
-                has_procs = any(procs)
-                mb_toks = sampler(
-                    logits_mb,
-                    temps,
-                    top_p=top_p,
-                    logit_processors=procs if has_procs else None,
-                    input_ids=[s.all_token_ids for s in mb] if has_procs else None,
-                )
+            last = self.stages[-1]
+            final_device = f"cuda:{self.devices[-1]}"
+            assert last.norm is not None and hidden is not None
+            hidden, _ = last.norm(hidden, residual)
+            logits_mb = last.compute_logits(hidden[:, -1])
+            temps = torch.tensor(
+                [s.params.temperature for s in mb], device=final_device, dtype=torch.float32
+            )
+            top_p = torch.tensor(
+                [s.params.top_p for s in mb], device=final_device, dtype=torch.float32
+            )
+            procs = [s.params.logit_processors for s in mb]
+            has_procs = any(procs)
+            mb_toks = sampler(
+                logits_mb,
+                temps,
+                top_p=top_p,
+                logit_processors=procs if has_procs else None,
+                input_ids=[s.all_token_ids for s in mb] if has_procs else None,
+            )
 
             for seq, tok in zip(mb, mb_toks.tolist()):
                 seq.output_ids.append(tok)
