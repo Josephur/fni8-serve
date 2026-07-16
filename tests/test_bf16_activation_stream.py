@@ -12,6 +12,7 @@ The seam is the activation dtype, seeded by `VocabEmbedding` and carried unchang
 through norm/RoPE/attention/MLP. `ModelConfig.act_dtype()` maps the checkpoint's
 `torch_dtype` to that seed. Softmax/LSE/norm reductions stay fp32 regardless.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -30,14 +31,63 @@ CUDA = torch.cuda.is_available()
 _MASSIVE = 1e6  # well past fp16's 65504 ceiling; comfortably inside bf16's ~3.4e38 range
 
 
+def test_qwen35_gated_attention_casts_only_kv_cache_write_to_fp16():
+    """The sm70 paged-KV writer is fp16-only; the bf16 compute stream stays bf16."""
+    from fni8serve.layers.gated_gqa_attention import _paged_cache_kv
+
+    k = torch.randn(2, 4, 16, dtype=torch.bfloat16)
+    v = torch.randn(2, 4, 16, dtype=torch.bfloat16)
+    cached_k, cached_v = _paged_cache_kv(k, v)
+
+    assert cached_k.dtype is torch.float16 and cached_v.dtype is torch.float16
+    assert k.dtype is torch.bfloat16 and v.dtype is torch.bfloat16
+
+
+def test_qwen35_gated_attention_restores_bf16_after_paged_decode():
+    """The paged kernel returns fp16, but the residual stream is gate/model dtype."""
+    from fni8serve.layers.gated_gqa_attention import GatedGQAAttention
+
+    attn = object.__new__(GatedGQAAttention)
+    torch.nn.Module.__init__(attn)
+    attn.nh, attn.hd = 2, 8
+    attn.o_proj = torch.nn.Identity()
+    out = torch.randn(1, 1, 2, 8, dtype=torch.float16)
+    gate = torch.randn(1, 1, 2, 8, dtype=torch.bfloat16)
+
+    projected = attn._gate_and_project(out, gate, 1, 1)
+
+    assert projected.dtype is torch.bfloat16
+
+
+@pytest.mark.skipif(not CUDA, reason="bf16 attention fallback is CUDA-only")
+def test_qwen35_bf16_varlen_fallback_preserves_stream_dtype():
+    from fni8serve.layers.gated_gqa_attention import _bf16_varlen_attention
+
+    q = torch.randn(5, 4, 32, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(5, 2, 32, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(5, 2, 32, device="cuda", dtype=torch.bfloat16)
+    cu = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32)
+
+    out = _bf16_varlen_attention(q, k, v, cu, scale=32**-0.5)
+
+    assert out.shape == q.shape
+    assert out.dtype is torch.bfloat16 and torch.isfinite(out).all()
+
+
 # ── config: torch_dtype -> activation dtype ──────────────────────────────────
 
 
 def _cfg(torch_dtype: str) -> ModelConfig:
     return ModelConfig(
-        arch="gemma3_text", vocab_size=64, hidden_size=32, num_hidden_layers=1,
-        num_attention_heads=2, num_key_value_heads=1, intermediate_size=64,
-        head_dim=16, torch_dtype=torch_dtype,
+        arch="gemma3_text",
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=64,
+        head_dim=16,
+        torch_dtype=torch_dtype,
     )
 
 
@@ -49,16 +99,32 @@ def test_act_dtype_bf16_for_bf16_native_checkpoint():
 def test_act_dtype_fp16_default_and_for_fp16_checkpoint():
     assert _cfg("float16").act_dtype() is torch.float16
     # default (unspecified torch_dtype) stays fp16 -- fp16-native models are unchanged
-    assert ModelConfig(arch="qwen3", vocab_size=64, hidden_size=32, num_hidden_layers=1,
-                       num_attention_heads=2, num_key_value_heads=1,
-                       intermediate_size=64).act_dtype() is torch.float16
+    assert (
+        ModelConfig(
+            arch="qwen3",
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            intermediate_size=64,
+        ).act_dtype()
+        is torch.float16
+    )
 
 
 def test_from_hf_captures_torch_dtype():
     cfg = ModelConfig.from_hf(
-        {"model_type": "gemma3_text", "vocab_size": 64, "hidden_size": 32,
-         "num_hidden_layers": 1, "num_attention_heads": 2, "num_key_value_heads": 1,
-         "intermediate_size": 64, "torch_dtype": "bfloat16"}
+        {
+            "model_type": "gemma3_text",
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "intermediate_size": 64,
+            "torch_dtype": "bfloat16",
+        }
     )
     assert cfg.torch_dtype == "bfloat16"
     assert cfg.act_dtype() is torch.bfloat16
@@ -131,11 +197,23 @@ def test_gemma3_forward_runs_bf16_stream_and_stays_finite():
     from tests.test_models import gemma3_sd  # reuse the small-model state-dict builder
 
     cfg = ModelConfig(
-        arch="gemma3", vocab_size=320, hidden_size=256, num_hidden_layers=2,
-        num_attention_heads=4, num_key_value_heads=2, intermediate_size=512,
-        head_dim=64, rms_norm_eps=1e-6, rope_theta=1e6, rope_local_theta=1e4,
-        sliding_window=64, sliding_window_pattern=2, query_pre_attn_scalar=64,
-        norm_add_unit_offset=True, embed_scale=16.0, hidden_act="gelu_pytorch_tanh",
+        arch="gemma3",
+        vocab_size=320,
+        hidden_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=512,
+        head_dim=64,
+        rms_norm_eps=1e-6,
+        rope_theta=1e6,
+        rope_local_theta=1e4,
+        sliding_window=64,
+        sliding_window_pattern=2,
+        query_pre_attn_scalar=64,
+        norm_add_unit_offset=True,
+        embed_scale=16.0,
+        hidden_act="gelu_pytorch_tanh",
         torch_dtype="bfloat16",
     )
     model = build_model(cfg, gemma3_sd(cfg)).cuda().eval()

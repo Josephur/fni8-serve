@@ -73,6 +73,21 @@ def _seq(pixel_values=None, temperature=0.0) -> Sequence:
 _MTP = object()  # sentinel: the guard only checks `mtp is None`
 
 
+def test_partial_mtp_prefix_is_treated_as_no_head():
+    """A converted checkpoint may retain MTP markers without a complete block."""
+    from types import SimpleNamespace
+
+    from fni8serve.models.qwen3_5 import build_qwen3_5_mtp
+
+    partial = {
+        "mtp.fc.weight": torch.empty(1),
+        "mtp.layers.0.self_attn.q_proj.weight": torch.empty(1),
+    }
+    cfg = SimpleNamespace(num_mtp_layers=0)
+
+    assert build_qwen3_5_mtp(cfg, partial, None, None, None) is None
+
+
 def test_guard_allows_plain_greedy_text():
     r = _runner(_PlainModel())
     assert r.has_recurrent is False

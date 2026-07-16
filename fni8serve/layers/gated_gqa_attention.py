@@ -38,6 +38,26 @@ from .norm import RMSNorm
 from .rotary import RotaryEmbedding
 
 
+def _paged_cache_kv(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Adapt Qwen3.5's bf16 stream to the sm70 paged-KV writer's fp16 ABI."""
+    if k.dtype is torch.bfloat16:
+        return k.half(), v.half()
+    return k, v
+
+
+def _bf16_varlen_attention(q, k, v, cu_seqlens, *, scale, window_left=-1):
+    """Use the bf16-capable attention kernel per packed sequence on sm70."""
+    bounds = cu_seqlens.detach().cpu().tolist()
+    outputs = []
+    for start, end in zip(bounds, bounds[1:]):
+        qs = q[start:end].transpose(0, 1).unsqueeze(0)
+        ks = k[start:end].transpose(0, 1).unsqueeze(0)
+        vs = v[start:end].transpose(0, 1).unsqueeze(0)
+        out = fni8.attn_int8_fwd(qs, ks, vs, causal=True, scale=scale, window_left=window_left)
+        outputs.append(out.squeeze(0).transpose(0, 1))
+    return torch.cat(outputs, dim=0)
+
+
 class GatedGQAAttention(nn.Module):
     def __init__(
         self,
@@ -66,11 +86,13 @@ class GatedGQAAttention(nn.Module):
         self.rope = rope
         self.q_norm = (
             RMSNorm(head_dim, rms_norm_eps, q_norm, add_unit_offset=qk_unit_offset)
-            if q_norm is not None else None
+            if q_norm is not None
+            else None
         )
         self.k_norm = (
             RMSNorm(head_dim, rms_norm_eps, k_norm, add_unit_offset=qk_unit_offset)
-            if k_norm is not None else None
+            if k_norm is not None
+            else None
         )
 
     def _project(self, x):
@@ -102,19 +124,30 @@ class GatedGQAAttention(nn.Module):
                 q_v = q.reshape(B * S, self.nh, self.hd)
                 k_v = k.reshape(B * S, self.nkv, self.hd)
                 v_v = v.reshape(B * S, self.nkv, self.hd)
-                ctx.kv_cache.write_prefill_varlen(layer_idx, ctx.slot_mapping, k_v, v_v)
+                cache_k, cache_v = _paged_cache_kv(k_v, v_v)
+                ctx.kv_cache.write_prefill_varlen(layer_idx, ctx.slot_mapping, cache_k, cache_v)
                 max_seqlen = int((ctx.cu_seqlens[1:] - ctx.cu_seqlens[:-1]).max().item())
-                out_v = fni8.attn_int8_varlen(
-                    q_v,
-                    k_v,
-                    v_v,
-                    ctx.cu_seqlens,
-                    ctx.cu_seqlens,
-                    max_seqlen,
-                    max_seqlen,
-                    causal=self.causal,
-                    scale=self.scale,
-                )
+                if q_v.dtype is torch.bfloat16:
+                    out_v = _bf16_varlen_attention(
+                        q_v,
+                        k_v,
+                        v_v,
+                        ctx.cu_seqlens,
+                        scale=self.scale,
+                        window_left=self.window_left,
+                    )
+                else:
+                    out_v = fni8.attn_int8_varlen(
+                        q_v,
+                        k_v,
+                        v_v,
+                        ctx.cu_seqlens,
+                        ctx.cu_seqlens,
+                        max_seqlen,
+                        max_seqlen,
+                        causal=self.causal,
+                        scale=self.scale,
+                    )
                 out = out_v.reshape(B, S, self.nh, self.hd)  # token-major [B,S,H,D]
                 return self._gate_and_project(out, gate, B, S)
             # Non-varlen prefill: kernels want [B, H, S, D].
@@ -122,15 +155,20 @@ class GatedGQAAttention(nn.Module):
             kt = k.transpose(1, 2).contiguous()
             vt = v.transpose(1, 2).contiguous()
             slot = ctx.slots[0] if ctx.slots is not None else None
+            cache_k, cache_v = _paged_cache_kv(kt, vt)
             ctx.kv_cache.write_prefill(
-                layer_idx, kt, vt, slot=slot, start=ctx.prefill_start, positions=positions,
+                layer_idx,
+                cache_k,
+                cache_v,
+                slot=slot,
+                start=ctx.prefill_start,
+                positions=positions,
             )
             # Chunked prefill: use accumulated fp16 K/V + current K/V with
             # attn_int8_fwd (same kernel as full prefill) by zero-padding Q.
             acc_buf = getattr(ctx, "acc_kv_buffer", None)
             if acc_buf is not None and layer_idx < len(acc_buf) and acc_buf[layer_idx] is not None:
                 k_prev, v_prev = acc_buf[layer_idx]
-                prev_len = k_prev.shape[2]
                 cur_len = kt.shape[2]
                 kt_all = torch.cat([k_prev, kt], dim=2)
                 vt_all = torch.cat([v_prev, vt], dim=2)
@@ -138,8 +176,12 @@ class GatedGQAAttention(nn.Module):
                 q_pad = kt_all.new_zeros(1, self.nh, total_len, self.hd)
                 q_pad[:, :, -cur_len:, :] = qt  # actual Q at the end
                 out = fni8.attn_int8_fwd(
-                    q_pad, kt_all, vt_all,
-                    causal=self.causal, scale=self.scale, window_left=self.window_left,
+                    q_pad,
+                    kt_all,
+                    vt_all,
+                    causal=self.causal,
+                    scale=self.scale,
+                    window_left=self.window_left,
                 )
                 out = out[:, :, -cur_len:, :]
                 acc_buf[layer_idx] = (kt_all.contiguous(), vt_all.contiguous())
@@ -148,7 +190,9 @@ class GatedGQAAttention(nn.Module):
                     qt, kt, vt, causal=self.causal, scale=self.scale, window_left=self.window_left
                 )
             # Initialize or update accumulated buffer
-            if acc_buf is not None and not (layer_idx < len(acc_buf) and acc_buf[layer_idx] is not None):
+            if acc_buf is not None and not (
+                layer_idx < len(acc_buf) and acc_buf[layer_idx] is not None
+            ):
                 while len(acc_buf) <= layer_idx:
                     acc_buf.append(None)
                 acc_buf[layer_idx] = (kt.contiguous(), vt.contiguous())
@@ -166,7 +210,8 @@ class GatedGQAAttention(nn.Module):
             # standalone/decode paths use applies the sigmoid output gate PER verify
             # token before the single o_proj. Committing every verify token's K/V
             # (accepted-token KV, #235) is done inside ``_verify_batched``.
-            out = GQAAttention._verify_batched(self, q, k, v, ctx, layer_idx)
+            cache_k, cache_v = _paged_cache_kv(k, v)
+            out = GQAAttention._verify_batched(self, q, cache_k, cache_v, ctx, layer_idx)
             out = out.transpose(1, 2)  # [B,H,S,D] -> [B,S,nh,hd]
             return self._gate_and_project(out, gate, B, S)
 
@@ -180,7 +225,8 @@ class GatedGQAAttention(nn.Module):
             # It returns [B, H, 1, D]; transpose to token-major [B, 1, H, D] so the
             # SAME `_gate_and_project` the standalone paths use applies the sigmoid
             # output gate before o_proj — identical gate math to the ModelRunner path.
-            out = GQAAttention._decode_batched(self, q, k, v, ctx, layer_idx)
+            cache_k, cache_v = _paged_cache_kv(k, v)
+            out = GQAAttention._decode_batched(self, q, cache_k, cache_v, ctx, layer_idx)
             out = out.transpose(1, 2)  # [B,H,1,D] -> [B,1,H,D] = [B,S,nh,hd]
             return self._gate_and_project(out, gate, B, S)
 
@@ -196,7 +242,10 @@ class GatedGQAAttention(nn.Module):
 
     def _gate_and_project(self, out, gate, B, S):
         """out, gate: [B, S, nh, hd]. Apply sigmoid gate, merge heads, o_proj."""
-        out = out * torch.sigmoid(gate.to(out.dtype))
+        # Paged decode is fp16-only on sm70, while bf16-native models keep their
+        # residual stream (and projection input) in bf16. Restore that model dtype
+        # after the paged kernel instead of leaking fp16 into the next RMSNorm.
+        out = out.to(gate.dtype) * torch.sigmoid(gate)
         out = out.reshape(B, S, self.nh * self.hd)
         return self.o_proj(out)
 

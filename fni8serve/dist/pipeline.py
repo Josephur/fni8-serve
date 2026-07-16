@@ -352,7 +352,8 @@ def make_pipeline(
     # complete model on BOTH GPUs, so a model larger than one card could never enter
     # the supposedly sharded path and quantized QTensor attrs did not move at all.
     model: Any = build_model(cfg, weights)
-    backbone: Any = model.model
+    # Most families expose a `.model` backbone; Qwen3.5 is itself the backbone.
+    backbone: Any = getattr(model, "model", model)
     module_groups: list[list[nn.Module]] = []
     for stage_id in range(n_stages):
         start, end = bounds[stage_id : stage_id + 2]

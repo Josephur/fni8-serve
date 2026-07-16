@@ -76,6 +76,30 @@ def _sd(cfg: ModelConfig):
 
 
 class TestMakePipeline:
+    @two_gpus
+    @cuda_only
+    def test_make_pipeline_accepts_direct_backbone_models(self, monkeypatch):
+        """Qwen3.5 exposes layers on the CausalLM itself, without `.model`."""
+        import fni8serve.dist.pipeline as pipeline
+
+        cfg = _cfg(n_layers=2)
+
+        class DirectBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+                self.layers = torch.nn.ModuleList(
+                    [torch.nn.Linear(cfg.hidden_size, cfg.hidden_size) for _ in range(2)]
+                )
+                self.norm = torch.nn.LayerNorm(cfg.hidden_size)
+                self.lm_head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+
+        monkeypatch.setattr(pipeline, "build_model", lambda _cfg, _weights: DirectBackbone())
+        stages = pipeline.make_pipeline(cfg, {}, devices=(0, 1), max_num_seqs=1, max_len=16)
+
+        assert len(stages) == 2
+        assert stages[0].embed is not None and stages[1].lm_head is not None
+
     @three_gpus
     @cuda_only
     def test_make_pipeline_supports_three_stage_capacity(self):
