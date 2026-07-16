@@ -26,18 +26,20 @@ except ImportError:
 
 import torch
 
+from bench.metrics import summarize_generation_steps
+
 print(
     f"torch {torch.__version__}, CUDA {torch.cuda.is_available()}, "
     f"device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}"
 )
 
 # ── Step 1: verify fni8.linear_q4k imports ──────────────────────────────────
-import fni8
+import fni8  # noqa: E402
 
 assert hasattr(fni8, "linear_q4k"), "fni8.linear_q4k NOT available — fused kernel missing"
-print(f"[check] fni8.linear_q4k available (fused Q4_K dp4a kernel)")
+print("[check] fni8.linear_q4k available (fused Q4_K dp4a kernel)")
 
-from fni8serve.layers.linear import _FNI8_HAS_Q4K
+from fni8serve.layers.linear import _FNI8_HAS_Q4K  # noqa: E402
 
 print(f"[check] _FNI8_HAS_Q4K = {_FNI8_HAS_Q4K}")
 
@@ -45,7 +47,11 @@ print(f"[check] _FNI8_HAS_Q4K = {_FNI8_HAS_Q4K}")
 GGUF_PATH = "/flint8_work/Qwen3.5-9B-UD-Q4_K_XL.gguf"
 assert os.path.exists(GGUF_PATH), f"GGUF not found: {GGUF_PATH}"
 
-from fni8serve.gguf_native import gguf_config, load_gguf_engine
+from fni8serve.gguf_native import (  # noqa: E402
+    _native_kquant_types,
+    gguf_config,
+    load_gguf_engine,
+)
 
 t0 = time.perf_counter()
 cfg = gguf_config(GGUF_PATH)
@@ -82,7 +88,8 @@ t_load = time.perf_counter() - t0
 print(f"[load] engine built in {t_load:.2f}s")
 
 # Report native vs fallback path
-print(f"[load] native_types={'Q4_K' if _FNI8_HAS_Q4K else '(none — int8 fallback)'}")
+native_types = _native_kquant_types()
+print(f"[load] native_types={','.join(native_types) or '(none — int8 fallback)'}")
 
 # CUDA graph status
 runner = engine.runner
@@ -90,7 +97,7 @@ gd = getattr(runner, "graphed", None)
 if gd is not None:
     print(f"[graph] GraphedDecode supported={gd.supported}, reason={gd._unsupported_reason}")
 else:
-    print(f"[graph] no GraphedDecode on runner")
+    print("[graph] no GraphedDecode on runner")
 
 # ── Step 3: benchmark decode ────────────────────────────────────────────────
 PROMPT_LEN = 256
@@ -100,7 +107,7 @@ NEW_TOKENS = 128
 # Use token 1 (typically a valid token in most tokenizers)
 prompt_ids = [1] * PROMPT_LEN
 
-from fni8serve.engine.sequence import SamplingParams
+from fni8serve.engine.sequence import SamplingParams  # noqa: E402
 
 print(f"\n[bench] prompt_len={PROMPT_LEN}, new_tokens={NEW_TOKENS}")
 
@@ -114,34 +121,39 @@ engine.forget(wid)
 torch.cuda.synchronize()
 print("[bench] warmup done")
 
-# Actual benchmark — use generate() which handles prefill + decode correctly
+# Actual benchmark — time each scheduler step so prefill and lazy graph capture
+# cannot be mislabeled as steady decode.
 torch.cuda.reset_peak_memory_stats()
-t0_total = time.perf_counter()
-
-outputs = engine.generate([prompt_ids], SamplingParams(max_tokens=NEW_TOKENS, temperature=0.0))
-output_ids = outputs[0] if outputs else []
-
-torch.cuda.synchronize()
-t_total = time.perf_counter() - t0_total
+request_id = engine.add_request(
+    prompt_ids, SamplingParams(max_tokens=NEW_TOKENS, temperature=0.0, ignore_eos=True)
+)
+step_times = []
+while engine.scheduler.has_work():
+    t0 = time.perf_counter()
+    engine.step()
+    torch.cuda.synchronize()
+    step_times.append(time.perf_counter() - t0)
+output_ids = list(engine._out[request_id].output_ids)
+summary = summarize_generation_steps(step_times, warmup_decode_steps=1)
 peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
 
 # ── Step 4: report ──────────────────────────────────────────────────────────
 print(f"\n[debug] output_ids ({len(output_ids)} tokens): {output_ids[:30]}")
 
-# Steady-state estimate: total_time / num_tokens
-tok_per_sec = len(output_ids) / t_total if t_total > 0 and output_ids else 0
-
 print(f"\n{'=' * 60}")
-print(f"RESULTS: Qwen3.5-9B GGUF-native decode")
+print("RESULTS: Qwen3.5-9B GGUF-native decode")
 print(f"{'=' * 60}")
-print(f"  Decode tok/s (end-to-end):    {tok_per_sec:.1f}")
-print(f"  Target:                        69")
-print(f"  vs target:                     {tok_per_sec / 69 * 100:.1f}%")
+print(f"  Steady decode tok/s:           {summary['steady_decode_tok_s']:.1f}")
+print(f"  End-to-end tok/s:              {summary['end_to_end_tok_s']:.1f}")
+print(f"  Prefill:                       {summary['prefill_s']:.3f}s")
+print(f"  Lazy graph capture:            {summary['graph_capture_s']:.3f}s")
+print("  Target:                        69")
+print(f"  steady vs target:              {summary['steady_decode_tok_s'] / 69 * 100:.1f}%")
 print(f"  Output tokens:                 {len(output_ids)}")
-print(f"  Total time:                    {t_total:.2f}s")
+print(f"  Total time:                    {summary['total_s']:.2f}s")
 print(f"  Peak VRAM:                     {peak_vram:.2f} GB")
 print(f"  VRAM < 16GB:                   {'YES' if peak_vram < 16.0 else 'NO — OVER BUDGET'}")
-print(f"  Native Q4_K path:              {'YES' if _FNI8_HAS_Q4K else 'NO (int8 fallback)'}")
+print(f"  Native k-quant types:           {','.join(native_types) or 'none'}")
 print(f"  CUDA graphs:                   {'ON' if gd and gd.supported else 'OFF'}")
 
 # Coherence check: decode output should be non-empty, non-repetitive
@@ -151,7 +163,7 @@ if output_ids:
     coherent = unique > len(output_ids) * 0.1
     print(f"  Coherent:                      {'YES' if coherent else 'NO — likely garbage'}")
 else:
-    print(f"  Coherent:                      NO — empty output!")
+    print("  Coherent:                      NO — empty output!")
 
 # Verbatim output if short enough
 if len(output_ids) <= 200:
