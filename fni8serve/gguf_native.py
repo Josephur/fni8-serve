@@ -24,6 +24,8 @@ It removes NO `.fni8` code (that is P5); the loader simply branches on file suff
 from __future__ import annotations
 
 import json
+import struct
+import sys
 
 import numpy as np
 import torch
@@ -147,10 +149,102 @@ class _KV:
 
 
 def _open_gguf(path: str):
-    """Open one GGUF reader for all header and tensor phases of a cold load."""
-    from gguf import GGUFReader
+    """Open one reader without materializing unused tokenizer-array objects.
 
-    return GGUFReader(path)
+    llama.cpp's reader represents every vocabulary token, score, type, and merge as
+    a separate NumPy view plus Python list entry.  Qwen's 248k-token metadata then
+    costs tens of seconds before the first weight is touched.  The serving loader
+    needs only the token-array length, so retain compact ``range`` metadata and scan
+    variable-length strings directly from the mmap.
+    """
+    from gguf import GGUFReader
+    from gguf.constants import GGUFValueType
+    from gguf.gguf_reader import ReaderField
+
+    class _ServingGGUFReader(GGUFReader):
+        _SKIP_ARRAYS = {
+            "tokenizer.ggml.tokens",
+            "tokenizer.ggml.scores",
+            "tokenizer.ggml.token_type",
+            "tokenizer.ggml.merges",
+        }
+
+        def _build_fields(self, offs: int, count: int) -> int:
+            for _ in range(count):
+                orig_offs = offs
+                kv_klen, kv_kdata = self._get_str(offs)
+                offs += int(kv_klen.nbytes + kv_kdata.nbytes)
+                raw_kv_type = self._get(offs, np.uint32)
+                offs += int(raw_kv_type.nbytes)
+                name = str(bytes(kv_kdata), encoding="utf-8")
+
+                if (
+                    name in self._SKIP_ARRAYS
+                    and GGUFValueType(int(raw_kv_type[0])) == GGUFValueType.ARRAY
+                ):
+                    raw_item_type = self._get(offs, np.uint32)
+                    array_len = self._get(offs + 4, np.uint64)
+                    n = int(array_len[0])
+                    item_type = GGUFValueType(int(raw_item_type[0]))
+                    pos = offs + 12
+                    if item_type == GGUFValueType.STRING:
+                        fmt = ">Q" if self.byte_order == "S" and sys.byteorder == "little" else "<Q"
+                        for _idx in range(n):
+                            size = struct.unpack_from(fmt, self.data, pos)[0]
+                            pos += 8 + size
+                    else:
+                        np_type = self.gguf_scalar_to_np.get(item_type)
+                        if np_type is None:
+                            # Unknown/nested arrays retain the upstream reader's
+                            # complete representation rather than guessing layout.
+                            field_size, field_parts, field_idxs, field_types = (
+                                self._get_field_parts(offs, raw_kv_type[0])
+                            )
+                            parts = [kv_klen, kv_kdata, raw_kv_type, *field_parts]
+                            self._push_field(
+                                ReaderField(
+                                    orig_offs,
+                                    name,
+                                    parts,
+                                    [idx + 3 for idx in field_idxs],
+                                    field_types,
+                                ),
+                                skip_sum=True,
+                            )
+                            offs += field_size
+                            continue
+                        pos += n * np.dtype(np_type).itemsize
+                    self._push_field(
+                        ReaderField(
+                            orig_offs,
+                            name,
+                            [kv_klen, kv_kdata, raw_kv_type, raw_item_type, array_len],
+                            range(n),
+                            [GGUFValueType.ARRAY, item_type],
+                        ),
+                        skip_sum=True,
+                    )
+                    offs = pos
+                    continue
+
+                field_size, field_parts, field_idxs, field_types = self._get_field_parts(
+                    offs, raw_kv_type[0]
+                )
+                parts = [kv_klen, kv_kdata, raw_kv_type, *field_parts]
+                self._push_field(
+                    ReaderField(
+                        orig_offs,
+                        name,
+                        parts,
+                        [idx + 3 for idx in field_idxs],
+                        field_types,
+                    ),
+                    skip_sum=True,
+                )
+                offs += field_size
+            return offs
+
+    return _ServingGGUFReader(path)
 
 
 def gguf_config(path: str, *, _reader=None) -> ModelConfig:
