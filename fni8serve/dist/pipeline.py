@@ -215,23 +215,24 @@ def _unpack_boundary(packed: torch.Tensor, hidden_size: int):
     return packed[..., :hidden_size], packed[..., hidden_size:]
 
 
-def _detach_shared_stage_modules(stage0_modules: list[nn.Module], stage1_modules: list[nn.Module]):
-    """Give stage 1 one copy of buffer-bearing modules shared across stage roots.
+def _detach_shared_stage_modules(stage_modules: list[list[nn.Module]]):
+    """Give every stage one copy of buffer-bearing modules shared across roots.
 
     Model builders intentionally share one RoPE table across every layer. Moving the
-    two layer slices independently would otherwise move that same table from GPU 0 to
-    GPU 1 and leave stage 0 with a cross-device reference.
+    layer slices independently would otherwise move that same table to the final GPU
+    and leave earlier stages with cross-device references.
     """
-    ids0 = {id(m) for root in stage0_modules for m in root.modules()}
-    ids1 = {id(m) for root in stage1_modules for m in root.modules()}
-    shared = ids0 & ids1
-    replacements: dict[int, nn.Module] = {}
-    for root in stage1_modules:
-        for parent in root.modules():
-            for name, child in list(parent.named_children()):
-                if id(child) in shared:
-                    replacement = replacements.setdefault(id(child), copy.deepcopy(child))
-                    setattr(parent, name, replacement)
+    owner: dict[int, int] = {}
+    for stage_id, roots in enumerate(stage_modules):
+        replacements: dict[int, nn.Module] = {}
+        for root in roots:
+            for parent in root.modules():
+                for name, child in list(parent.named_children()):
+                    child_id = id(child)
+                    first_stage = owner.setdefault(child_id, stage_id)
+                    if first_stage != stage_id:
+                        replacement = replacements.setdefault(child_id, copy.deepcopy(child))
+                        setattr(parent, name, replacement)
 
 
 def _move_stage_module(module: nn.Module, device: str) -> nn.Module:
@@ -280,6 +281,7 @@ class PipelineStage:
         kv_cache: PagedKVCache,
         lin_cache=None,
         layer_offset: int = 0,
+        num_stages: int = 2,
     ):
         self.stage_id = stage_id
         self.embed = embed
@@ -289,6 +291,7 @@ class PipelineStage:
         self.kv_cache: PagedKVCache = kv_cache
         self.lin_cache = lin_cache or RecurrentStateCache()
         self.layer_offset = layer_offset
+        self.num_stages = num_stages
         self._remapped_cache: LayerRemappedCache | None = None
 
     @property
@@ -297,7 +300,7 @@ class PipelineStage:
 
     @property
     def is_last(self) -> bool:
-        return True  # 2-stage: stage 0 is not last, stage 1 is. Override for >2 stages.
+        return self.stage_id == self.num_stages - 1
 
     @property
     def _device(self):
@@ -324,20 +327,25 @@ def make_pipeline(
     cfg: ModelConfig,
     weights: dict,
     *,
-    devices: tuple[int, int] = (0, 1),
+    devices: tuple[int, ...] = (0, 1),
     max_num_seqs: int = 16,
     max_len: int = 2048,
     block_size: int = 16,
-) -> tuple[PipelineStage, PipelineStage]:
-    """Build a 2-stage pipeline from *cfg* and *weights*.
+) -> tuple[PipelineStage, ...]:
+    """Build contiguous stage-local pipeline slices on two or more GPUs.
 
     The weights dict must contain tensors on CPU (or the same device for each stage)
     so `build_model` can place them on the correct GPU via post-build .to().
 
-    Returns (stage_0, stage_1).
+    Returns one :class:`PipelineStage` per device.
     """
     n_layers = cfg.num_hidden_layers
-    mid = max(1, n_layers // 2)
+    n_stages = len(devices)
+    if n_stages < 2:
+        raise ValueError("pipeline parallelism needs at least two devices")
+    if n_stages > n_layers:
+        raise ValueError("pipeline stage count cannot exceed the model layer count")
+    bounds = [i * n_layers // n_stages for i in range(n_stages + 1)]
 
     # Assemble once on CPU, split the module graph, then move only each stage's
     # parameters/buffers/QTensor payloads. The previous implementation built the
@@ -345,60 +353,48 @@ def make_pipeline(
     # the supposedly sharded path and quantized QTensor attrs did not move at all.
     model: Any = build_model(cfg, weights)
     backbone: Any = model.model
-    first_modules = [backbone.embed_tokens, *list(backbone.layers[:mid])]
-    last_modules = [*list(backbone.layers[mid:]), backbone.norm, model.lm_head]
-    _detach_shared_stage_modules(first_modules, last_modules)
-    dev0, dev1 = (f"cuda:{dev}" for dev in devices)
-    for module in first_modules:
-        _move_stage_module(module, dev0)
-        module.eval()
-    for module in last_modules:
-        _move_stage_module(module, dev1)
-        module.eval()
+    module_groups: list[list[nn.Module]] = []
+    for stage_id in range(n_stages):
+        start, end = bounds[stage_id : stage_id + 2]
+        group = list(backbone.layers[start:end])
+        if stage_id == 0:
+            group.insert(0, backbone.embed_tokens)
+        if stage_id == n_stages - 1:
+            group.extend([backbone.norm, model.lm_head])
+        module_groups.append(group)
+    _detach_shared_stage_modules(module_groups)
 
-    stage0 = PipelineStage(
-        0,
-        embed=backbone.embed_tokens,
-        layers=[backbone.layers[i] for i in range(mid)],
-        layer_offset=0,
-        kv_cache=_build_stage_cache(
-            mid,
-            max_num_seqs,
-            cfg.num_key_value_heads,
-            max_len,
-            cfg.resolved_head_dim(),
-            device=devices[0],
-            block_size=block_size,
-        ),
-    )
-
-    stage1 = PipelineStage(
-        1,
-        layers=[backbone.layers[i] for i in range(mid, n_layers)],
-        norm=backbone.norm,
-        lm_head=model.lm_head,
-        layer_offset=mid,
-        kv_cache=_build_stage_cache(
-            n_layers - mid,
-            max_num_seqs,
-            cfg.num_key_value_heads,
-            max_len,
-            cfg.resolved_head_dim(),
-            device=devices[1],
-            block_size=block_size,
-        ),
-    )
-
-    return stage0, stage1
+    stages = []
+    for stage_id, (device, modules) in enumerate(zip(devices, module_groups)):
+        start, end = bounds[stage_id : stage_id + 2]
+        for module in modules:
+            _move_stage_module(module, f"cuda:{device}")
+            module.eval()
+        stages.append(
+            PipelineStage(
+                stage_id,
+                embed=backbone.embed_tokens if stage_id == 0 else None,
+                layers=list(backbone.layers[start:end]),
+                norm=backbone.norm if stage_id == n_stages - 1 else None,
+                lm_head=model.lm_head if stage_id == n_stages - 1 else None,
+                layer_offset=start,
+                num_stages=n_stages,
+                kv_cache=_build_stage_cache(
+                    end - start,
+                    max_num_seqs,
+                    cfg.num_key_value_heads,
+                    max_len,
+                    cfg.resolved_head_dim(),
+                    device=device,
+                    block_size=block_size,
+                ),
+            )
+        )
+    return tuple(stages)
 
 
 class PipelineEngine:
-    """Pipeline-parallel inference for 2 GPUs.
-
-    Wraps two PipelineStages and a scheduler. Prefill runs stage 0 first, then
-    transfers hidden/residual to stage 1. Decode micro-batches the scheduled
-    batch so the PP-boundary transfer overlaps with compute on both GPUs.
-    """
+    """Pipeline-parallel inference for two contiguous GPU stages."""
 
     def __init__(
         self,

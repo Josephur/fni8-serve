@@ -24,6 +24,7 @@ cuda_only = pytest.mark.skipif(not CUDA, reason="pipeline needs CUDA + fni8")
 
 NUM_GPUS = torch.cuda.device_count() if CUDA else 0
 two_gpus = pytest.mark.skipif(NUM_GPUS < 2, reason="needs >= 2 GPUs for PP")
+three_gpus = pytest.mark.skipif(NUM_GPUS < 3, reason="needs >= 3 GPUs for PP")
 
 
 def _cfg(n_layers: int = 2):
@@ -75,6 +76,26 @@ def _sd(cfg: ModelConfig):
 
 
 class TestMakePipeline:
+    @three_gpus
+    @cuda_only
+    def test_make_pipeline_supports_three_stage_capacity(self):
+        """A model larger than two cards must split across three stage-local slices."""
+        cfg = _cfg(n_layers=6)
+        stages = make_pipeline(
+            cfg, _sd(cfg), devices=(0, 1, 2), max_num_seqs=4, max_len=64
+        )
+
+        assert len(stages) == 3
+        assert [len(stage.layers) for stage in stages] == [2, 2, 2]
+        assert [stage.layer_offset for stage in stages] == [0, 2, 4]
+        assert [stage._device.index for stage in stages] == [0, 1, 2]
+        assert stages[0].is_first and not stages[0].is_last
+        assert not stages[1].is_first and not stages[1].is_last
+        assert stages[2].is_last
+        for expected_device, stage in enumerate(stages):
+            qweight = stage.layers[0].self_attn.qkv_proj.weight.data
+            assert qweight.device.index == expected_device
+
     @two_gpus
     @cuda_only
     def test_make_pipeline_builds_backbone_once(self, monkeypatch):
