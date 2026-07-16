@@ -1,7 +1,27 @@
 # SPDX-License-Identifier: MIT
 """Regression tests for honest prefill/decode benchmark accounting."""
 
-from bench.metrics import summarize_generation_steps
+import pytest
+
+from bench.metrics import env_flag, summarize_generation_steps
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_env_flag_accepts_explicit_true_values(monkeypatch, value):
+    monkeypatch.setenv("FNI8_TEST_FLAG", value)
+    assert env_flag("FNI8_TEST_FLAG") is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off"])
+def test_env_flag_accepts_explicit_false_values(monkeypatch, value):
+    monkeypatch.setenv("FNI8_TEST_FLAG", value)
+    assert env_flag("FNI8_TEST_FLAG", default=True) is False
+
+
+def test_env_flag_rejects_ambiguous_values(monkeypatch):
+    monkeypatch.setenv("FNI8_TEST_FLAG", "maybe")
+    with pytest.raises(ValueError, match="FNI8_TEST_FLAG"):
+        env_flag("FNI8_TEST_FLAG")
 
 
 def test_generation_summary_does_not_call_prefill_decode_throughput():

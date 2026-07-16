@@ -3,7 +3,21 @@
 
 from __future__ import annotations
 
+import os
 import statistics
+
+
+def env_flag(name: str, *, default: bool = False) -> bool:
+    """Parse an explicit boolean environment knob without truthy-string traps."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be one of 1/0, true/false, yes/no, or on/off")
 
 
 def summarize_generation_steps(
