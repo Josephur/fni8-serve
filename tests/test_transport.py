@@ -20,7 +20,9 @@ from fni8serve.dist import TransferHandle, accuracy_report, recv, send
 CUDA = torch.cuda.is_available()
 cuda_only = pytest.mark.skipif(not CUDA, reason="transport needs CUDA + fni8")
 NUM_GPUS = torch.cuda.device_count() if CUDA else 0
-two_gpus = pytest.mark.skipif(NUM_GPUS < 2, reason="needs >= 2 GPUs for P2P")
+two_gpus = pytest.mark.skipif(NUM_GPUS < 2, reason="needs >= 2 GPUs")
+PEER_0_TO_1 = NUM_GPUS >= 2 and torch.cuda.can_device_access_peer(0, 1)
+p2p_0_to_1 = pytest.mark.skipif(not PEER_0_TO_1, reason="CUDA peer access 0 -> 1 unavailable")
 
 
 # ── test helpers ────────────────────────────────────────────────────────────
@@ -278,6 +280,7 @@ class TestSendRecvMultiGpu:
 
     @two_gpus
     @cuda_only
+    @p2p_0_to_1
     def test_used_p2p_when_peers_accessible(self):
         """P2P path must be selected when GPUs have direct peer access."""
         src, dst = 0, 1
@@ -288,6 +291,7 @@ class TestSendRecvMultiGpu:
 
     @two_gpus
     @cuda_only
+    @p2p_0_to_1
     def test_fp16_p2p_bit_exact(self):
         """fp16 round-trip across GPUs via P2P must be bit-exact (lossless codec)."""
         src, dst = 0, 1
@@ -307,8 +311,7 @@ class TestSendRecvMultiGpu:
         """When peer access is unavailable, a cross-GPU send must fall back to
         host-staging (used_p2p False) and still round-trip with fidelity.
 
-        The fleet's GPUs do have peer access, so we force the no-peer branch by
-        patching the capability probe — this genuinely exercises the
+        Force the no-peer branch so peer-capable CI also exercises the
         GPU→pinned-host→GPU fallback copy across two distinct devices.
         """
         import fni8serve.dist as dist_mod

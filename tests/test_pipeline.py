@@ -265,6 +265,59 @@ class TestPipelineOutputMatchesSingleGpu:
 
         assert engine.generate([prompt], params)[0] == ref
 
+    @pytest.mark.parametrize("depth", [2, 3, 4, 6])
+    @cuda_only
+    def test_fixed_model_matches_single_gpu_at_arbitrary_depth(self, depth):
+        """The generalized pipeline keeps one fixed model correct through six stages."""
+        if NUM_GPUS < depth:
+            pytest.skip(f"needs >= {depth} GPUs")
+
+        torch.manual_seed(204)
+        cfg = _cfg(n_layers=12)
+        state = _sd(cfg)
+        prompt = [3, 1, 4, 1, 5]
+        params = SamplingParams(temperature=0.0, max_tokens=3)
+        reference = LLMEngine(
+            cfg,
+            {name: value.clone().to("cuda:0") for name, value in state.items()},
+            device="cuda:0",
+            max_num_seqs=4,
+            max_len=64,
+        )
+        expected = reference.generate([prompt], params)[0]
+        del reference
+        torch.cuda.empty_cache()
+
+        devices = tuple(range(depth))
+        stages = make_pipeline(
+            cfg,
+            state,
+            devices=devices,
+            max_num_seqs=4,
+            max_len=64,
+        )
+        layers_per_stage = 12 // depth
+        assert [len(stage.layers) for stage in stages] == [layers_per_stage] * depth
+        assert [stage.layer_offset for stage in stages] == list(
+            range(0, 12, layers_per_stage)
+        )
+        assert [stage._device.index for stage in stages] == list(devices)
+        assert all(stage.kv_cache.has_free_slot() for stage in stages)
+
+        engine = PipelineEngine.from_stages(
+            stages,
+            cfg,
+            max_num_seqs=4,
+            max_len=64,
+            wire_scheme="fp16",
+        )
+        actual = engine.generate([prompt], params)[0]
+        repeated = engine.generate([prompt], params)[0]
+
+        assert actual == expected
+        assert repeated == expected
+        assert all(stage.kv_cache.has_free_slot() for stage in stages)
+
     @two_gpus
     @cuda_only
     def test_same_output_single_prompt(self):
