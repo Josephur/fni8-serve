@@ -35,9 +35,7 @@ _LTX_DIT = "/mnt/24tb/containers-archive/wan2gp/ckpts/ltx-2.3-22b-distilled-Q4_K
 
 _HAVE_GGUF = pytest.importorskip("gguf", reason="gguf lib required for native loader")
 
-requires_qwen35 = pytest.mark.skipif(
-    not os.path.exists(_QWEN35_9B), reason=f"missing {_QWEN35_9B}"
-)
+requires_qwen35 = pytest.mark.skipif(not os.path.exists(_QWEN35_9B), reason=f"missing {_QWEN35_9B}")
 requires_qwen3 = pytest.mark.skipif(not os.path.exists(_QWEN3_8B), reason=f"missing {_QWEN3_8B}")
 requires_ltx = pytest.mark.skipif(not os.path.exists(_LTX_DIT), reason=f"missing {_LTX_DIT}")
 
@@ -63,14 +61,60 @@ def test_gguf_engine_consumes_owned_weights(monkeypatch):
         def __init__(self, passed_cfg, passed_weights, **kwargs):
             seen.update(cfg=passed_cfg, weights=passed_weights, kwargs=kwargs)
 
-    monkeypatch.setattr(native, "gguf_config", lambda _path: cfg)
+    monkeypatch.setattr(native, "_open_gguf", lambda _path: object())
+    monkeypatch.setattr(native, "gguf_config", lambda _path, **_kwargs: cfg)
     monkeypatch.setattr(native, "gguf_state_dict", lambda *_args, **_kwargs: weights)
     monkeypatch.setattr(native, "_native_kquant_types", lambda: set())
-    monkeypatch.setattr(native, "_gguf_eos_id", lambda _path: 1)
+    monkeypatch.setattr(native, "_gguf_eos_id", lambda _path, **_kwargs: 1)
     monkeypatch.setattr(fni8serve.engine, "LLMEngine", FakeEngine)
 
     native.load_gguf_engine("model.gguf", device="cpu")
     assert seen["kwargs"]["consume_weights"] is True
+
+
+def test_gguf_engine_reuses_one_reader(monkeypatch):
+    """A cold load must not parse the multi-GB GGUF header three separate times."""
+    from types import SimpleNamespace
+
+    import fni8serve.engine
+    import fni8serve.gguf_native as native
+
+    reader = object()
+    opened = []
+    observed = []
+    cfg = SimpleNamespace(
+        arch="qwen3",
+        hidden_size=4,
+        linear_attention=False,
+        qk_norm=False,
+        num_mtp_layers=0,
+    )
+    monkeypatch.setattr(native, "_open_gguf", lambda path: opened.append(path) or reader)
+    monkeypatch.setattr(
+        native,
+        "gguf_config",
+        lambda path, *, _reader=None: observed.append(("config", _reader)) or cfg,
+    )
+    monkeypatch.setattr(
+        native,
+        "gguf_state_dict",
+        lambda path, *, device, native_types, _reader=None: (
+            observed.append(("weights", _reader))
+            or {"model.embed_tokens.weight": torch.zeros(8, 4)}
+        ),
+    )
+    monkeypatch.setattr(
+        native,
+        "_gguf_eos_id",
+        lambda path, *, _reader=None: observed.append(("eos", _reader)) or 1,
+    )
+    monkeypatch.setattr(native, "_native_kquant_types", lambda: ())
+    monkeypatch.setattr(fni8serve.engine, "LLMEngine", lambda *args, **kwargs: object())
+
+    native.load_gguf_engine("model.gguf", device="cpu")
+
+    assert opened == ["model.gguf"]
+    assert observed == [("config", reader), ("weights", reader), ("eos", reader)]
 
 
 @pytest.mark.correctness
