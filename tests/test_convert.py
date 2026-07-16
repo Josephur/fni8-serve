@@ -213,6 +213,92 @@ def test_convert_persists_extra_for_divergent_families(tmp_path):
     assert via_ctor.extra.get("conv_L_cache") == 3
 
 
+def test_qwen3_5_separate_deltanet_full_config_roundtrip(tmp_path, monkeypatch):
+    """A converted Qwen3.5 checkpoint is self-contained, without load shims.
+
+    Qwen3.5 uses separate DeltaNet projections rather than Qwen3-Next's fused
+    projections.  Exercise the real HF -> .fni8 -> config/state-dict path so a
+    regression in either the tensor remap or metadata serialization is caught.
+    """
+    pytest.importorskip("safetensors")
+    from safetensors.torch import save_file
+
+    import fni8serve.convert as convert_mod
+    import fni8serve.models.config as config_mod
+
+    hidden = 32
+    num_key_heads = num_value_heads = 2
+    key_head_dim = value_head_dim = 8
+    qkv_dim = 2 * num_key_heads * key_head_dim + num_value_heads * value_head_dim
+    linear = "model.layers.0.linear_attn"
+    source = {
+        f"{linear}.in_proj_qkv.weight": torch.randn(qkv_dim, hidden),
+        f"{linear}.in_proj_z.weight": torch.randn(num_value_heads * value_head_dim, hidden),
+        f"{linear}.in_proj_b.weight": torch.randn(num_value_heads, hidden),
+        f"{linear}.in_proj_a.weight": torch.randn(num_value_heads, hidden),
+        f"{linear}.conv1d.weight": torch.randn(qkv_dim, 1, 4),
+    }
+    save_file(source, str(tmp_path / "model.safetensors"))
+    hf_config = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "vocab_size": 64,
+        "hidden_size": hidden,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "intermediate_size": 64,
+        "max_position_embeddings": 128,
+        "head_dim": 8,
+        "layer_types": [
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ],
+        "linear_num_key_heads": num_key_heads,
+        "linear_num_value_heads": num_value_heads,
+        "linear_key_head_dim": key_head_dim,
+        "linear_value_head_dim": value_head_dim,
+        "linear_conv_kernel_dim": 4,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(hf_config))
+
+    output = tmp_path / "model.fni8"
+    convert_mod.convert_hf_to_fni8(str(tmp_path), str(output), weight_bits=8)
+
+    converted = load_fni8_state_dict(str(output), device="cpu")
+    expected_names = {
+        f"{linear}.qkv_proj.weight",
+        f"{linear}.z_proj.weight",
+        f"{linear}.beta_proj.weight",
+        f"{linear}.dt_proj.weight",
+        f"{linear}.conv_weight",
+    }
+    assert set(converted) == expected_names
+    assert not any("in_proj_" in name or "conv1d" in name for name in converted)
+    assert converted[f"{linear}.conv_weight"].shape == (qkv_dim, 4)
+
+    meta_config = checkpoint_info(str(output))["meta"]["config"]
+    # Make accidental use of the family fallback observable: the persisted
+    # pattern must still reload as interval 4, not this deliberately wrong 7.
+    monkeypatch.setitem(config_mod._HYBRID_LINEAR_DEFAULT_INTERVAL, "qwen3_5", 7)
+    reloaded = ModelConfig.from_hf(meta_config, arch=meta_config["arch"])
+    assert reloaded.extra["linear_num_key_heads"] == num_key_heads
+    assert reloaded.extra["linear_num_value_heads"] == num_value_heads
+    assert reloaded.extra["linear_key_head_dim"] == key_head_dim
+    assert reloaded.extra["linear_value_head_dim"] == value_head_dim
+    assert reloaded.extra["linear_conv_kernel_dim"] == 4
+    assert reloaded.linear_attention
+    assert reloaded.full_attention_interval == 4
+    assert [reloaded.attention_kind(i) for i in range(4)] == [
+        "linear",
+        "linear",
+        "linear",
+        "full",
+    ]
+
+
 def test_convert_hf_to_fni8_streams_shards_one_at_a_time(tmp_path, monkeypatch):
     """Regression for the 220GB-in-RAM OOM (GLM-4.5-Air): convert_hf_to_fni8 must
     quantize each safetensors shard as it's loaded rather than merging the whole
@@ -469,7 +555,6 @@ def test_qwen3_next_conv1d_trim_4part():
     """conv1d.weight with 4 parts (including Z rows) is trimmed to 3 parts."""
     cfg = _qwen3_next_cfg()
     hf_sd = _hf_fused_sd(cfg)
-    H = cfg.hidden_size
     nk = cfg.extra["linear_num_key_heads"]
     nv = cfg.extra["linear_num_value_heads"]
     kd = cfg.extra["linear_key_head_dim"]
