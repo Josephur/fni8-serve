@@ -44,9 +44,11 @@ the short version:
 | MiniMax-Text (lightning) | softmax half decodes int8; lightning half is torch — int8 prefill unwired, no lightning decode kernel yet |
 
 Multi-GPU (pipeline + MoE-expert parallelism) and MTP speculative decode are wired but
-still maturing. Tensor/FSDP parallelism is unusable here — the PCIe 1.0 x1 link is
-~3,300× slower than HBM, so cross-device tokens go through `fni8.transport` compression
-and stay on pipeline/expert boundaries only.
+still maturing. The PCIe 1.0 x1 link makes frequent dense-model collectives expensive,
+so pipeline/expert boundaries with `fni8.transport` are the default. Tensor parallelism
+is still viable for selected large sparse MoEs such as 35B-A3B when active compute and
+expert structure amortize communication; every TP configuration needs a topology-specific
+throughput measurement. FSDP-style inference remains a poor default on this fleet.
 
 ## A hardware note that bites people
 
