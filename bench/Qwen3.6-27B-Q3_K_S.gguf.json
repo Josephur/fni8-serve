@@ -43,6 +43,21 @@
     "target_fraction": 0.887,
     "target_met": false
   },
+  "representative_q3k_ncu": {
+    "artifact": "Qwen3.6-27B-Q3_K_S.gemm_decode_q3k.ncu.csv",
+    "kernel_duration_us": 172.032,
+    "compute_throughput_pct": 83.2,
+    "sm_busy_pct": 85.69,
+    "memory_throughput_pct": 74.14,
+    "dram_throughput_pct": 55.25,
+    "dram_gb_s": 462.2,
+    "achieved_occupancy_pct": 91.13,
+    "l1_hit_rate_pct": 92.11,
+    "l2_hit_rate_pct": 35.57,
+    "excessive_global_sectors": 12011520,
+    "estimated_global_load_speedup_pct": 54.55,
+    "interpretation": "Occupancy is already high; the next target is redundant/uncoalesced Q3 weight loading and unpack ALU work."
+  },
   "notes": [
     "The synthetic 256-token run is the apples-to-apples performance baseline.",
     "The natural-prompt run is a separate coherence check; ignore_eos intentionally generated a repeated special-token tail after the complete answer.",
