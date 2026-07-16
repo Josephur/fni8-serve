@@ -173,6 +173,29 @@ class TestMakePipeline:
 
 
 class TestPipelineOutputMatchesSingleGpu:
+    @two_gpus
+    @cuda_only
+    def test_decode_preserves_recurrent_state_between_steps(self, monkeypatch):
+        """Decode must bind slots without resetting DeltaNet state every token."""
+        cfg = _cfg(n_layers=2)
+        stages = make_pipeline(cfg, _sd(cfg), devices=(0, 1), max_num_seqs=4, max_len=64)
+        reset_counts = [0, 0]
+        for stage_id, stage in enumerate(stages):
+            real_reset = stage.lin_cache.reset
+
+            def counted_reset(stage_id=stage_id, real_reset=real_reset):
+                reset_counts[stage_id] += 1
+                return real_reset()
+
+            monkeypatch.setattr(stage.lin_cache, "reset", counted_reset)
+
+        engine = PipelineEngine.from_stages(
+            stages, cfg, max_num_seqs=4, max_len=64, wire_scheme="int8"
+        )
+        engine.generate([[3, 1, 4, 1, 5]], SamplingParams(temperature=0.0, max_tokens=4))
+
+        assert reset_counts == [1, 1]
+
     @three_gpus
     @cuda_only
     def test_same_output_three_stage_pipeline(self):
