@@ -4,8 +4,8 @@ name: CI
 # compiled kernels, it never rebuilds them. So instead of cloning + nvcc-compiling fni8
 # on every PR (~35 min, the old flow, and the source of the concurrent-build OOMs), we
 # run against the prebuilt `fni8-built:sm70` image (fni8 baked in, refreshed on each
-# fni8-master merge). ~3 min, no nvcc → many serve PRs can test concurrently without
-# ever touching the box's compile budget. Branch protection makes `build-test` mandatory.
+# fni8-master merge). A GitHub-hosted classifier keeps documentation/CI-only changes off
+# the Volta queue entirely. Branch protection keeps the aggregate `build-test` mandatory.
 
 on:
   pull_request:
@@ -16,7 +16,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-test:                       # <- required status check name; keep it
+  changes:
+    name: classify changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - '*.py'
+              - 'fni8serve/**'
+              - 'tests/**'
+              - 'bench/**'
+              - 'examples/**'
+              - 'scripts/**'
+              - 'tools/**'
+              - 'docker/**'
+              - 'pyproject.toml'
+
+  runtime-test:
+    name: serving tests
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, volta-gpu]
     timeout-minutes: 20
     steps:
@@ -51,3 +76,22 @@ jobs:
                 --index-url https://download.pytorch.org/whl/cu129 -q
               pytest -q
             '
+
+  build-test:
+    name: build-test
+    needs: [changes, runtime-test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Preserve the required gate
+        env:
+          CHANGE_RESULT: ${{ needs.changes.result }}
+          CODE_CHANGED: ${{ needs.changes.outputs.code }}
+          RUNTIME_RESULT: ${{ needs.runtime-test.result }}
+        run: |
+          test "$CHANGE_RESULT" = success
+          if [ "$CODE_CHANGED" = true ]; then
+            test "$RUNTIME_RESULT" = success
+          else
+            echo "Documentation/CI-only change: Volta lane skipped"
+          fi
