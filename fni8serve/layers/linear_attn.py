@@ -191,6 +191,7 @@ class GatedDeltaNetAttention(nn.Module):
         value_dim,
         conv_kernel=4,
         z_proj: QTensor | None = None,
+        gate_beta_proj: QTensor | None = None,
     ):
         super().__init__()
         self.nk, self.nv = num_k_heads, num_v_heads
@@ -198,14 +199,23 @@ class GatedDeltaNetAttention(nn.Module):
         self.conv_kernel = conv_kernel
         self.qkv_proj = LinearW8A8(qkv_proj)
         self.out_proj = LinearW8A8(out_proj)
-        self.beta_proj = LinearW8A8(beta_proj)
-        self.gate_proj = LinearW8A8(gate_proj)
+        if gate_beta_proj is not None:
+            self.gate_beta_proj = LinearW8A8(gate_beta_proj)
+        else:
+            self.beta_proj = LinearW8A8(beta_proj)
+            self.gate_proj = LinearW8A8(gate_proj)
         if z_proj is not None:
             self.z_proj = LinearW8A8(z_proj)
         self.register_buffer("conv_weight", conv_weight, persistent=False)  # [Wc, K]
         self.A_log = nn.Parameter(a_log)
         self.dt_bias = nn.Parameter(dt_bias)
         self.norm = RMSNorm(value_dim, cfg.rms_norm_eps, norm_gain)
+
+    def _project_gate_beta(self, hidden):
+        """Project raw dt/gate and beta logits, using one GEMM when weights are fused."""
+        if hasattr(self, "gate_beta_proj"):
+            return self.gate_beta_proj(hidden).split([self.nv, self.nv], dim=-1)
+        return self.gate_proj(hidden), self.beta_proj(hidden)
 
     def _conv(self, x, tail=None, return_traj=False):
         """Causal depthwise conv1d(k) + SiLU. x: [B, L, Wc]. `tail`: optional
@@ -284,8 +294,9 @@ class GatedDeltaNetAttention(nn.Module):
         qf = q.reshape(B, self.nk, 1, self.kd).float()
         kf = k.reshape(B, self.nk, 1, self.kd).float()
         vf = v.reshape(B, self.nv, 1, self.vd).float()
-        dt_f = self.gate_proj(hidden).reshape(B, self.nv, 1).float()   # raw dt logits
-        bl_f = self.beta_proj(hidden).reshape(B, self.nv, 1).float()   # raw beta logits
+        dt, bl = self._project_gate_beta(hidden)
+        dt_f = dt.reshape(B, self.nv, 1).float()   # raw dt logits
+        bl_f = bl.reshape(B, self.nv, 1).float()   # raw beta logits
         zf = None
         if hasattr(self, "z_proj"):
             zf = self.z_proj(hidden).reshape(B, self.nv, 1, self.vd).float()
@@ -335,9 +346,10 @@ class GatedDeltaNetAttention(nn.Module):
         rep = self.nv // self.nk
         q = q.repeat_interleave(rep, dim=1)
         k = k.repeat_interleave(rep, dim=1)
-        beta = torch.sigmoid(self.beta_proj(hidden)).transpose(1, 2)  # [B,nv,L]...
+        dt, beta = self._project_gate_beta(hidden)
+        beta = torch.sigmoid(beta).transpose(1, 2)  # [B,nv,L]
         beta = beta.reshape(B, self.nv, L) if beta.dim() == 3 else beta
-        dt = self.gate_proj(hidden).transpose(1, 2)
+        dt = dt.transpose(1, 2)
         g = -F.softplus(dt.float() + self.dt_bias.view(1, -1, 1)) * self.A_log.exp().view(1, -1, 1)
         state = cache.get_state(layer_idx) if cache is not None else None
         o, state = _gated_delta_rule(

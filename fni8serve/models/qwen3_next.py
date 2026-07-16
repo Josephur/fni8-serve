@@ -29,7 +29,7 @@ from .config import ModelConfig
 from .moe import SparseMoE
 from .mtp import build_mtp
 from .registry import register_model
-from .weights import gate_up_weight, qkv_weight, to_qtensor
+from .weights import gate_up_weight, merge_qtensor, qkv_weight, to_qtensor
 
 
 def _full_attn(cfg, sd, p, rope):
@@ -58,8 +58,12 @@ def _linear_attn(cfg, sd, p):
         conv_weight=sd[f"{la}.conv_weight"],
         a_log=sd[f"{la}.A_log"],
         dt_bias=sd[f"{la}.dt_bias"],
-        beta_proj=to_qtensor(sd[f"{la}.beta_proj.weight"]),
-        gate_proj=to_qtensor(sd[f"{la}.dt_proj.weight"]),
+        beta_proj=None,
+        gate_proj=None,
+        gate_beta_proj=merge_qtensor([
+            to_qtensor(sd[f"{la}.dt_proj.weight"]),
+            to_qtensor(sd[f"{la}.beta_proj.weight"]),
+        ]),
         z_proj=to_qtensor(sd[f"{la}.z_proj.weight"]),
         norm_gain=sd[f"{la}.norm.weight"],
         num_k_heads=x["linear_num_key_heads"],
