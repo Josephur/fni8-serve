@@ -279,7 +279,12 @@ class RecurrentStateCache:
         self._vtraj[layer_idx] = (state_traj, conv_traj)
 
     @staticmethod
-    def _pick(traj: torch.Tensor, row_last: list[int]) -> torch.Tensor:
+    def _pick(
+        traj: torch.Tensor,
+        row_last: list[int],
+        rows: torch.Tensor | None = None,
+        indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Gather ``traj[b, row_last[b]]`` -> [B, ...] on ``traj``'s device, for the
         first ``len(row_last)`` rows. When the verify forward is CUDA-graph-captured
         the trajectory is recorded over the padded batch bucket (``traj.shape[0]`` ==
@@ -287,9 +292,16 @@ class RecurrentStateCache:
         a padded bucket commits exactly its real sequences (Bmax==B in the eager path,
         so this is a no-op there)."""
         n = len(row_last)
-        rows = torch.arange(n, device=traj.device)
-        idx = torch.tensor(row_last, device=traj.device)
-        return traj[rows, idx]
+        if n == 1:
+            # The latency-sensitive decode path is normally batch 1. Basic indexing
+            # returns a view, avoiding two tiny CUDA tensor allocations plus an
+            # advanced-index gather for every state and conv trajectory.
+            return traj[0, row_last[0]].unsqueeze(0)
+        if rows is None:
+            rows = torch.arange(n, device=traj.device)
+        if indices is None:
+            indices = torch.tensor(row_last, device=traj.device)
+        return traj[rows, indices]
 
     def commit_verify(self, row_last: list[int]) -> None:
         """Commit, per bound row ``b``, the recurrent state (and/or conv tail) AFTER
@@ -297,11 +309,23 @@ class RecurrentStateCache:
         trajectory). Scatters into the per-slot committed store exactly as a normal
         decode step's ``set_state`` / ``set_conv_tail`` would — reaching the correct
         committed state with no re-decode. Clears the capture afterward."""
+        rows = indices = None
+        if len(row_last) > 1 and self._vtraj:
+            example = next(
+                traj
+                for state_traj, conv_traj in self._vtraj.values()
+                for traj in (state_traj, conv_traj)
+                if traj is not None
+            )
+            # Every captured trajectory shares batch rows, device, and accepted
+            # indices. Materialize them once per commit instead of once per layer.
+            rows = torch.arange(len(row_last), device=example.device)
+            indices = torch.tensor(row_last, device=example.device)
         for lidx, (state_traj, conv_traj) in self._vtraj.items():
             if state_traj is not None:
-                self.set_state(lidx, self._pick(state_traj, row_last))
+                self.set_state(lidx, self._pick(state_traj, row_last, rows, indices))
             if conv_traj is not None:
-                self.set_conv_tail(lidx, self._pick(conv_traj, row_last))
+                self.set_conv_tail(lidx, self._pick(conv_traj, row_last, rows, indices))
         self.end_verify_capture()
 
     def verify_captured_layers(self) -> int:
